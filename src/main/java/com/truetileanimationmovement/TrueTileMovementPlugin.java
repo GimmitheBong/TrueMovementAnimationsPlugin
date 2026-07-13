@@ -117,6 +117,8 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	private boolean bIsWalkHereOptionWithExamine = false;
 	private long LastInputTime = 0;
 	private boolean bIsRecentInput = false;
+	// TEMPORARY COMPLETED-CLICK CAMERA RESUME TEST
+	private boolean bAwaitingCompletedLeftClickCameraResume = false;
 	private float CurrentPredictedZoomLevel = 0; // (default to halfway) Value between 37 (zoomed out) and 112 (zoomed in)
 
 	// Cache of target name to default action, serialize this so the user can accumulate right click options
@@ -549,6 +551,17 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 			return;
 		}
 
+		// TEMPORARY COMPLETED-CLICK CAMERA RESUME TEST
+		// A non-CANCEL MenuOptionClicked proves that the pending left-click action was resolved.
+		if (bAwaitingCompletedLeftClickCameraResume)
+		{
+			bAwaitingCompletedLeftClickCameraResume = false;
+			if (event.getMenuAction() != CANCEL)
+			{
+				bIsRecentInput = false;
+			}
+		}
+
 		// These actions disable the adaptive camera
 		if (event.getMenuAction() == WIDGET_TARGET && (event.getMenuOption().equals("Use") || event.getMenuOption().equals("Cast") ))
 		{
@@ -634,6 +647,9 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		// The user loses some accuracy, but it allows the feature to be possible.
 		if (bIsWalkHereOptionWithExamine && !SwingUtilities.isMiddleMouseButton(e))
 		{
+			// TEMPORARY COMPLETED-CLICK CAMERA RESUME TEST
+			// Only a left press may be completed by the corresponding action event.
+			bAwaitingCompletedLeftClickCameraResume = SwingUtilities.isLeftMouseButton(e);
 			bIsRecentInput = true;
 			client.setCameraMode(0);
 			LastInputTime = System.currentTimeMillis();
