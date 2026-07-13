@@ -659,23 +659,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	@Override
 	public MouseWheelEvent mouseWheelMoved(MouseWheelEvent event)
 	{
-		clientThread.invoke(() ->
-		{
-			// Walk option, we are in the main client for sure
-			MenuEntry[] entries = client.getMenuEntries();
-			for (MenuEntry entry : entries)
-			{
-				if (entry.getType() == WALK)
-				{
-					float rotation = event.getWheelRotation();
-					CurrentPredictedZoomLevel -= rotation * 2.5f;
-					CurrentPredictedZoomLevel = Math.min(CurrentPredictedZoomLevel, 112);
-					CurrentPredictedZoomLevel = Math.max(CurrentPredictedZoomLevel, 37);
-					break;
-				}
-			}
-		});
-
 		return event;
 	}
 
