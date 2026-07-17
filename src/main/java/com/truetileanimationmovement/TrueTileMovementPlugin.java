@@ -1,7 +1,5 @@
 package com.truetileanimationmovement;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
 import javax.inject.Inject;
 import javax.swing.*;
@@ -13,42 +11,28 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 // Accepted camera zoom synchronization
 import net.runelite.api.gameval.VarClientID;
-import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.callback.Hooks;
 import net.runelite.client.callback.RenderCallback;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.PluginChanged;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.input.MouseWheelListener;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import com.google.common.annotations.VisibleForTesting;
 import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 
-import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.BufferedImage;
-import java.io.IOException;
-import java.io.Reader;
-import java.io.Writer;
-import java.lang.reflect.Type;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.*;
 import java.util.List;
 
 import net.runelite.api.Perspective;
 import net.runelite.client.util.ImageUtil;
 
-import static com.sun.jna.platform.linux.Mman.MAP_TYPE;
 import static net.runelite.api.HitsplatID.*;
 import static net.runelite.api.MenuAction.*;
-import static net.runelite.api.MenuAction.GROUND_ITEM_FIFTH_OPTION;
-import static net.runelite.api.MenuAction.GROUND_ITEM_THIRD_OPTION;
 
 @Slf4j
 @PluginDescriptor(
@@ -79,16 +63,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 
 	@Inject
 	private MouseManager mouseManager;
-
-	@Inject
-	private Gson gson;
-
-	private static final Type MAP_TYPE =
-			new TypeToken<Map<String, String>>() {}.getType();
-
-	private final Path saveFile = RuneLite.RUNELITE_DIR.toPath()
-			.resolve("TrueTileMovementPlugin")
-			.resolve("data.json");
 
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
 	public boolean bIsPluginSupportedCurrently = true;
@@ -161,7 +135,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		}
 	};
 
-	private boolean bIsWalkHereOptionWithExamine = false;
+	private boolean bHasWalkHereWithOtherOptions = false;
 	private long LastInputTime = 0;
 	private boolean bIsRecentInput = false;
 	private float CurrentPredictedZoomLevel = 0; // (default to halfway) Value between 37 (zoomed out) and 112 (zoomed in)
@@ -170,141 +144,8 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 	private Integer LastAcceptedZoomLevel = null;
 	private boolean bLastAcceptedZoomWasResized = false;
 
-	// Cache of target name to default action, serialize this so the user can accumulate right click options
-	private Map<String, String> MainActionCache = new HashMap<>();
-	private void saveMainActionCache() throws IOException
-	{
-		Files.createDirectories(saveFile.getParent());
-
-		try (Writer writer = Files.newBufferedWriter(saveFile))
-		{
-			gson.toJson(MainActionCache, MAP_TYPE, writer);
-		}
-	}
-
-	void loadMainActionCache() throws IOException
-	{
-		if (!Files.exists(saveFile))
-		{
-			MainActionCache = new HashMap<>();
-			return;
-		}
-
-		try (Reader reader = Files.newBufferedReader(saveFile))
-		{
-			MainActionCache = gson.fromJson(reader, MAP_TYPE);
-			if (MainActionCache == null)
-			{
-				MainActionCache = new HashMap<>();
-			}
-		}
-	}
-
 	private WorldView currentWorldView = null;
 	private int LastPrintedAnimation = 0;
-
-	int ConvertFromTypeToPriority(MenuAction Type)
-	{
-		int ReturnValue = 0;
-
-		if (Type == GROUND_ITEM_FIFTH_OPTION)
-		{
-			ReturnValue = 1;
-		}
-		else if (Type == GROUND_ITEM_FOURTH_OPTION)
-		{
-			ReturnValue = 2;
-		}
-		else if (Type == GROUND_ITEM_THIRD_OPTION)
-		{
-			ReturnValue = 3;
-		}
-		else if (Type == GROUND_ITEM_SECOND_OPTION)
-		{
-			ReturnValue = 4;
-		}
-		else if (Type == GROUND_ITEM_FIRST_OPTION)
-		{
-			ReturnValue = 5;
-		}
-		else if (Type == NPC_FIFTH_OPTION)
-		{
-			ReturnValue = 6;
-		}
-		else if (Type == NPC_FOURTH_OPTION)
-		{
-			ReturnValue = 7;
-		}
-		else if (Type == NPC_THIRD_OPTION)
-		{
-			ReturnValue = 8;
-		}
-		else if (Type == NPC_SECOND_OPTION)
-		{
-			ReturnValue = 9;
-		}
-		else if (Type == NPC_FIRST_OPTION)
-		{
-			ReturnValue = 10;
-		}
-		else if (Type == GAME_OBJECT_FIFTH_OPTION)
-		{
-			ReturnValue = 11;
-		}
-		else if (Type == GAME_OBJECT_FOURTH_OPTION)
-		{
-			ReturnValue = 12;
-		}
-		else if (Type == GAME_OBJECT_THIRD_OPTION)
-		{
-			ReturnValue = 13;
-		}
-		else if (Type == GAME_OBJECT_SECOND_OPTION)
-		{
-			ReturnValue = 14;
-		}
-		else if (Type == GAME_OBJECT_FIRST_OPTION)
-		{
-			ReturnValue = 15;
-		}
-
-
-		return ReturnValue;
-	}
-
-	MenuEntry[] FindFirstEntry()
-	{
-		// Find the target
-		MenuEntry FirstMenuEntry = null;
-		MenuEntry WalkHereMenuEntry = null;
-		int HighestPriorityMenuEntry = -1;
-		MenuEntry[] entries = client.getMenuEntries();
-		for (MenuEntry entry : entries)
-		{
-			int TypePriority = ConvertFromTypeToPriority(entry.getType());
-			if (HighestPriorityMenuEntry < TypePriority && entry.getTarget() != null)
-			{
-				HighestPriorityMenuEntry = TypePriority;
-				FirstMenuEntry = entry;
-			}
-			else if (entry.getType() == WALK)
-			{
-				WalkHereMenuEntry = entry;
-			}
-		}
-
-		// Walk here option
-		if (FirstMenuEntry == null)
-		{
-			FirstMenuEntry = WalkHereMenuEntry;
-		}
-
-		MenuEntry[] BundledReturn = new MenuEntry[2];
-		BundledReturn[0] = FirstMenuEntry;
-		BundledReturn[1] = WalkHereMenuEntry;
-
-		return BundledReturn;
-	}
 
 	private boolean IsAdaptiveCameraOn()
 	{
@@ -327,7 +168,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		return FrameDeltaMilliseconds;
 	}
 
-	private double CurrentMinimapZoomLevel = 0;
 	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
@@ -346,59 +186,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			bForceAdaptiveCameraOff = false;
 		}
 
-		// Option has walk here option
-		MenuEntry[] entries = client.getMenuEntries();
-		if (IsAdaptiveCameraOn() && entries.length > 2)
-		{
-			MenuEntry[] BundledEntries = FindFirstEntry();
-			MenuEntry FirstMenuEntry = BundledEntries[0];
-			MenuEntry WalkHereMenuEntry = BundledEntries[1];
-
-			String TargetString = "";
-			if (FirstMenuEntry == null)
-			{
-				FirstMenuEntry = WalkHereMenuEntry;
-			}
-
-			TargetString = FirstMenuEntry.getTarget();
-
-			String TargetOption = "Interact";
-			if (MainActionCache.containsKey(TargetString))
-			{
-				TargetOption = MainActionCache.get(TargetString);
-			}
-
-			for (int i = 0; i < entries.length; ++i)
-			{
-				if (entries[i].getType() == WALK)
-				{
-					if (!client.isMenuOpen() && !TargetString.isEmpty())
-					{
-						entries[i].setOption(TargetOption);
-						entries[i].setTarget(TargetString);
-					}
-					else if (entries[i] != FirstMenuEntry)
-					{
-						entries[i].setOption("Walk here");
-						entries[i].setTarget("");
-					}
-				}
-			}
-
-			if (WalkHereMenuEntry != null)
-			{
-				bIsWalkHereOptionWithExamine = true;
-			}
-			else
-			{
-				bIsWalkHereOptionWithExamine = false;
-			}
-		}
-		else
-		{
-			bIsWalkHereOptionWithExamine = false;
-		}
-
 		// Plugin no longer supported (Need GPU plugin)
 		if (TicksSincePluginWasSupport > 5)
 		{
@@ -409,6 +196,36 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			bIsPluginSupportedCurrently = true;
 		}
 		++TicksSincePluginWasSupport;
+	}
+
+	@Subscribe(priority = -2)
+	public void onPostMenuSort(PostMenuSort event)
+	{
+		// Menu swapping and filtering is complete at this point. Only observe the
+		// final menu; changing WALK's text or target breaks target-based hide rules.
+		bHasWalkHereWithOtherOptions = IsAdaptiveCameraOn()
+				&& !client.isMenuOpen()
+				&& HasWalkHereWithOtherOptions(client.getMenu().getMenuEntries());
+	}
+
+	static boolean HasWalkHereWithOtherOptions(MenuEntry[] entries)
+	{
+		boolean HasWalkHere = false;
+		boolean HasOtherOption = false;
+
+		for (MenuEntry entry : entries)
+		{
+			if (entry.getType() == WALK)
+			{
+				HasWalkHere = true;
+			}
+			else if (entry.getType() != CANCEL)
+			{
+				HasOtherOption = true;
+			}
+		}
+
+		return HasWalkHere && HasOtherOption;
 	}
 
 	private void UpdateAdaptiveCamera(CustomMovementHandler PlayerMovementHandler, int FootprintHeight)
@@ -554,30 +371,12 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		{
 			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight);
 		}
-		// Cache our options
+		// Keep the normal camera position synchronized while adaptive rendering is paused.
 		else
 		{
 			LastAdaptiveCameraUpdateNanos = 0;
 			if (client.getCameraMode() == 0)
 			{
-				// Find the target
-				MenuEntry[] BundledEntries = FindFirstEntry();
-				MenuEntry FirstMenuEntry = BundledEntries[0];
-				MenuEntry WalkHereMenuEntry = BundledEntries[1];
-
-				String TargetString = "";
-				if (FirstMenuEntry == null)
-				{
-					FirstMenuEntry = WalkHereMenuEntry;
-				}
-				TargetString = FirstMenuEntry.getTarget();
-
-				// Update the cache of the true default option
-				if (FirstMenuEntry != null && !TargetString.isEmpty())
-				{
-					MainActionCache.put(TargetString, FirstMenuEntry.getOption());
-				}
-
 				// Store in sudo world space
 				WorldPoint trueWorldTile = client.getLocalPlayer().getWorldLocation();
 				LocalPoint trueLocalTile = LocalPoint.fromWorld(client, trueWorldTile);
@@ -755,7 +554,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 	@Override
 	protected void startUp() throws Exception
 	{
-		loadMainActionCache();
 		InitializePrayerImages();
 		InitializeSkullImages();
 		InitializeHitsplatImages();
@@ -787,7 +585,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 	@Override
 	protected void shutDown() throws Exception
 	{
-		saveMainActionCache();
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
@@ -843,17 +640,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			return;
 		}
 
-		// Cache our plugin data during a world hop or logout
-		if (gameStateChanged.getGameState() == GameState.HOPPING ||
-		gameStateChanged.getGameState() == GameState.LOGIN_SCREEN)
-		{
-            try {
-                saveMainActionCache();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
 		// Runelite objects are stale
 		if (gameStateChanged.getGameState() == GameState.LOADING ||
 				gameStateChanged.getGameState() == GameState.CONNECTION_LOST ||
@@ -882,7 +668,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		// The user loses some accuracy, but it allows the feature to be possible.
 		// ClientTick already selects the normal camera before menu sorting and click detection,
 		// so a left press does not need to hold that camera state through the rendered frame.
-		if (bIsWalkHereOptionWithExamine &&
+		if (bHasWalkHereWithOtherOptions &&
 				!SwingUtilities.isMiddleMouseButton(e) &&
 				!SwingUtilities.isLeftMouseButton(e))
 		{
