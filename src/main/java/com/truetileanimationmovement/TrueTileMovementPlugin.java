@@ -11,7 +11,8 @@ import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
-import net.runelite.api.widgets.Widget;
+// Accepted camera zoom synchronization
+import net.runelite.api.gameval.VarClientID;
 import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.Hooks;
@@ -20,13 +21,12 @@ import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.PluginChanged;
-import net.runelite.client.input.KeyListener;
-import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.input.MouseWheelListener;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import com.google.common.annotations.VisibleForTesting;
+import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 import java.awt.*;
@@ -54,7 +54,7 @@ import static net.runelite.api.MenuAction.GROUND_ITEM_THIRD_OPTION;
 @PluginDescriptor(
 	name = "True Tile Movement"
 )
-public class TrueTileMovementPlugin extends Plugin implements MouseListener, KeyListener, MouseWheelListener
+public class TrueTileMovementPlugin extends Plugin implements MouseListener, MouseWheelListener
 {
 	@Inject
 	private Client client;
@@ -75,7 +75,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	private ClientThread clientThread;
 
 	@Inject
-	private KeyManager keyManager;
+	private DrawManager drawManager;
 
 	@Inject
 	private MouseManager mouseManager;
@@ -146,12 +146,29 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 
 	private float CurrentCameraPositionX = -1; // Offset in "sudo world space" (see adaptive camera function)
 	private float CurrentCameraPositionZ = -1;
+	private static final float ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS = 16.667f;
+	private static final float MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS = 100.0f;
+	private long LastAdaptiveCameraUpdateNanos = 0;
+	// Keep free-camera mode confined to the adaptive frame: native keyboard input is
+	// accepted after presentation, while the normal camera is never rendered.
+	private volatile boolean bAdaptiveCameraRenderedThisFrame = false;
+	private final Runnable PostDrawCameraModeHandoff = () ->
+	{
+		if (bAdaptiveCameraRenderedThisFrame)
+		{
+			bAdaptiveCameraRenderedThisFrame = false;
+			client.setCameraMode(0);
+		}
+	};
 
 	private boolean bIsWalkHereOptionWithExamine = false;
 	private long LastInputTime = 0;
 	private boolean bIsRecentInput = false;
-	private boolean bAwaitingCompletedLeftClickCameraResume = false;
 	private float CurrentPredictedZoomLevel = 0; // (default to halfway) Value between 37 (zoomed out) and 112 (zoomed in)
+	// Accepted camera zoom synchronization
+	private static final float ACCEPTED_ZOOM_TO_PREDICTED_ZOOM_SCALE = 0.098f;
+	private Integer LastAcceptedZoomLevel = null;
+	private boolean bLastAcceptedZoomWasResized = false;
 
 	// Cache of target name to default action, serialize this so the user can accumulate right click options
 	private Map<String, String> MainActionCache = new HashMap<>();
@@ -294,6 +311,22 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		return !bForceAdaptiveCameraOff && config.AdaptiveCameraOn() && !bNonAdaptiveCameraActionActive;
 	}
 
+	private float GetAdaptiveCameraFrameDeltaMilliseconds()
+	{
+		long CurrentUpdateNanos = System.nanoTime();
+		float FrameDeltaMilliseconds = ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS;
+
+		if (LastAdaptiveCameraUpdateNanos != 0 && CurrentUpdateNanos > LastAdaptiveCameraUpdateNanos)
+		{
+			FrameDeltaMilliseconds = Math.min(
+					(CurrentUpdateNanos - LastAdaptiveCameraUpdateNanos) / 1_000_000.0f,
+					MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS);
+		}
+
+		LastAdaptiveCameraUpdateNanos = CurrentUpdateNanos;
+		return FrameDeltaMilliseconds;
+	}
+
 	private double CurrentMinimapZoomLevel = 0;
 	@Subscribe
 	public void onClientTick(ClientTick event)
@@ -385,8 +418,10 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		LocalPoint trueLocalTile = LocalPoint.fromWorld(client, trueWorldTile);
 		if (trueLocalTile == null)
 		{
+			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
+		float CameraFrameDeltaMilliseconds = GetAdaptiveCameraFrameDeltaMilliseconds();
 
 		// Store in sudo world space to prevent jumps when loading new chunks
 		double CalculationOffsetVectorX = trueLocalTile.getX() - trueWorldTile.getX() * 128;
@@ -425,8 +460,9 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		float DistanceX = Math.abs(DirectionX);
 		float DistanceZ = Math.abs(DirectionZ);
 
-		// Adjust using the current framerate (Tuned to 60FPS)
-		Velocity *= (float) (PlayerMovementHandler.CurrentFrameDelta / 16.667);// Speed value centered at 60FPS
+		// Scale with the interval for this rendered camera frame. The movement handler is
+		// updated later in overlay rendering, so its CurrentFrameDelta belongs to the prior frame.
+		Velocity *= CameraFrameDeltaMilliseconds / ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS;
 
 		if (DistanceToTarget != 0)
 		{
@@ -463,6 +499,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		client.setCameraFocalPointX(CurrentCameraPositionX);
 		client.setCameraFocalPointY(FootprintHeight - CurrentPredictedZoomLevel);
 		client.setCameraFocalPointZ(CurrentCameraPositionZ);
+		bAdaptiveCameraRenderedThisFrame = true;
 
 		// Store in sudo-world space to prevent jumps
 		CurrentCameraPositionX -= (float) CalculationOffsetVectorX;
@@ -472,14 +509,17 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	@Subscribe
 	public void onBeforeRender(BeforeRender beforeRender)
 	{
+		bAdaptiveCameraRenderedThisFrame = false;
 		if (bForceEarlyOut || !bIsPluginSupportedCurrently || client.getLocalPlayer() == null)
 		{
+			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
 
 		CustomMovementHandler PlayerMovementHandler = OverlayRenderer.MovementHandlerCache.get(client.getLocalPlayer().getId());
 		if (PlayerMovementHandler == null)
 		{
+			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
 
@@ -492,6 +532,9 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		{
 			FootprintHeight -= PlayerMovementHandler.OldAnimationHeight;
 		}
+
+		// Accepted camera zoom synchronization
+		UpdatePredictedZoomFromAcceptedZoom();
 
 		if ( CurrentPredictedZoomLevel == 0)
 		{
@@ -514,6 +557,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		// Cache our options
 		else
 		{
+			LastAdaptiveCameraUpdateNanos = 0;
 			if (client.getCameraMode() == 0)
 			{
 				// Find the target
@@ -718,12 +762,16 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 
 		client.getCanvas().addMouseListener(this);
 		mouseManager.registerMouseWheelListener(this);
-		keyManager.registerKeyListener(this);
 		renderCallbackManager.register(renderCallback);
+		drawManager.registerEveryFrameListener(PostDrawCameraModeHandoff);
 		overlayManager.add(OverlayRenderer);
 		bForceEarlyOut = false;
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionZ = -1;
+		LastAdaptiveCameraUpdateNanos = 0;
+		bAdaptiveCameraRenderedThisFrame = false;
+		// Accepted camera zoom synchronization
+		LastAcceptedZoomLevel = null;
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -742,14 +790,16 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		saveMainActionCache();
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionZ = -1;
+		LastAdaptiveCameraUpdateNanos = 0;
+		bAdaptiveCameraRenderedThisFrame = false;
 
 		clientThread.invoke(() ->
 		{
             client.getCanvas().removeMouseListener(this);
 			mouseManager.unregisterMouseWheelListener(this);
-			keyManager.unregisterKeyListener(this);
 			OverlayRenderer.Cleanup();
 			renderCallbackManager.unregister(renderCallback);
+			drawManager.unregisterEveryFrameListener(PostDrawCameraModeHandoff);
 			overlayManager.remove(OverlayRenderer);
 			bForceEarlyOut = true;
 			client.setCameraMode(0);
@@ -762,16 +812,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		if (bForceEarlyOut || !bIsPluginSupportedCurrently)
 		{
 			return;
-		}
-
-		// A non-CANCEL MenuOptionClicked proves that the pending left-click action was resolved.
-		if (bAwaitingCompletedLeftClickCameraResume)
-		{
-			bAwaitingCompletedLeftClickCameraResume = false;
-			if (event.getMenuAction() != CANCEL)
-			{
-				bIsRecentInput = false;
-			}
 		}
 
 		// These actions disable the adaptive camera
@@ -840,10 +880,12 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 		// If the option is not just "walk here", swap to the old camera system for just a few frames or while the right click menu is open.
 		// The plugin's camera is so close to the original camera view that the clickboxes are close enough.
 		// The user loses some accuracy, but it allows the feature to be possible.
-		if (bIsWalkHereOptionWithExamine && !SwingUtilities.isMiddleMouseButton(e))
+		// ClientTick already selects the normal camera before menu sorting and click detection,
+		// so a left press does not need to hold that camera state through the rendered frame.
+		if (bIsWalkHereOptionWithExamine &&
+				!SwingUtilities.isMiddleMouseButton(e) &&
+				!SwingUtilities.isLeftMouseButton(e))
 		{
-			// Only a left press may be completed by the corresponding action event.
-			bAwaitingCompletedLeftClickCameraResume = SwingUtilities.isLeftMouseButton(e);
 			bIsRecentInput = true;
 			client.setCameraMode(0);
 			LastInputTime = System.currentTimeMillis();
@@ -853,24 +895,44 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	@Override
 	public MouseWheelEvent mouseWheelMoved(MouseWheelEvent event)
 	{
-		clientThread.invoke(() ->
-		{
-			// Walk option, we are in the main client for sure
-			MenuEntry[] entries = client.getMenuEntries();
-			for (MenuEntry entry : entries)
-			{
-				if (entry.getType() == WALK)
-				{
-					float rotation = event.getWheelRotation();
-					CurrentPredictedZoomLevel -= rotation * 2.5f;
-					CurrentPredictedZoomLevel = Math.min(CurrentPredictedZoomLevel, 112);
-					CurrentPredictedZoomLevel = Math.max(CurrentPredictedZoomLevel, 37);
-					break;
-				}
-			}
-		});
-
+		// Accepted camera zoom synchronization
+		// The accepted zoom delta is observed on the client thread after the input has been processed.
 		return event;
+	}
+
+	// Accepted camera zoom synchronization
+	private void UpdatePredictedZoomFromAcceptedZoom()
+	{
+		boolean bIsResized = client.isResized();
+		int AcceptedZoomLevel = getAcceptedZoomLevel();
+
+		if (LastAcceptedZoomLevel == null || bLastAcceptedZoomWasResized != bIsResized ||
+				CurrentPredictedZoomLevel == 0)
+		{
+			LastAcceptedZoomLevel = AcceptedZoomLevel;
+			bLastAcceptedZoomWasResized = bIsResized;
+			return;
+		}
+
+		int AcceptedZoomDelta = AcceptedZoomLevel - LastAcceptedZoomLevel;
+		LastAcceptedZoomLevel = AcceptedZoomLevel;
+
+		if (AcceptedZoomDelta == 0)
+		{
+			return;
+		}
+
+		CurrentPredictedZoomLevel += AcceptedZoomDelta * ACCEPTED_ZOOM_TO_PREDICTED_ZOOM_SCALE;
+		CurrentPredictedZoomLevel = Math.min(CurrentPredictedZoomLevel, 112);
+		CurrentPredictedZoomLevel = Math.max(CurrentPredictedZoomLevel, 37);
+	}
+
+	// Accepted camera zoom synchronization
+	private int getAcceptedZoomLevel()
+	{
+		return client.getVarcIntValue(client.isResized()
+				? VarClientID.CAMERA_ZOOM_BIG
+				: VarClientID.CAMERA_ZOOM_SMALL);
 	}
 
 	@Override
@@ -888,46 +950,5 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Key
 	public void mouseExited(MouseEvent e)
 	{
 
-	}
-	private boolean isNonTypingKey(KeyEvent e)
-	{
-		int code = e.getKeyCode();
-
-		return (code >= KeyEvent.VK_F1 && code <= KeyEvent.VK_F12)
-				|| code == KeyEvent.VK_SHIFT
-				|| code == KeyEvent.VK_CONTROL
-				|| code == KeyEvent.VK_ALT
-				|| code == KeyEvent.VK_LEFT
-				|| code == KeyEvent.VK_RIGHT
-				|| code == KeyEvent.VK_UP
-				|| code == KeyEvent.VK_DOWN;
-	}
-
-	@Override
-	public void keyPressed(KeyEvent e)
-	{
-		Widget focused = client.getFocusedInputFieldWidget();
-		if (focused == null)
-		{
-			char c = e.getKeyChar();
-
-			if (!Character.isISOControl(c) && !isNonTypingKey(e))
-			{
-				// This is a printable character that could go into chat, do the same trick as the mouse
-				bIsRecentInput = true;
-				LastInputTime = System.currentTimeMillis();
-				client.setCameraMode(0);
-			}
-		}
-	}
-
-	@Override
-	public void keyReleased(KeyEvent e)
-	{
-	}
-
-	@Override
-	public void keyTyped(KeyEvent e)
-	{
 	}
 }
