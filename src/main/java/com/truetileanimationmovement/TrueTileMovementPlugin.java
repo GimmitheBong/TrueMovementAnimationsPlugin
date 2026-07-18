@@ -2,7 +2,6 @@ package com.truetileanimationmovement;
 
 import com.google.inject.Provides;
 import javax.inject.Inject;
-import javax.swing.*;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
@@ -20,7 +19,6 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 
-import java.awt.event.*;
 import java.awt.image.BufferedImage;
 import java.util.*;
 import java.util.List;
@@ -35,7 +33,7 @@ import static net.runelite.api.MenuAction.*;
 @PluginDescriptor(
 	name = "True Tile Movement"
 )
-public class TrueTileMovementPlugin extends Plugin implements MouseListener
+public class TrueTileMovementPlugin extends Plugin
 {
 	@Inject
 	private Client client;
@@ -117,8 +115,8 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 	private static final float ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS = 16.667f;
 	private static final float MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS = 100.0f;
 	private long LastAdaptiveCameraUpdateNanos = 0;
-	// Keep free-camera mode confined to the adaptive frame: native keyboard input is
-	// accepted after presentation, while the normal camera is never rendered.
+	// Keep free-camera mode confined to the adaptive frame: native input and menu
+	// processing run after presentation, while the normal camera is never rendered.
 	private volatile boolean bAdaptiveCameraRenderedThisFrame = false;
 	private final Runnable PostDrawCameraModeHandoff = () ->
 	{
@@ -130,9 +128,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		}
 	};
 
-	private boolean bHasWalkHereWithOtherOptions = false;
-	private long LastInputTime = 0;
-	private boolean bIsRecentInput = false;
 	private static final int CAMERA_VIEWPORT_BASE_HEIGHT = 334;
 	private static final int CAMERA_VIEWPORT_ZOOM_BLEND_RANGE = 100;
 	private static final int CAMERA_FOLLOW_HEIGHT_BASE = 25;
@@ -166,7 +161,7 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
-		// Update the minimap, it doesn't update in free cam
+		// Update the minimap and select the normal camera before menu sorting and click detection.
 		if (IsAdaptiveCameraOn())
 		{
 			client.setCameraMode(0);
@@ -193,45 +188,11 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		++TicksSincePluginWasSupport;
 	}
 
-	@Subscribe(priority = -2)
-	public void onPostMenuSort(PostMenuSort event)
-	{
-		// Menu swapping and filtering is complete at this point. Only observe the
-		// final menu; changing WALK's text or target breaks target-based hide rules.
-		bHasWalkHereWithOtherOptions = IsAdaptiveCameraOn()
-				&& !client.isMenuOpen()
-				&& HasWalkHereWithOtherOptions(client.getMenu().getMenuEntries());
-	}
-
-	static boolean HasWalkHereWithOtherOptions(MenuEntry[] entries)
-	{
-		boolean HasWalkHere = false;
-		boolean HasOtherOption = false;
-
-		for (MenuEntry entry : entries)
-		{
-			if (entry.getType() == WALK)
-			{
-				HasWalkHere = true;
-			}
-			else if (entry.getType() != CANCEL)
-			{
-				HasOtherOption = true;
-			}
-		}
-
-		return HasWalkHere && HasOtherOption;
-	}
-
 	static boolean ShouldRenderAdaptiveCamera(
 			boolean AdaptiveCameraOn,
-			boolean IsRecentInput,
-			boolean IsMenuOpen,
 			boolean ShouldRenderOwner)
 	{
-		return AdaptiveCameraOn &&
-				(!IsRecentInput || IsMenuOpen) &&
-				!ShouldRenderOwner;
+		return AdaptiveCameraOn && !ShouldRenderOwner;
 	}
 
 	private void UpdateAdaptiveCamera(
@@ -489,20 +450,11 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		}
 		int CameraFollowHeight = GetCameraFollowHeight();
 
-		boolean IsMenuOpen = client.isMenuOpen();
-		if (!IsMenuOpen && (System.currentTimeMillis() - LastInputTime > 60))
-		{
-			bIsRecentInput = false;
-		}
-
-		// Menu entries have already been captured with the normal camera. While the
-		// screen-space menu is open, render the 3D scene with the adaptive focal point;
-		// the draw-complete handoff restores the normal camera before native input.
-		// The live menu state also protects presentation if event ordering ever differs.
+		// Input processing uses the normal camera outside the draw interval. Never
+		// expose that interaction camera during presentation: on uneven terrain its
+		// focal height belongs to the hidden owner rather than the visible model.
 		if (ShouldRenderAdaptiveCamera(
 				IsAdaptiveCameraOn(),
-				bIsRecentInput,
-				IsMenuOpen,
 				PlayerMovementHandler.bShouldRenderOwner))
 		{
 			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight, CameraFollowHeight);
@@ -694,7 +646,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		InitializeSkullImages();
 		InitializeHitsplatImages();
 
-		client.getCanvas().addMouseListener(this);
 		renderCallbackManager.register(renderCallback);
 		drawManager.registerEveryFrameListener(PostDrawCameraModeHandoff);
 		overlayManager.add(OverlayRenderer);
@@ -725,7 +676,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 
 		clientThread.invoke(() ->
 		{
-            client.getCanvas().removeMouseListener(this);
 			OverlayRenderer.Cleanup();
 			renderCallbackManager.unregister(renderCallback);
 			drawManager.unregisterEveryFrameListener(PostDrawCameraModeHandoff);
@@ -733,15 +683,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 			bForceEarlyOut = true;
 			client.setCameraMode(0);
 		});
-	}
-
-	@Subscribe
-	public void onMenuOpened(MenuOpened event)
-	{
-		// The normal camera is only needed until the client has finalized the menu.
-		// Release the hold now so closing a quickly selected menu cannot render a
-		// trailing normal-camera frame.
-		bIsRecentInput = false;
 	}
 
 	@Subscribe
@@ -796,43 +737,4 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		return configManager.getConfig(TrueTileMovementConfig.class);
 	}
 
-	@Override
-	public void mouseClicked(MouseEvent e)
-	{
-	}
-
-	@Override
-	public void mousePressed(MouseEvent e)
-	{
-		// If the option is not just "walk here", swap to the old camera system for just a few frames or while the right click menu is open.
-		// The plugin's camera is so close to the original camera view that the clickboxes are close enough.
-		// The user loses some accuracy, but it allows the feature to be possible.
-		// ClientTick already selects the normal camera before menu sorting and click detection,
-		// so a left press does not need to hold that camera state through the rendered frame.
-		if (bHasWalkHereWithOtherOptions &&
-				!SwingUtilities.isMiddleMouseButton(e) &&
-				!SwingUtilities.isLeftMouseButton(e))
-		{
-			bIsRecentInput = true;
-			client.setCameraMode(0);
-			LastInputTime = System.currentTimeMillis();
-		}
-	}
-
-	@Override
-	public void mouseReleased(MouseEvent e)
-	{
-
-	}
-
-	@Override
-	public void mouseEntered(MouseEvent e)
-	{
-	}
-
-	@Override
-	public void mouseExited(MouseEvent e)
-	{
-
-	}
 }

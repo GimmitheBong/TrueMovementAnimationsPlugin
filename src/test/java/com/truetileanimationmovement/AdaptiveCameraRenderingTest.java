@@ -8,46 +8,25 @@ import static org.junit.Assert.assertTrue;
 public class AdaptiveCameraRenderingTest
 {
 	@Test
-	public void openMenuUsesAdaptiveCameraAfterRecentInput()
+	public void hiddenOwnerUsesAdaptiveCamera()
 	{
 		assertTrue(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
 				true,
-				true,
-				true,
 				false));
 	}
 
 	@Test
-	public void pendingMenuCreationKeepsInteractionCamera()
+	public void disabledAdaptiveCameraUsesNativeCamera()
 	{
 		assertFalse(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
-				true,
-				true,
 				false,
 				false));
 	}
 
 	@Test
-	public void regularAdaptiveRenderingIsUnchanged()
-	{
-		assertTrue(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
-				true,
-				false,
-				false,
-				false));
-	}
-
-	@Test
-	public void adaptivePrerequisitesStillTakePriority()
+	public void visibleOwnerUsesNativeCamera()
 	{
 		assertFalse(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
-				false,
-				false,
-				true,
-				false));
-		assertFalse(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
-				true,
-				false,
 				true,
 				true));
 	}
