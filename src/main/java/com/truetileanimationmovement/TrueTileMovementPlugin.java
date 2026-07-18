@@ -9,15 +9,12 @@ import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
-// Accepted camera zoom synchronization
 import net.runelite.api.gameval.VarClientID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallback;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.input.MouseManager;
-import net.runelite.client.input.MouseWheelListener;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.DrawManager;
@@ -38,7 +35,7 @@ import static net.runelite.api.MenuAction.*;
 @PluginDescriptor(
 	name = "True Tile Movement"
 )
-public class TrueTileMovementPlugin extends Plugin implements MouseListener, MouseWheelListener
+public class TrueTileMovementPlugin extends Plugin implements MouseListener
 {
 	@Inject
 	private Client client;
@@ -60,9 +57,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 
 	@Inject
 	private DrawManager drawManager;
-
-	@Inject
-	private MouseManager mouseManager;
 
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
 	public boolean bIsPluginSupportedCurrently = true;
@@ -128,7 +122,8 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 	private volatile boolean bAdaptiveCameraRenderedThisFrame = false;
 	private final Runnable PostDrawCameraModeHandoff = () ->
 	{
-		if (bAdaptiveCameraRenderedThisFrame)
+		boolean AdaptiveCameraWasRendered = bAdaptiveCameraRenderedThisFrame;
+		if (AdaptiveCameraWasRendered)
 		{
 			bAdaptiveCameraRenderedThisFrame = false;
 			client.setCameraMode(0);
@@ -138,11 +133,11 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 	private boolean bHasWalkHereWithOtherOptions = false;
 	private long LastInputTime = 0;
 	private boolean bIsRecentInput = false;
-	private float CurrentPredictedZoomLevel = 0; // (default to halfway) Value between 37 (zoomed out) and 112 (zoomed in)
-	// Accepted camera zoom synchronization
-	private static final float ACCEPTED_ZOOM_TO_PREDICTED_ZOOM_SCALE = 0.098f;
-	private Integer LastAcceptedZoomLevel = null;
-	private boolean bLastAcceptedZoomWasResized = false;
+	private static final int CAMERA_VIEWPORT_BASE_HEIGHT = 334;
+	private static final int CAMERA_VIEWPORT_ZOOM_BLEND_RANGE = 100;
+	private static final int CAMERA_FOLLOW_HEIGHT_BASE = 25;
+	private static final int CAMERA_FOLLOW_HEIGHT_SCALE = 25;
+	private static final int CAMERA_FOLLOW_HEIGHT_DIVISOR = 256;
 
 	private WorldView currentWorldView = null;
 	private int LastPrintedAnimation = 0;
@@ -228,7 +223,10 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		return HasWalkHere && HasOtherOption;
 	}
 
-	private void UpdateAdaptiveCamera(CustomMovementHandler PlayerMovementHandler, int FootprintHeight)
+	private void UpdateAdaptiveCamera(
+			CustomMovementHandler PlayerMovementHandler,
+			float FootprintHeight,
+			int CameraFollowHeight)
 	{
 		Player player = client.getLocalPlayer();
 		WorldPoint trueWorldTile = player.getWorldLocation();
@@ -308,19 +306,135 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			}
 		}
 
-		// TODO: Probably do to Y too
-
 		client.setCameraMode(1);
 		client.setFreeCameraSpeed(0);
 
 		client.setCameraFocalPointX(CurrentCameraPositionX);
-		client.setCameraFocalPointY(FootprintHeight - CurrentPredictedZoomLevel);
+		client.setCameraFocalPointY(FootprintHeight - CameraFollowHeight);
 		client.setCameraFocalPointZ(CurrentCameraPositionZ);
 		bAdaptiveCameraRenderedThisFrame = true;
 
 		// Store in sudo-world space to prevent jumps
 		CurrentCameraPositionX -= (float) CalculationOffsetVectorX;
 		CurrentCameraPositionZ -= (float) CalculationOffsetVectorY;
+	}
+
+	private static int Clamp(int value, int minimum, int maximum)
+	{
+		return Math.max(minimum, Math.min(maximum, value));
+	}
+
+	/**
+	 * Mirrors the normal camera settings script. In particular, its final
+	 * multiply and divide use integer arithmetic; the follow height is not a
+	 * floating-point zoom delta.
+	 */
+	private int GetCameraFollowHeight()
+	{
+		int SmallZoom = Clamp(
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_SMALL),
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_SMALL_MIN),
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_SMALL_MAX));
+		int BigZoom = Clamp(
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_BIG),
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_BIG_MIN),
+				client.getVarcIntValue(VarClientID.CAMERA_ZOOM_BIG_MAX));
+		int ViewportBlend = Clamp(
+				client.getViewportHeight() - CAMERA_VIEWPORT_BASE_HEIGHT,
+				0,
+				CAMERA_VIEWPORT_ZOOM_BLEND_RANGE);
+		int EffectiveZoom = SmallZoom +
+				(BigZoom - SmallZoom) * ViewportBlend / CAMERA_VIEWPORT_ZOOM_BLEND_RANGE;
+		return CAMERA_FOLLOW_HEIGHT_BASE +
+				CAMERA_FOLLOW_HEIGHT_SCALE * EffectiveZoom / CAMERA_FOLLOW_HEIGHT_DIVISOR;
+	}
+
+	/**
+	 * Matches the native client's floating-point terrain interpolation used by
+	 * its camera follow calculation. The public Perspective helper returns an
+	 * integer and loses the fractional terrain component on sloped tiles.
+	 */
+	private static float GetCameraTileHeight(
+			WorldView worldView,
+			float localX,
+			float localY,
+			int plane)
+	{
+		int TileX = (int) (localX / Perspective.LOCAL_TILE_SIZE);
+		int TileY = (int) (localY / Perspective.LOCAL_TILE_SIZE);
+		if (TileX < 0 || TileY < 0 || TileX >= worldView.getSizeX() || TileY >= worldView.getSizeY())
+		{
+			return 0;
+		}
+
+		int EffectivePlane = plane;
+		byte[][][] TileSettings = worldView.getTileSettings();
+		if (plane < 3 && (TileSettings[1][TileX][TileY] & 2) == 2)
+		{
+			EffectivePlane++;
+		}
+
+		int[][] TileHeights = worldView.getTileHeights()[EffectivePlane];
+		float TileOffsetX = localX % Perspective.LOCAL_TILE_SIZE;
+		float TileOffsetY = localY % Perspective.LOCAL_TILE_SIZE;
+		float SouthHeight =
+				(Perspective.LOCAL_TILE_SIZE - TileOffsetX) * TileHeights[TileX][TileY] +
+				TileOffsetX * TileHeights[TileX + 1][TileY];
+		SouthHeight /= Perspective.LOCAL_TILE_SIZE;
+		float NorthHeight =
+				(Perspective.LOCAL_TILE_SIZE - TileOffsetX) * TileHeights[TileX][TileY + 1] +
+				TileOffsetX * TileHeights[TileX + 1][TileY + 1];
+		NorthHeight /= Perspective.LOCAL_TILE_SIZE;
+
+		return (TileOffsetY * NorthHeight +
+				(Perspective.LOCAL_TILE_SIZE - TileOffsetY) * SouthHeight) /
+				Perspective.LOCAL_TILE_SIZE;
+	}
+
+	private static float GetCameraFootprintTileHeight(
+			WorldView worldView,
+			LocalPoint localLocation,
+			int plane,
+			int footprintSize)
+	{
+		float LocalX = localLocation.getX();
+		float LocalY = localLocation.getY();
+		if (footprintSize == 0)
+		{
+			return GetCameraTileHeight(worldView, LocalX, LocalY, plane);
+		}
+
+		int HalfFootprint = footprintSize / 2;
+		float Left = LocalX - HalfFootprint;
+		float Bottom = LocalY - HalfFootprint;
+		float Right = LocalX + HalfFootprint;
+		float Top = LocalY + HalfFootprint;
+		float MinimumHeight = Float.MAX_VALUE;
+
+		for (float TileX = Left / Perspective.LOCAL_TILE_SIZE + 1;
+			 TileX <= Right / Perspective.LOCAL_TILE_SIZE;
+			 TileX++)
+		{
+			for (float TileY = Bottom / Perspective.LOCAL_TILE_SIZE + 1;
+				 TileY <= Top / Perspective.LOCAL_TILE_SIZE;
+				 TileY++)
+			{
+				MinimumHeight = Math.min(
+						MinimumHeight,
+						GetCameraTileHeight(
+								worldView,
+								TileX * Perspective.LOCAL_TILE_SIZE,
+								TileY * Perspective.LOCAL_TILE_SIZE,
+								plane));
+			}
+		}
+
+		MinimumHeight = Math.min(MinimumHeight, GetCameraTileHeight(worldView, LocalX, LocalY, plane));
+		MinimumHeight = Math.min(MinimumHeight, GetCameraTileHeight(worldView, Left, Bottom, plane));
+		MinimumHeight = Math.min(MinimumHeight, GetCameraTileHeight(worldView, Left, Top, plane));
+		MinimumHeight = Math.min(MinimumHeight, GetCameraTileHeight(worldView, Right, Bottom, plane));
+		MinimumHeight = Math.min(MinimumHeight, GetCameraTileHeight(worldView, Right, Top, plane));
+		return MinimumHeight;
 	}
 
 	@Subscribe
@@ -333,43 +447,45 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			return;
 		}
 
-		CustomMovementHandler PlayerMovementHandler = OverlayRenderer.MovementHandlerCache.get(client.getLocalPlayer().getId());
+		Player player = client.getLocalPlayer();
+		CustomMovementHandler PlayerMovementHandler = OverlayRenderer.MovementHandlerCache.get(player.getId());
 		if (PlayerMovementHandler == null)
 		{
 			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
-
-		int FootprintHeight = Perspective.getFootprintTileHeight(client, client.getLocalPlayer().getLocalLocation(), client.getLocalPlayer().getWorldView().getPlane(), client.getLocalPlayer().getFootprintSize());
-		if (client.getLocalPlayer().getAnimation() != -1)
+		LocalPoint CameraHeightLocation = PlayerMovementHandler.Model == null
+				? null
+				: PlayerMovementHandler.Model.getLocation();
+		if (CameraHeightLocation == null)
 		{
-			FootprintHeight -= client.getLocalPlayer().getAnimationHeightOffset();
+			LastAdaptiveCameraUpdateNanos = 0;
+			return;
+		}
+
+		float FootprintHeight = GetCameraFootprintTileHeight(
+				player.getWorldView(),
+				CameraHeightLocation,
+				player.getWorldView().getPlane(),
+				player.getFootprintSize());
+		if (player.getAnimation() != -1)
+		{
+			FootprintHeight -= player.getAnimationHeightOffset();
 		}
 		else
 		{
 			FootprintHeight -= PlayerMovementHandler.OldAnimationHeight;
 		}
-
-		// Accepted camera zoom synchronization
-		UpdatePredictedZoomFromAcceptedZoom();
-
-		if ( CurrentPredictedZoomLevel == 0)
-		{
-			CurrentPredictedZoomLevel = FootprintHeight - client.getCameraFocalPointY();
-		}
+		int CameraFollowHeight = GetCameraFollowHeight();
 
 		if (!client.isMenuOpen() && (System.currentTimeMillis() -LastInputTime > 60))
 		{
 			bIsRecentInput = false;
 		}
-		else if (client.getCameraMode() == 0)
-		{
-			CurrentPredictedZoomLevel = FootprintHeight - client.getCameraFocalPointY();
-		}
 
 		if (IsAdaptiveCameraOn() && !bIsRecentInput && !PlayerMovementHandler.bShouldRenderOwner)
 		{
-			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight);
+			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight, CameraFollowHeight);
 		}
 		// Keep the normal camera position synchronized while adaptive rendering is paused.
 		else
@@ -559,7 +675,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		InitializeHitsplatImages();
 
 		client.getCanvas().addMouseListener(this);
-		mouseManager.registerMouseWheelListener(this);
 		renderCallbackManager.register(renderCallback);
 		drawManager.registerEveryFrameListener(PostDrawCameraModeHandoff);
 		overlayManager.add(OverlayRenderer);
@@ -568,8 +683,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
 		bAdaptiveCameraRenderedThisFrame = false;
-		// Accepted camera zoom synchronization
-		LastAcceptedZoomLevel = null;
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -593,7 +706,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 		clientThread.invoke(() ->
 		{
             client.getCanvas().removeMouseListener(this);
-			mouseManager.unregisterMouseWheelListener(this);
 			OverlayRenderer.Cleanup();
 			renderCallbackManager.unregister(renderCallback);
 			drawManager.unregisterEveryFrameListener(PostDrawCameraModeHandoff);
@@ -676,49 +788,6 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener, Mou
 			client.setCameraMode(0);
 			LastInputTime = System.currentTimeMillis();
 		}
-	}
-
-	@Override
-	public MouseWheelEvent mouseWheelMoved(MouseWheelEvent event)
-	{
-		// Accepted camera zoom synchronization
-		// The accepted zoom delta is observed on the client thread after the input has been processed.
-		return event;
-	}
-
-	// Accepted camera zoom synchronization
-	private void UpdatePredictedZoomFromAcceptedZoom()
-	{
-		boolean bIsResized = client.isResized();
-		int AcceptedZoomLevel = getAcceptedZoomLevel();
-
-		if (LastAcceptedZoomLevel == null || bLastAcceptedZoomWasResized != bIsResized ||
-				CurrentPredictedZoomLevel == 0)
-		{
-			LastAcceptedZoomLevel = AcceptedZoomLevel;
-			bLastAcceptedZoomWasResized = bIsResized;
-			return;
-		}
-
-		int AcceptedZoomDelta = AcceptedZoomLevel - LastAcceptedZoomLevel;
-		LastAcceptedZoomLevel = AcceptedZoomLevel;
-
-		if (AcceptedZoomDelta == 0)
-		{
-			return;
-		}
-
-		CurrentPredictedZoomLevel += AcceptedZoomDelta * ACCEPTED_ZOOM_TO_PREDICTED_ZOOM_SCALE;
-		CurrentPredictedZoomLevel = Math.min(CurrentPredictedZoomLevel, 112);
-		CurrentPredictedZoomLevel = Math.max(CurrentPredictedZoomLevel, 37);
-	}
-
-	// Accepted camera zoom synchronization
-	private int getAcceptedZoomLevel()
-	{
-		return client.getVarcIntValue(client.isResized()
-				? VarClientID.CAMERA_ZOOM_BIG
-				: VarClientID.CAMERA_ZOOM_SMALL);
 	}
 
 	@Override
