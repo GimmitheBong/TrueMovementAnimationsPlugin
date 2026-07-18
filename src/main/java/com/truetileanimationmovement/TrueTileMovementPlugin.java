@@ -223,6 +223,17 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		return HasWalkHere && HasOtherOption;
 	}
 
+	static boolean ShouldRenderAdaptiveCamera(
+			boolean AdaptiveCameraOn,
+			boolean IsRecentInput,
+			boolean IsMenuOpen,
+			boolean ShouldRenderOwner)
+	{
+		return AdaptiveCameraOn &&
+				(!IsRecentInput || IsMenuOpen) &&
+				!ShouldRenderOwner;
+	}
+
 	private void UpdateAdaptiveCamera(
 			CustomMovementHandler PlayerMovementHandler,
 			float FootprintHeight,
@@ -478,12 +489,21 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 		}
 		int CameraFollowHeight = GetCameraFollowHeight();
 
-		if (!client.isMenuOpen() && (System.currentTimeMillis() -LastInputTime > 60))
+		boolean IsMenuOpen = client.isMenuOpen();
+		if (!IsMenuOpen && (System.currentTimeMillis() - LastInputTime > 60))
 		{
 			bIsRecentInput = false;
 		}
 
-		if (IsAdaptiveCameraOn() && !bIsRecentInput && !PlayerMovementHandler.bShouldRenderOwner)
+		// Menu entries have already been captured with the normal camera. While the
+		// screen-space menu is open, render the 3D scene with the adaptive focal point;
+		// the draw-complete handoff restores the normal camera before native input.
+		// The live menu state also protects presentation if event ordering ever differs.
+		if (ShouldRenderAdaptiveCamera(
+				IsAdaptiveCameraOn(),
+				bIsRecentInput,
+				IsMenuOpen,
+				PlayerMovementHandler.bShouldRenderOwner))
 		{
 			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight, CameraFollowHeight);
 		}
@@ -713,6 +733,15 @@ public class TrueTileMovementPlugin extends Plugin implements MouseListener
 			bForceEarlyOut = true;
 			client.setCameraMode(0);
 		});
+	}
+
+	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		// The normal camera is only needed until the client has finalized the menu.
+		// Release the hold now so closing a quickly selected menu cannot render a
+		// trailing normal-camera frame.
+		bIsRecentInput = false;
 	}
 
 	@Subscribe
