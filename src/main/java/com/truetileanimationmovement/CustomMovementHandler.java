@@ -1,13 +1,16 @@
 package com.truetileanimationmovement;
 
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.AnimationID;
 
 import javax.inject.Inject;
 import java.util.HashSet;
 import java.util.Set;
 
+@Slf4j
 public class CustomMovementHandler
 {
     // General
@@ -19,8 +22,11 @@ public class CustomMovementHandler
     // Time management
     private long CurrentTime;
     public int CurrentFrameDelta;
-    private long LastTimeMilliseconds = 0;
-    private long LastAnimationTickTime = 0;
+    private static final int MAX_FRAME_DELTA_MILLISECONDS = 100;
+    private long CurrentFrameNanos = 0;
+    private long LastFrameNanos = 0;
+    private long TileMovementStartNanos = 0;
+    private int LastAnimationGameCycle = -1;
     private int MillisecondsSinceTileChange = 0;
 
     // Runelite object management
@@ -31,10 +37,12 @@ public class CustomMovementHandler
     // Targeting
     public Actor currentTarget = null;
     private int NotInteractingTimer = 0;
+    private long LastInteractionNanos = 0;
+    private long TargetModelUnavailableSinceNanos = 0;
 
     // Rendering owner
-    public boolean bShouldRenderOwner = false;
-    public boolean bAttemptToRenderOwner = false;
+    public boolean bShouldRenderOwner = true;
+    public boolean bAttemptToRenderOwner = true;
     public boolean bTransitioningToBattleMode = false;
 
     // Local caches
@@ -48,17 +56,23 @@ public class CustomMovementHandler
     private WorldPoint LastLerpPositionWorldPoint;
 
     // Animation Handling
-    private int NO_ANIMATION = -1;
-    private int CurrentAnimationIDPlaying = 3;
-    Set<Integer> UniqueAnimationExceptionList = new HashSet<Integer>();
+    private static final int NO_ANIMATION = -1;
+    private int CurrentAnimationIDPlaying = NO_ANIMATION;
+    private int CurrentAnimationStartingFrame = NO_ANIMATION;
+    private int CurrentAnimationEndingFrame = NO_ANIMATION;
+    private int CurrentAnimationSpeed = NO_ANIMATION;
     Set<Integer> UniqueAnimationLocationAndOrientationExceptionList = new HashSet<Integer>();
     private long LastTimeUniqueAnimationLocationOrientationWasUsed = 0;
+    private int LastOwnerActionAnimation = NO_ANIMATION;
+    private boolean bPlayingKillCelebration = false;
+    private boolean bOwnerMovementAnimationsSuppressed = false;
 
 
     // Original true animations
     private AnimationRequestDetails CurrentAnimationRequest;
     private IdleAnimationSet OldAnimationSet = new IdleAnimationSet();
     public int OldAnimationHeight = 0;
+    private boolean bAnimationHeightRefreshPending = false;
     private boolean bIsDefaultHumanAnimationSet = true;
 
     // Rotation
@@ -96,39 +110,23 @@ public class CustomMovementHandler
         this.overlay = overlay;
         this.Owner = Owner;
 
-        // Initialize all animations we do want to lerp
-        UniqueAnimationExceptionList.add(829); // Eat food
-        UniqueAnimationExceptionList.add(2588); // Agility
-        UniqueAnimationExceptionList.add(2586); // Agility
-        UniqueAnimationExceptionList.add(2583); // Agility
-        UniqueAnimationExceptionList.add(714); // Teleport
-        UniqueAnimationExceptionList.add(878); // Teleport
-        UniqueAnimationExceptionList.add(1816); // Teleport
-        UniqueAnimationExceptionList.add(1979); // Teleport
-        UniqueAnimationExceptionList.add(3872); // Teleport
-        UniqueAnimationExceptionList.add(13811); // Teleport
-        UniqueAnimationExceptionList.add(4069); // Teleport
-        UniqueAnimationExceptionList.add(4071); // Teleport
-        UniqueAnimationExceptionList.add(3869); // Teleport
-        UniqueAnimationExceptionList.add(3865); // Teleport
-
-        UniqueAnimationLocationAndOrientationExceptionList.add(749); // crawl pipe
-        UniqueAnimationLocationAndOrientationExceptionList.add(751); // rope swing
-        UniqueAnimationLocationAndOrientationExceptionList.add(840); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(839); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(1252); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(828); // climb up
-        UniqueAnimationLocationAndOrientationExceptionList.add(740); // climb up
-        UniqueAnimationLocationAndOrientationExceptionList.add(7134); // slide down
-        UniqueAnimationLocationAndOrientationExceptionList.add(844); // crawl
-        UniqueAnimationLocationAndOrientationExceptionList.add(769); // long hop
-        UniqueAnimationLocationAndOrientationExceptionList.add(3057); // Wall climb
-        UniqueAnimationLocationAndOrientationExceptionList.add(3058); // Wall climb
-        UniqueAnimationLocationAndOrientationExceptionList.add(3067); // long jump
-        UniqueAnimationLocationAndOrientationExceptionList.add(3068); // long jump
-        UniqueAnimationLocationAndOrientationExceptionList.add(1115); // jump and cover
-        UniqueAnimationLocationAndOrientationExceptionList.add(5708); // penguin
-        UniqueAnimationLocationAndOrientationExceptionList.add(5709); // penguin
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_DOUBLEPIPESQUEEZE);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_ROPESWING_LONG);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_CRUMBLEDWALL);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_STYLE);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_LOWWALL);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_REACHFORLADDER);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_CLIMBING_DOWN);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_LOGBALANCE_LOOP);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_CRAWLING);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_STEPPINGSTONEJUMP);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_LEDGE_ON_RIGHT);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_LEDGE_OFF_RIGHT);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_GAP_JUMP);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_GAP_JUMP_FALL);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITYARENA_DIVE_PLAYER);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.PENG_JUMP_A);
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.PENG_JUMP_B);
     }
 
     double quadraticTween(long startTime, long endTime, long currentTime)
@@ -155,12 +153,24 @@ public class CustomMovementHandler
         return t;
     }
 
-    private int ShortestAngleDifference(int from, int to)
+    static int ShortestAngleDifference(int from, int to)
     {
-        return ((to - from + 3095) % 2047) - 1048;
+        return ((to - from + 1024) & 2047) - 1024;
     }
 
-    private int getOrientationBetweenPoints(double point1X, double point1Y, double point2X, double point2Y, int OffsetAngle)
+    static int MoveOrientationTowards(int Current, int Target, int MaximumStep)
+    {
+        if (MaximumStep <= 0)
+        {
+            return Current & 2047;
+        }
+
+        int Difference = ShortestAngleDifference(Current, Target);
+        int AppliedStep = Math.max(-MaximumStep, Math.min(MaximumStep, Difference));
+        return (Current + AppliedStep) & 2047;
+    }
+
+    static int getOrientationBetweenPoints(double point1X, double point1Y, double point2X, double point2Y, int OffsetAngle)
     {
         // Calculate the difference in X and Y coordinates
         double deltaX = point2X - point1X;
@@ -169,23 +179,30 @@ public class CustomMovementHandler
         // Calculate the angle in radians
         double angleInRadians = Math.atan2(deltaY, deltaX);
 
-        // Convert to degrees and normalize to a 0-2047 range
-        double angleInDegrees = Math.toDegrees(angleInRadians);
-        angleInDegrees += OffsetAngle;
-
-        if (angleInDegrees < 0)
+        // Convert to the client's 0-2047 orientation range. Normalize after
+        // applying the offset and inversion so offsets above 360 degrees can
+        // never produce a negative orientation.
+        double angleInDegrees = (360.0 - (Math.toDegrees(angleInRadians) + OffsetAngle)) % 360.0;
+        if (angleInDegrees < 0.0)
         {
-            angleInDegrees += 360;
+            angleInDegrees += 360.0;
         }
-
-        angleInDegrees = 360 - angleInDegrees; // Inverted
-
-        return (int) ((angleInDegrees / 360) * 2047);
+        return ((int) (angleInDegrees / 360.0 * 2048.0)) & 2047;
     }
 
     private boolean IsPlayerOwner()
     {
         return (Owner instanceof Player);
+    }
+
+    boolean IsOwner(Actor actor)
+    {
+        return Owner == actor;
+    }
+
+    boolean HasRenderableModel()
+    {
+        return Model != null && Model.isActive() && Model.getModel() != null;
     }
 
     public void Initialize(boolean bRuneliteObjectsStale)
@@ -195,11 +212,12 @@ public class CustomMovementHandler
             AnimController = new AnimationController(client, NO_ANIMATION);
             AnimController.setOnFinished((AnimationController InController) ->
             {
-                // Reset animation (loop)
-                InController.setFrame(0);
-
-                // In the case an enemy animation is played, we reset this now
-                bTargetWasKilled = false;
+                if (bPlayingKillCelebration)
+                {
+                    bTargetWasKilled = false;
+                    bPlayingKillCelebration = false;
+                }
+                InController.loop();
             });
         }
 
@@ -213,7 +231,19 @@ public class CustomMovementHandler
                 Model.setLocation(OldModel.getLocation(), OldModel.getLevel());
                 Model.setOrientation(CurrentOrientation);
                 Model.setAnimationController(OldModel.getAnimationController());
-                client.removeRuneLiteObject(OldModel);
+                OldModel.setActive(false);
+                OldModel.setModel(null);
+            }
+            else
+            {
+                LocalPoint OwnerLocation = Owner.getLocalLocation();
+                if (OwnerLocation != null)
+                {
+                    CurrentOrientation = Owner.getCurrentOrientation();
+                    TargetOrientation = CurrentOrientation;
+                    Model.setLocation(OwnerLocation, Owner.getWorldView().getPlane());
+                    Model.setOrientation(CurrentOrientation);
+                }
             }
         }
 
@@ -255,7 +285,8 @@ public class CustomMovementHandler
                         cameraModel.setLocation(OldModel.getLocation(), OldModel.getLevel());
                         cameraModel.setOrientation(OldModel.getOrientation());
                         cameraModel.setAnimationController(OldModel.getAnimationController());
-                        client.removeRuneLiteObject(OldModel);
+                        OldModel.setActive(false);
+                        OldModel.setModel(null);
                     }
                 }
             }
@@ -264,136 +295,151 @@ public class CustomMovementHandler
 
     public void Cleanup()
     {
-        // Render once with should render owner back on
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
-
-        if (AnimController != null)
+        try
         {
-            AnimController = null;
+            RestoreOwnerAnimations();
+        }
+        catch (RuntimeException ex)
+        {
+            log.debug("Unable to restore actor animations during True Tile cleanup", ex);
         }
 
-        if (Model != null)
+        RuneLiteObject OldModel = Model;
+        Model = null;
+        CleanupRuneLiteObject(OldModel, "movement");
+
+        RuneLiteObject OldCameraModel = cameraModel;
+        cameraModel = null;
+        CleanupRuneLiteObject(OldCameraModel, "camera");
+
+        AnimController = null;
+        cameraModelAnimController = null;
+        LastFrameNanos = 0;
+        CurrentFrameNanos = 0;
+        TileMovementStartNanos = 0;
+        LastAnimationGameCycle = -1;
+        InvalidateCustomAnimation();
+        LastOwnerActionAnimation = NO_ANIMATION;
+        bPlayingKillCelebration = false;
+        bAnimationHeightRefreshPending = false;
+        LastInteractionNanos = 0;
+        TargetModelUnavailableSinceNanos = 0;
+        NotInteractingTimer = 0;
+        bOwnerMovementAnimationsSuppressed = false;
+    }
+
+    private void CleanupRuneLiteObject(RuneLiteObject Object, String Description)
+    {
+        if (Object == null)
         {
-            Model.setModel(null);
-            Model = null;
-            client.removeRuneLiteObject(Model);
-
-            if (Owner.getIdleRotateLeft() == NO_ANIMATION)
-            {
-                Owner.setIdleRotateLeft(OldAnimationSet.IdleRotateLeft);
-            }
-
-            if (Owner.getIdleRotateRight() == NO_ANIMATION)
-            {
-                Owner.setIdleRotateRight(OldAnimationSet.IdleRotateRight);
-            }
-
-            if (Owner.getWalkAnimation() == NO_ANIMATION)
-            {
-                Owner.setWalkAnimation(OldAnimationSet.WalkAnimation);
-            }
-
-            if (Owner.getWalkRotateLeft() == NO_ANIMATION)
-            {
-                Owner.setWalkRotateLeft(OldAnimationSet.WalkRotateLeft);
-            }
-
-            if (Owner.getWalkRotateRight() == NO_ANIMATION)
-            {
-                Owner.setWalkRotateRight(OldAnimationSet.WalkRotateRight);
-            }
-
-            if (Owner.getWalkRotate180() == NO_ANIMATION)
-            {
-                Owner.setWalkRotate180(OldAnimationSet.WalkRotate180);
-            }
-
-            if (Owner.getIdlePoseAnimation() == NO_ANIMATION)
-            {
-                Owner.setIdlePoseAnimation(OldAnimationSet.IdlePoseAnimation);
-            }
-
-            if (Owner.getPoseAnimation() == NO_ANIMATION)
-            {
-                Owner.setPoseAnimation(OldAnimationSet.PoseAnimation);
-            }
-
-            if (Owner.getRunAnimation() == NO_ANIMATION)
-            {
-                Owner.setRunAnimation(OldAnimationSet.RunAnimation);
-            }
-
+            return;
         }
 
-        if (cameraModel != null)
+        try
         {
-            cameraModel.setModel(null);
-            cameraModel = null;
-            client.removeRuneLiteObject(cameraModel);
+            Object.setActive(false);
         }
+        catch (RuntimeException ex)
+        {
+            log.debug("Unable to deactivate True Tile {} object", Description, ex);
+        }
+        try
+        {
+            Object.setModel(null);
+            Object.setAnimationController(null);
+        }
+        catch (RuntimeException ex)
+        {
+            log.debug("Unable to clear True Tile {} object", Description, ex);
+        }
+    }
+
+    private void RestoreOwnerAnimations()
+    {
+        if (Owner == null)
+        {
+            return;
+        }
+
+        if (!bOwnerMovementAnimationsSuppressed)
+        {
+            return;
+        }
+
+        Owner.setIdleRotateLeft(OldAnimationSet.IdleRotateLeft);
+        Owner.setIdleRotateRight(OldAnimationSet.IdleRotateRight);
+        Owner.setWalkAnimation(OldAnimationSet.WalkAnimation);
+        Owner.setWalkRotateLeft(OldAnimationSet.WalkRotateLeft);
+        Owner.setWalkRotateRight(OldAnimationSet.WalkRotateRight);
+        Owner.setWalkRotate180(OldAnimationSet.WalkRotate180);
+        Owner.setIdlePoseAnimation(OldAnimationSet.IdlePoseAnimation);
+        Owner.setPoseAnimation(OldAnimationSet.PoseAnimation);
+        Owner.setRunAnimation(OldAnimationSet.RunAnimation);
+        bOwnerMovementAnimationsSuppressed = false;
     }
 
     private void UpdateOldIdleAnimations()
     {
         boolean bAnyChanges = false;
-        if (Owner.getIdleRotateLeft() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getIdleRotateLeft() != NO_ANIMATION) &&
                 OldAnimationSet.IdleRotateLeft != Owner.getIdleRotateLeft())
         {
             OldAnimationSet.IdleRotateLeft = Owner.getIdleRotateLeft();
             bAnyChanges = true;
         }
 
-        if (Owner.getIdleRotateRight() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getIdleRotateRight() != NO_ANIMATION) &&
                 OldAnimationSet.IdleRotateRight != Owner.getIdleRotateRight())
         {
             OldAnimationSet.IdleRotateRight = Owner.getIdleRotateRight();
             bAnyChanges = true;
         }
 
-        if (Owner.getWalkAnimation() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getWalkAnimation() != NO_ANIMATION) &&
                 OldAnimationSet.WalkAnimation != Owner.getWalkAnimation())
         {
             OldAnimationSet.WalkAnimation = Owner.getWalkAnimation();
             bAnyChanges = true;
         }
 
-        if (Owner.getWalkRotateLeft() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getWalkRotateLeft() != NO_ANIMATION) &&
                 OldAnimationSet.WalkRotateLeft != Owner.getWalkRotateLeft())
         {
             OldAnimationSet.WalkRotateLeft = Owner.getWalkRotateLeft();
             bAnyChanges = true;
         }
 
-        if (Owner.getWalkRotateRight() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getWalkRotateRight() != NO_ANIMATION) &&
                 OldAnimationSet.WalkRotateRight != Owner.getWalkRotateRight())
         {
             OldAnimationSet.WalkRotateRight = Owner.getWalkRotateRight();
             bAnyChanges = true;
         }
 
-        if (Owner.getWalkRotate180() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getWalkRotate180() != NO_ANIMATION) &&
                 OldAnimationSet.WalkRotate180 != Owner.getWalkRotate180())
         {
             OldAnimationSet.WalkRotate180 = Owner.getWalkRotate180();
             bAnyChanges = true;
         }
 
-        if (Owner.getIdlePoseAnimation() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getIdlePoseAnimation() != NO_ANIMATION) &&
                 OldAnimationSet.IdlePoseAnimation != Owner.getIdlePoseAnimation())
         {
             OldAnimationSet.IdlePoseAnimation = Owner.getIdlePoseAnimation();
             bAnyChanges = true;
         }
 
-        if (Owner.getPoseAnimation() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getPoseAnimation() != NO_ANIMATION) &&
                 OldAnimationSet.PoseAnimation != Owner.getPoseAnimation())
         {
             OldAnimationSet.PoseAnimation = Owner.getPoseAnimation();
             bAnyChanges = true;
         }
 
-        if (Owner.getRunAnimation() != NO_ANIMATION &&
+        if ((!bOwnerMovementAnimationsSuppressed || Owner.getRunAnimation() != NO_ANIMATION) &&
                 OldAnimationSet.RunAnimation != Owner.getRunAnimation())
         {
             OldAnimationSet.RunAnimation = Owner.getRunAnimation();
@@ -403,7 +449,6 @@ public class CustomMovementHandler
         if (bAnyChanges)
         {
             OldAnimationSet.CacheUniqueLabel();
-            OldAnimationHeight = Owner.getAnimationHeightOffset();
 
             // Monkey or penguin
             if (OldAnimationSet.IdlePoseAnimation == 1386 ||
@@ -418,80 +463,174 @@ public class CustomMovementHandler
                 bIsDefaultHumanAnimationSet = true;
             }
         }
+
+        // Never cache a transient attack/cast/flinch height as the locomotion
+        // baseline. Equipment changes are common during combat, and the old
+        // value otherwise survives after the action animation ends.
+        if (bAnyChanges && Owner.getAnimation() != NO_ANIMATION)
+        {
+            bAnimationHeightRefreshPending = true;
+        }
+        if (Owner.getAnimation() == NO_ANIMATION &&
+                (bAnyChanges || bShouldRenderOwner || bAnimationHeightRefreshPending))
+        {
+            OldAnimationHeight = Owner.getAnimationHeightOffset();
+            bAnimationHeightRefreshPending = false;
+        }
     }
     private void UpdateFrameTimer()
     {
-        CurrentTime = System.currentTimeMillis();
-        CurrentFrameDelta = (int) (CurrentTime - LastTimeMilliseconds);
-        LastTimeMilliseconds = CurrentTime;
-        MillisecondsSinceTileChange += CurrentFrameDelta;
+        CurrentFrameNanos = System.nanoTime();
+        CurrentTime = CurrentFrameNanos / 1_000_000L;
+        CurrentFrameDelta = CalculateFrameDeltaMilliseconds(LastFrameNanos, CurrentFrameNanos);
+        LastFrameNanos = CurrentFrameNanos;
+
+        if (TileMovementStartNanos == 0)
+        {
+            MillisecondsSinceTileChange = 600;
+        }
+        else
+        {
+            long ElapsedNanos = Math.max(0, CurrentFrameNanos - TileMovementStartNanos);
+            MillisecondsSinceTileChange = (int) Math.min(
+                    Integer.MAX_VALUE,
+                    ElapsedNanos / 1_000_000L);
+        }
     }
 
-    private void UpdateTrueTileLocation()
+    static int CalculateFrameDeltaMilliseconds(long PreviousFrameNanos, long CurrentFrameNanos)
+    {
+        if (PreviousFrameNanos == 0 || CurrentFrameNanos <= PreviousFrameNanos)
+        {
+            return 0;
+        }
+
+        long ElapsedMilliseconds = (CurrentFrameNanos - PreviousFrameNanos) / 1_000_000L;
+        return (int) Math.min(MAX_FRAME_DELTA_MILLISECONDS, ElapsedMilliseconds);
+    }
+
+    private void ResetTileMovementTimer()
+    {
+        TileMovementStartNanos = CurrentFrameNanos;
+        MillisecondsSinceTileChange = 0;
+    }
+
+    private boolean UpdateTrueTileLocation()
     {
         CurrentWorldPoint = Owner.getWorldLocation();
 
         LocalPoint LocalCurrentTrueTilePosition = LocalPoint.fromWorld(client, CurrentWorldPoint);
+        if (LocalCurrentTrueTilePosition == null)
+        {
+            return false;
+        }
+
         if (!LocalCurrentTrueTilePosition.equals(CurrentTrueTilePosition))
         {
             // Also record the last one
             LastTrueTilePosition = CurrentTrueTilePosition;
             CurrentTrueTilePosition = LocalCurrentTrueTilePosition;
         }
+        return true;
     }
 
     private void UpdateTargetStatus()
     {
-        // Potentially disconnect from current fight
-        int TileDistanceFromTarget = 0;
-        if (currentTarget != null)
-        {
-            TileDistanceFromTarget = currentTarget.getWorldLocation().distanceTo(Owner.getWorldLocation());
-        }
-
-        if (currentTarget != null &&
-                (currentTarget.isDead() ||
-                        currentTarget.getModel() == null ||
-                        // Not interacting with the owner and the engagement timer has ran out (Also a decent distance away)
-                        (currentTarget.getInteracting() != Owner
-                                && Owner.getInteracting() != currentTarget
-                                && NotInteractingTimer > config.StopEngagingInCombatTime()
-                                && TileDistanceFromTarget > 3) ||
-                        (currentTarget.getInteracting() != Owner
-                                && Owner.getInteracting() != currentTarget
-                                && NotInteractingTimer > config.StopEngagingInCombatTimeFromCloseDistance()
-                                && TileDistanceFromTarget <= 3)
-                        ||
-                        // Very far
-                        TileDistanceFromTarget > 10 ||
-                        !config.CombatModeEnabled() && Owner.getInteracting() != currentTarget))
-        {
-            bTargetWasKilled = currentTarget.isDead();
-            LastNPCCombatLevel = currentTarget.getCombatLevel();
-            currentTarget = null;
-
-
-            if (bTargetWasKilled)
-            {
-                LastTimeEnemyKilled = CurrentTime;
-            }
-        }
-
         Actor InteractingActor = Owner.getInteracting();
         if (InteractingActor instanceof NPC || InteractingActor instanceof Player)
         {
-            if (currentTarget != InteractingActor)
-            {
-                NotInteractingTimer = 0;
-            }
-
+            // Temporary action changes can clear interaction for a few frames.
+            // A confirmed interaction always resets the grace timer, including
+            // when it resumes against the same target.
+            NotInteractingTimer = 0;
+            LastInteractionNanos = CurrentFrameNanos;
             currentTarget = InteractingActor;
             bTargetWasKilled = false;
-        } else
+            TargetModelUnavailableSinceNanos = 0;
+        }
+        else if (currentTarget != null && LastInteractionNanos != 0)
         {
-            NotInteractingTimer += CurrentFrameDelta;
+            // Start the disengage grace period only after both actors have
+            // actually stopped interacting and the owner's current action has
+            // ended. Eating, casting, and flinching can temporarily clear the
+            // owner's interaction without ending combat.
+            if (currentTarget.getInteracting() == Owner || Owner.getAnimation() != NO_ANIMATION)
+            {
+                LastInteractionNanos = CurrentFrameNanos;
+                NotInteractingTimer = 0;
+            }
+            else
+            {
+                long ElapsedNanos = Math.max(0, CurrentFrameNanos - LastInteractionNanos);
+                NotInteractingTimer = (int) Math.min(
+                        Integer.MAX_VALUE,
+                        ElapsedNanos / 1_000_000L);
+            }
         }
 
+        if (currentTarget == null)
+        {
+            return;
+        }
+
+        LocalPoint TargetLocalLocation = currentTarget.getLocalLocation();
+        if (TargetLocalLocation == null || currentTarget.getWorldView() != Owner.getWorldView())
+        {
+            ClearCurrentTarget(false);
+            return;
+        }
+
+        int TileDistanceFromTarget = currentTarget.getWorldLocation().distanceTo(Owner.getWorldLocation());
+        boolean NeitherActorIsInteracting = currentTarget.getInteracting() != Owner &&
+                Owner.getInteracting() != currentTarget;
+
+        if (NeitherActorIsInteracting && currentTarget.getModel() == null)
+        {
+            if (TargetModelUnavailableSinceNanos == 0)
+            {
+                TargetModelUnavailableSinceNanos = CurrentFrameNanos;
+            }
+        }
+        else
+        {
+            TargetModelUnavailableSinceNanos = 0;
+        }
+
+        boolean TargetModelUnavailableTooLong = TargetModelUnavailableSinceNanos != 0 &&
+                CurrentFrameNanos - TargetModelUnavailableSinceNanos >= 600_000_000L;
+        int DisengageTime = TileDistanceFromTarget > 3
+                ? config.StopEngagingInCombatTime()
+                : config.StopEngagingInCombatTimeFromCloseDistance();
+
+        if (!config.CombatModeEnabled())
+        {
+            DisengageTime = Math.min(DisengageTime, 1200);
+        }
+        if (currentTarget.isDead() ||
+                TileDistanceFromTarget > 10 ||
+                TargetModelUnavailableTooLong ||
+                (NeitherActorIsInteracting && NotInteractingTimer > DisengageTime))
+        {
+            ClearCurrentTarget(currentTarget.isDead());
+        }
+    }
+
+    private void ClearCurrentTarget(boolean TargetWasKilled)
+    {
+        if (currentTarget != null)
+        {
+            LastNPCCombatLevel = currentTarget.getCombatLevel();
+        }
+        bTargetWasKilled = TargetWasKilled;
+        currentTarget = null;
+        LastInteractionNanos = 0;
+        TargetModelUnavailableSinceNanos = 0;
+        NotInteractingTimer = 0;
+
+        if (bTargetWasKilled)
+        {
+            LastTimeEnemyKilled = CurrentTime;
+        }
     }
 
     private boolean ShouldOnlyEnablePluginInCombat()
@@ -571,7 +710,7 @@ public class CustomMovementHandler
                 LastLerpPosition = Model.getLocation();
                 LastLerpPositionWorldPoint = WorldPoint.fromLocal(client, LastLerpPosition);
 
-                MillisecondsSinceTileChange = 0;
+                ResetTileMovementTimer();
                 bNewTileMovementStarted = true;
                 bLastMovementDestinationPotentiallyDirty = true;
             }
@@ -594,6 +733,10 @@ public class CustomMovementHandler
             }
 
             LocalPoint RequestedLerpPoint = LocalPoint.fromWorld(client, CurrentWorldPoint);
+            if (RequestedLerpPoint == null)
+            {
+                return;
+            }
             if (LastLerpPosition == null)
             {
                 NextLerpPosition = RequestedLerpPoint;
@@ -661,7 +804,11 @@ public class CustomMovementHandler
                         (Math.abs(NextLerpPoint.getX() - RequestedLerpPoint.getX()) <= 1024) &&
                         (Math.abs(NextLerpPoint.getY() - RequestedLerpPoint.getY()) <= 1024))
                 {
-                    LastLerpPosition = NextLerpPosition;
+                    // Rebase from the position that was actually shown last frame.
+                    // Server ticks are not guaranteed to arrive exactly 600 ms
+                    // after the prior one, so rebasing from the old destination
+                    // creates a visible snap at each early/late retarget.
+                    LastLerpPosition = SelectTweenStart(NewLocalPointToDraw, NextLerpPosition);
                     LastLerpPositionWorldPoint = WorldPoint.fromLocal(client, LastLerpPosition);
                 }
                 // Lerp point does not exist! Teleport or something like that
@@ -674,7 +821,7 @@ public class CustomMovementHandler
                     // Teleport fallback (Not covered by animation in plugin)
                     if (IsPlayerOwner() && CurrentTime - overlay.LastTimeTeleport >= 1800)
                     {
-                        overlay.LastTimeTeleport = System.currentTimeMillis() - 600; // (We are at this location already, offset expected 1 tick animation time)
+                        overlay.LastTimeTeleport = System.nanoTime() / 1_000_000L - 600; // (We are at this location already, offset expected 1 tick animation time)
                         overlay.bShouldPlayTeleportAnimation = false; // Fallback, do not play animation
                     }
                 }
@@ -683,7 +830,7 @@ public class CustomMovementHandler
 
                 NextLerpPositionWorldPoint = CurrentWorldPoint;
 
-                MillisecondsSinceTileChange = 0;
+                ResetTileMovementTimer();
                 bNewTileMovementStarted = true;
                 bLastMovementDestinationPotentiallyDirty = true;
             }
@@ -734,10 +881,25 @@ public class CustomMovementHandler
         }
 
     }
+
+    static LocalPoint SelectTweenStart(LocalPoint LastRenderedPosition, LocalPoint PreviousDestination)
+    {
+        if (LastRenderedPosition == null ||
+                PreviousDestination == null ||
+                LastRenderedPosition.getWorldView() != PreviousDestination.getWorldView() ||
+                Math.abs(LastRenderedPosition.getX() - PreviousDestination.getX()) > 1024 ||
+                Math.abs(LastRenderedPosition.getY() - PreviousDestination.getY()) > 1024)
+        {
+            return PreviousDestination;
+        }
+
+        return LastRenderedPosition;
+    }
     private boolean bShouldUseTrueLocationOrientation = false;
     private void UpdateAnimationSelection()
     {
         bShouldUseTrueLocationOrientation = false;
+        bPlayingKillCelebration = false;
 
         // Quick and dirty teleport to location
         boolean bApplyQuickAndDirtyTeleport = LastLerpPosition.equals(NextLerpPosition);
@@ -769,7 +931,9 @@ public class CustomMovementHandler
             }
 
             // Just teleported
-            if (IsPlayerOwner() && CurrentTime - overlay.LastTimeTeleport < 1800)
+            if (IsPlayerOwner() &&
+                    overlay.LastTimeTeleport != 0 &&
+                    CurrentTime - overlay.LastTimeTeleport < 1800)
             {
                 if (overlay.bShouldPlayTeleportAnimation && bIsDefaultHumanAnimationSet)
                 {
@@ -782,7 +946,7 @@ public class CustomMovementHandler
                     else
                     {
                         CurrentAnimationRequest.bShouldTeleportToLocation = true;
-                        CurrentAnimationRequest.AnimationToPlay = 715; // Teleport in
+                        CurrentAnimationRequest.AnimationToPlay = AnimationID.HUMAN_CASTTELEPORT_REVERSE;
 
                         ChangeLastLerpPointForRotation();
                     }
@@ -797,8 +961,11 @@ public class CustomMovementHandler
 
                     // Get vector between true tile last and next;
                     // Rotate vector by orientation
-                    int DirectionX = Owner.getLocalLocation().getX() - LastTrueTilePosition.getX();
-                    int DirectionY = Owner.getLocalLocation().getY() - LastTrueTilePosition.getY();
+                    LocalPoint PreviousTrueTile = LastTrueTilePosition == null
+                            ? CurrentTrueTilePosition
+                            : LastTrueTilePosition;
+                    int DirectionX = Owner.getLocalLocation().getX() - PreviousTrueTile.getX();
+                    int DirectionY = Owner.getLocalLocation().getY() - PreviousTrueTile.getY();
 
                     if (Owner.getLocalLocation().getX() == CurrentTrueTilePosition.getX() &&
                             Owner.getLocalLocation().getY() == CurrentTrueTilePosition.getY() )
@@ -861,6 +1028,7 @@ public class CustomMovementHandler
         // Killed the target (not moving)
         else if (bTargetWasKilled && config.AllowNPCKilledCelebrationEmote() && LastNPCCombatLevel > 50 && bIsDefaultHumanAnimationSet)
         {
+            bPlayingKillCelebration = true;
             CurrentAnimationRequest = AnimationRequestMoveset.GetDefaultIdleMoveAnimationRequest(config);
 
             if (LastNPCCombatLevel > 300)
@@ -939,7 +1107,7 @@ public class CustomMovementHandler
 
         if (CurrentAnimationRequest.bResetAnimationOnNewTile && bNewTileMovementStarted)
         {
-            CurrentAnimationIDPlaying = 0; // Reset animation
+            InvalidateCustomAnimation();
         }
 
     }
@@ -954,11 +1122,12 @@ public class CustomMovementHandler
             {
                 bLastTickTooFarToSpecialMove = bTooFarToSpecialMove;
                 if (client.getLocalDestinationLocation() != null) {
-                    if (client.getLocalDestinationLocation() != LastMovementDestination) {
-                        LastMovementDestination = client.getLocalDestinationLocation();
+                    LocalPoint CurrentDestination = client.getLocalDestinationLocation();
+                    if (!CurrentDestination.equals(LastMovementDestination)) {
+                        LastMovementDestination = CurrentDestination;
 
                         // Next position isnt the next lerp position, this means it'll take 2+ moves to actually get there because of an obstacle
-                        if (LastMovementDestination != NextLerpPosition)
+                        if (!LastMovementDestination.equals(NextLerpPosition))
                         {
                             bTooFarToSpecialMove = true;
                         }
@@ -1034,8 +1203,7 @@ public class CustomMovementHandler
             {
                 // Find best direction to go, offset by 10000 for comparison to avoid negatives
                 int CameraTargetOrientation = (getOrientationBetweenPoints(Owner.getLocalLocation().getX(), Owner.getLocalLocation().getY(),
-                        NewLocalPointToDraw.getX(), NewLocalPointToDraw.getX(), 270));
-                int CameraTargetShortestAngle = ShortestAngleDifference(CurrentCameraObjectOrientation, CameraTargetOrientation);
+                        NewLocalPointToDraw.getX(), NewLocalPointToDraw.getY(), 270));
 
                 int NextCameraModelIndex = 0;
                 if (Owner.getLocalLocation().equals(NewLocalPointToDraw) )
@@ -1068,24 +1236,10 @@ public class CustomMovementHandler
                     cameraModel.setModel(client.mergeModels(/*cameraModelAnimController.animate*/(client.loadModel(CurrentCameraModelIndex))));
                 }
 
-                // Need to rotate to our target rotation smoothly
-                if (CameraTargetShortestAngle > 0)
-                {
-                    CurrentCameraObjectOrientation += Math.min(CameraTargetShortestAngle, config.CameraObjectOrientationRotationSpeed());
-                }
-                else if (CameraTargetShortestAngle != 0)
-                {
-                    CurrentCameraObjectOrientation -= Math.min(-CameraTargetShortestAngle, config.CameraObjectOrientationRotationSpeed());
-                }
-
-                if (CurrentCameraObjectOrientation < 0)
-                {
-                    CurrentCameraObjectOrientation += 2047;
-                }
-                else if (CurrentCameraObjectOrientation > 2047)
-                {
-                    CurrentCameraObjectOrientation -= 2047;
-                }
+                CurrentCameraObjectOrientation = MoveOrientationTowards(
+                        CurrentCameraObjectOrientation,
+                        CameraTargetOrientation,
+                        config.CameraObjectOrientationRotationSpeed());
 
                 cameraModel.setOrientation(CurrentCameraObjectOrientation);
 
@@ -1112,207 +1266,294 @@ public class CustomMovementHandler
             else if (cameraModel != null)
             {
                 cameraModel.setModel(null);
+                cameraModel.setActive(false);
             }
         }
     }
 
-    private void UpdateModelVisibleState()
+    static boolean ShouldUseNativeActionModel(int Animation)
     {
-        // Enter combat mode
+        return Animation != NO_ANIMATION;
+    }
+
+    static int CalculateElapsedClientCycles(int PreviousGameCycle, int CurrentGameCycle)
+    {
+        if (PreviousGameCycle < 0 || CurrentGameCycle <= PreviousGameCycle)
+        {
+            return 0;
+        }
+
+        // Avoid pathological catch-up work after a long pause or world change.
+        return Math.min(100, CurrentGameCycle - PreviousGameCycle);
+    }
+
+    private int ConsumeElapsedClientCycles()
+    {
+        int CurrentGameCycle = client.getGameCycle();
+        int ElapsedCycles = CalculateElapsedClientCycles(LastAnimationGameCycle, CurrentGameCycle);
+        LastAnimationGameCycle = CurrentGameCycle;
+        return ElapsedCycles;
+    }
+
+    private void HideOwnerMovementAnimations()
+    {
+        Owner.setIdleRotateLeft(NO_ANIMATION);
+        Owner.setIdleRotateRight(NO_ANIMATION);
+        Owner.setWalkAnimation(NO_ANIMATION);
+        Owner.setWalkRotateLeft(NO_ANIMATION);
+        Owner.setWalkRotateRight(NO_ANIMATION);
+        Owner.setWalkRotate180(NO_ANIMATION);
+        Owner.setIdlePoseAnimation(NO_ANIMATION);
+        Owner.setRunAnimation(NO_ANIMATION);
+        Owner.setPoseAnimation(NO_ANIMATION);
+        bOwnerMovementAnimationsSuppressed = true;
+    }
+
+    private void HideCustomModels()
+    {
+        if (Model != null)
+        {
+            Model.setModel(null);
+            Model.setActive(false);
+        }
+        if (cameraModel != null)
+        {
+            cameraModel.setModel(null);
+            cameraModel.setActive(false);
+        }
+    }
+
+    private boolean FailOpenToOwner()
+    {
+        bShouldRenderOwner = true;
+        bAttemptToRenderOwner = true;
+        RestoreOwnerAnimations();
+        HideCustomModels();
+        return false;
+    }
+
+    private void AdvanceCustomAnimation(int ElapsedClientCycles)
+    {
+        if (CurrentAnimationIDPlaying != CurrentAnimationRequest.AnimationToPlay ||
+                CurrentAnimationStartingFrame != CurrentAnimationRequest.StartingFrame ||
+                CurrentAnimationEndingFrame != CurrentAnimationRequest.EndingFrame ||
+                CurrentAnimationSpeed != CurrentAnimationRequest.AnimationSpeed)
+        {
+            CurrentAnimationIDPlaying = CurrentAnimationRequest.AnimationToPlay;
+            CurrentAnimationStartingFrame = CurrentAnimationRequest.StartingFrame;
+            CurrentAnimationEndingFrame = CurrentAnimationRequest.EndingFrame;
+            CurrentAnimationSpeed = CurrentAnimationRequest.AnimationSpeed;
+            AnimController.setAnimation(client.loadAnimation(CurrentAnimationIDPlaying));
+            AnimController.setFrame(CurrentAnimationStartingFrame);
+            return;
+        }
+
+        if (AnimController.getAnimation() == null || ElapsedClientCycles <= 0)
+        {
+            return;
+        }
+
+        int CurrentFrame = AnimController.getFrame();
+        if (CurrentFrame < CurrentAnimationStartingFrame)
+        {
+            AnimController.setFrame(CurrentAnimationStartingFrame);
+            CurrentFrame = CurrentAnimationStartingFrame;
+        }
+        if (CurrentFrame >= CurrentAnimationEndingFrame)
+        {
+            AnimController.setFrame(CurrentAnimationEndingFrame);
+            return;
+        }
+
+        AnimController.tick(ElapsedClientCycles * CurrentAnimationSpeed);
+        if (AnimController.getAnimation() != null)
+        {
+            if (AnimController.getFrame() < CurrentAnimationStartingFrame)
+            {
+                AnimController.setFrame(CurrentAnimationStartingFrame);
+            }
+            else if (AnimController.getFrame() > CurrentAnimationEndingFrame)
+            {
+                AnimController.setFrame(CurrentAnimationEndingFrame);
+            }
+        }
+    }
+
+    private void InvalidateCustomAnimation()
+    {
+        CurrentAnimationIDPlaying = NO_ANIMATION;
+        CurrentAnimationStartingFrame = NO_ANIMATION;
+        CurrentAnimationEndingFrame = NO_ANIMATION;
+        CurrentAnimationSpeed = NO_ANIMATION;
+    }
+
+    private boolean UpdateModelVisibleState()
+    {
+        int ElapsedClientCycles = ConsumeElapsedClientCycles();
+
         if (!bAttemptToRenderOwner)
         {
             bShouldRenderOwner = false;
         }
 
-        if (!bShouldRenderOwner)
+        if (bShouldRenderOwner)
         {
-            if (!bAttemptToRenderOwner)
+            RestoreOwnerAnimations();
+            HideCustomModels();
+            InvalidateCustomAnimation();
+            LastOwnerActionAnimation = Owner.getAnimation();
+            return true;
+        }
+
+        int OwnerAnimation = Owner.getAnimation();
+        boolean UseNativeActionModel = ShouldUseNativeActionModel(OwnerAnimation);
+
+        if (UseNativeActionModel)
+        {
+            // Capture the action with its native pose/movement layer intact.
+            // The real actor is suppressed at draw time, so restoring these
+            // fields cannot expose a duplicate model.
+            RestoreOwnerAnimations();
+        }
+        else if (!bAttemptToRenderOwner)
+        {
+            HideOwnerMovementAnimations();
+        }
+
+        if (LastOwnerActionAnimation != NO_ANIMATION && OwnerAnimation == NO_ANIMATION)
+        {
+            // Re-enter locomotion from its configured starting frame instead of
+            // exposing a stale custom frame that advanced behind the action.
+            InvalidateCustomAnimation();
+        }
+        LastOwnerActionAnimation = OwnerAnimation;
+
+        bShouldUseTrueLocationOrientation |= (OwnerAnimation != NO_ANIMATION &&
+                currentTarget == null &&
+                UniqueAnimationLocationAndOrientationExceptionList.contains(OwnerAnimation));
+
+        LocalPoint RenderLocation;
+        int RenderOrientation;
+        if (bShouldUseTrueLocationOrientation ||
+                (CurrentTime - LastTimeUniqueAnimationLocationOrientationWasUsed) < 600)
+        {
+            RenderLocation = Owner.getLocalLocation();
+            RenderOrientation = Owner.getCurrentOrientation();
+            CurrentOrientation = RenderOrientation;
+
+            if (bShouldUseTrueLocationOrientation)
             {
-                Owner.setIdleRotateLeft(NO_ANIMATION);
-                Owner.setIdleRotateRight(NO_ANIMATION);
-                Owner.setWalkAnimation(NO_ANIMATION);
-                Owner.setWalkRotateLeft(NO_ANIMATION);
-                Owner.setWalkRotateRight(NO_ANIMATION);
-                Owner.setWalkRotate180(NO_ANIMATION);
-                Owner.setIdlePoseAnimation(NO_ANIMATION);
-                Owner.setRunAnimation(NO_ANIMATION);
-                Owner.setPoseAnimation(NO_ANIMATION);
+                LastTimeUniqueAnimationLocationOrientationWasUsed = CurrentTime;
             }
-
-            // Animation has opted to use the true location/orientation (probably agility obstacle)
-            int OwnerAnimation = Owner.getAnimation();
-            bShouldUseTrueLocationOrientation |= (OwnerAnimation != -1 &&
-                    currentTarget == null &&
-                    UniqueAnimationLocationAndOrientationExceptionList.contains(OwnerAnimation));
-
-            if (bShouldUseTrueLocationOrientation || (CurrentTime - LastTimeUniqueAnimationLocationOrientationWasUsed) < 600) // A little bit of time before going to other animation
-            {
-                Model.setLocation(Owner.getLocalLocation(), Owner.getWorldView().getPlane());
-                Model.setOrientation(Owner.getOrientation());
-                CurrentOrientation = Owner.getOrientation();
-
-                if (bShouldUseTrueLocationOrientation)
-                {
-                    LastTimeUniqueAnimationLocationOrientationWasUsed = CurrentTime;
-                }
-            }
-            else
-            {
-                Model.setLocation(NewLocalPointToDraw, Owner.getWorldView().getPlane());
-
-                // Find best direction to go, offset by 10000 for comparison to avoid negatives
-                int ShortestAngle = ShortestAngleDifference(CurrentOrientation, TargetOrientation);
-
-                // Need to rotate to our target rotation smoothly
-                double AdjustedOrientationSpeed = CurrentAnimationRequest.OrientationSpeed * (CurrentFrameDelta / 16.667);// Speed value centered at 60FPS
-                if (ShortestAngle > 0)
-                {
-                    CurrentOrientation += Math.min(ShortestAngle, AdjustedOrientationSpeed);
-                }
-                else if (ShortestAngle != 0)
-                {
-                    CurrentOrientation -= Math.min(-ShortestAngle, AdjustedOrientationSpeed);
-                }
-
-                if (CurrentOrientation < 0)
-                {
-                    CurrentOrientation += 2047;
-                }
-                else if (CurrentOrientation > 2047)
-                {
-                    CurrentOrientation -= 2047;
-                }
-
-                // Don't rotate if we are at the destination when we are not in battle mode
-                Model.setOrientation(CurrentOrientation);
-            }
-
-
-            if (CurrentAnimationIDPlaying != CurrentAnimationRequest.AnimationToPlay)
-            {
-                CurrentAnimationIDPlaying = CurrentAnimationRequest.AnimationToPlay;
-                AnimController.setAnimation(client.loadAnimation(CurrentAnimationIDPlaying));
-                AnimController.setFrame(CurrentAnimationRequest.StartingFrame);
-            }
-
-            if (CurrentTime - LastAnimationTickTime >= 17) // 17ms per frame->60FPS
-            {
-                LastAnimationTickTime = CurrentTime;
-                int CurrentFrame = AnimController.getFrame();
-                if (CurrentFrame >= CurrentAnimationRequest.EndingFrame) {
-                    AnimController.setFrame(CurrentAnimationRequest.EndingFrame);
-                } else {
-                    AnimController.tick(CurrentAnimationRequest.AnimationSpeed);
-                }
-            }
-
-            // Do not lerp on unique animations outside of combat
-            if (Owner.getAnimation() != -1 &&
-                    (!overlay.bShowHPBar && currentTarget == null) &&
-                    (!UniqueAnimationExceptionList.contains(Owner.getAnimation()) || CurrentAnimationIDPlaying == OldAnimationSet.IdlePoseAnimation))
-            {
-                Model.setModel(client.mergeModels(Owner.getModel()));
-            }
-            else
-            {
-                Model.setModel(client.mergeModels(AnimController.animate(Owner.getModel())));
-            }
-            Model.getModel().setModelHeight(Owner.getModel().getModelHeight());
-            Model.getModel().setUvBufferOffset(Owner.getModel().getUvBufferOffset());
-            Model.getModel().setBufferOffset(Owner.getModel().getBufferOffset());
-            Model.getModel().setSceneId(Owner.getModel().getSceneId());
-
-            int FootprintHeight = Perspective.getFootprintTileHeight(client, Model.getLocation(), Owner.getWorldView().getPlane(), Owner.getFootprintSize());
-            if (Owner.getAnimation() != -1)
-            {
-                FootprintHeight -= Owner.getAnimationHeightOffset();
-            }
-            else
-            {
-                FootprintHeight -= OldAnimationHeight;
-            }
-
-            Model.setZ(FootprintHeight);
-            if (!Model.isActive())
-            {
-                Model.setActive(true);
-            }
-
-            UpdateCamera();
         }
         else
         {
-            if (Owner.getIdleRotateLeft() == NO_ANIMATION)
+            RenderLocation = NewLocalPointToDraw;
+            if (UseNativeActionModel)
             {
-                Owner.setIdleRotateLeft(OldAnimationSet.IdleRotateLeft);
+                RenderOrientation = Owner.getCurrentOrientation();
+                CurrentOrientation = RenderOrientation;
             }
-
-            if (Owner.getIdleRotateRight() == NO_ANIMATION)
+            else
             {
-                Owner.setIdleRotateRight(OldAnimationSet.IdleRotateRight);
-            }
-
-            if (Owner.getWalkAnimation() == NO_ANIMATION)
-            {
-                Owner.setWalkAnimation(OldAnimationSet.WalkAnimation);
-            }
-
-            if (Owner.getWalkRotateLeft() == NO_ANIMATION)
-            {
-                Owner.setWalkRotateLeft(OldAnimationSet.WalkRotateLeft);
-            }
-
-            if (Owner.getWalkRotateRight() == NO_ANIMATION)
-            {
-                Owner.setWalkRotateRight(OldAnimationSet.WalkRotateRight);
-            }
-
-            if (Owner.getWalkRotate180() == NO_ANIMATION)
-            {
-                Owner.setWalkRotate180(OldAnimationSet.WalkRotate180);
-            }
-
-            if (Owner.getIdlePoseAnimation() == NO_ANIMATION)
-            {
-                Owner.setIdlePoseAnimation(OldAnimationSet.IdlePoseAnimation);
-            }
-
-            if (Owner.getPoseAnimation() == NO_ANIMATION)
-            {
-                Owner.setPoseAnimation(OldAnimationSet.PoseAnimation);
-            }
-
-            if (Owner.getRunAnimation() == NO_ANIMATION)
-            {
-                Owner.setRunAnimation(OldAnimationSet.RunAnimation);
-            }
-
-            Model.setModel(null);
-            if (cameraModel != null)
-            {
-                cameraModel.setModel(null);
+                int OrientationStep = (int) Math.round(
+                        CurrentAnimationRequest.OrientationSpeed *
+                                (CurrentFrameDelta / 16.667));
+                CurrentOrientation = MoveOrientationTowards(
+                        CurrentOrientation,
+                        TargetOrientation,
+                        OrientationStep);
+                RenderOrientation = CurrentOrientation;
             }
         }
 
+        if (RenderLocation == null || Model == null || AnimController == null)
+        {
+            return FailOpenToOwner();
+        }
+
+        Model OwnerModel = Owner.getModel();
+        if (OwnerModel == null)
+        {
+            return FailOpenToOwner();
+        }
+
+        Model RenderedModel;
+        if (UseNativeActionModel)
+        {
+            // OwnerModel already contains the authoritative attack/cast/flinch/eat
+            // pose. Applying locomotion again double-transforms it and is the main
+            // source of combat flicker.
+            RenderedModel = client.mergeModels(OwnerModel);
+        }
+        else
+        {
+            AdvanceCustomAnimation(ElapsedClientCycles);
+            Model AnimatedModel = AnimController.getAnimation() == null
+                    ? OwnerModel
+                    : AnimController.animate(OwnerModel);
+            RenderedModel = client.mergeModels(AnimatedModel);
+        }
+
+        if (RenderedModel == null)
+        {
+            return FailOpenToOwner();
+        }
+
+        RenderedModel.setModelHeight(OwnerModel.getModelHeight());
+        RenderedModel.setUvBufferOffset(OwnerModel.getUvBufferOffset());
+        RenderedModel.setBufferOffset(OwnerModel.getBufferOffset());
+        RenderedModel.setSceneId(OwnerModel.getSceneId());
+
+        Model.setLocation(RenderLocation, Owner.getWorldView().getPlane());
+        Model.setOrientation(RenderOrientation);
+        Model.setModel(RenderedModel);
+
+        int FootprintHeight = Perspective.getFootprintTileHeight(
+                client,
+                RenderLocation,
+                Owner.getWorldView().getPlane(),
+                Owner.getFootprintSize());
+        FootprintHeight -= UseNativeActionModel
+                ? Owner.getAnimationHeightOffset()
+                : OldAnimationHeight;
+        Model.setZ(FootprintHeight);
+
+        if (!Model.isActive())
+        {
+            Model.setActive(true);
+        }
+
+        bShouldRenderOwner = false;
+        UpdateCamera();
+        return true;
     }
-    public void Update()
+
+    public boolean Update()
     {
+        if (Owner == null || Model == null)
+        {
+            return FailOpenToOwner();
+        }
+
         UpdateFrameTimer();
-
         UpdateOldIdleAnimations();
-
         UpdateTargetStatus();
 
-        UpdateTrueTileLocation();
+        if (!UpdateTrueTileLocation())
+        {
+            return FailOpenToOwner();
+        }
 
         UpdateLerpDestinations();
+        if (LastLerpPosition == null || NextLerpPosition == null)
+        {
+            return FailOpenToOwner();
+        }
 
         UpdateAnimationSelection();
-
         UpdateMovementType();
-
         ApplyTweening();
-
-        UpdateModelVisibleState();
+        return UpdateModelVisibleState();
     }
 }
