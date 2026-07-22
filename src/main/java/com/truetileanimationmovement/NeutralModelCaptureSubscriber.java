@@ -8,6 +8,10 @@ import net.runelite.api.events.GameTick;
 import net.runelite.client.eventbus.Subscribe;
 
 /**
+ * [TMA-R03] Coordinates the bounded neutral-locomotion capture transaction.
+ * See {@code docs/ANIMATION_RENDERING_ARCHITECTURE.md} for the event-order and
+ * restoration invariants.
+ *
  * Captures native owner models while the actor's animation selectors are
  * temporarily neutral. This lives outside the plugin because RuneLite permits
  * only one correctly named subscriber for each event type on a given object.
@@ -33,7 +37,8 @@ final class NeutralModelCaptureSubscriber
 			return;
 		}
 
-		// The cache was armed at the preceding GameTick in this client cycle.
+		// [TMA-R03] The cache was armed at the preceding GameTick in this
+		// client cycle.
 		// Native actor update has consumed the suppressed selectors; capture and
 		// restore before normal ClientTick subscribers read the actor.
 		overlay.CompleteNeutralOwnerModelCapture(player);
@@ -49,7 +54,8 @@ final class NeutralModelCaptureSubscriber
 			return;
 		}
 
-		// Run after normal GameTick subscribers. Native actor update later in this
+		// [TMA-R03] Run after normal GameTick subscribers. Native actor update
+		// later in this
 		// cycle consumes the bounded suppression; high-priority ClientTick then
 		// captures and restores it before any rendered frame.
 		overlay.BeginNeutralOwnerModelCapture(player);

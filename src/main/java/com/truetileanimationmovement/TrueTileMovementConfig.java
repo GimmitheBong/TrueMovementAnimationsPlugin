@@ -177,6 +177,7 @@ public interface TrueTileMovementConfig extends Config
 		return false;
 	}
 
+	// [TMA-R11] This is the single user-facing override for every plugin leap.
 	@ConfigItem(
 			keyName = "DisableLeapingAnimations",
 			name = "Disable Leaping Animations",

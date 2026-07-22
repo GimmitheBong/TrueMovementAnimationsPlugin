@@ -15,6 +15,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.IntPredicate;
 
+/**
+ * Builds the one replacement-player frame consumed by BeforeRender.
+ *
+ * <p>The {@code [TMA-R##]} labels identify rendering invariants documented in
+ * {@code docs/ANIMATION_RENDERING_ARCHITECTURE.md}. Keep the label beside the
+ * decision it protects so model-source and handoff changes remain auditable.</p>
+ */
 @Slf4j
 public class CustomMovementHandler
 {
@@ -24,7 +31,8 @@ public class CustomMovementHandler
     private final TrueTileMovementConfig config;
     TrueMovementOverlay overlay;
 
-    // Time management
+    // [TMA-R02] One bounded clock for tween and animation progression.
+    // See the architecture guide before changing any of these policy limits.
     private long CurrentTime;
     public int CurrentFrameDelta;
     private static final int MAX_FRAME_DELTA_MILLISECONDS = 100;
@@ -73,7 +81,7 @@ public class CustomMovementHandler
     private int LastRenderedWorldOffsetX = 0;
     private int LastRenderedWorldOffsetY = 0;
 
-    // Animation Handling
+    // Animation handling
     private static final int NO_ANIMATION = -1;
     private int CurrentAnimationIDPlaying = NO_ANIMATION;
     private int CurrentAnimationStartingFrame = NO_ANIMATION;
@@ -87,6 +95,8 @@ public class CustomMovementHandler
     private int LastSuccessfulRenderGameCycle = -1;
     private PlayerAppearanceKey LastRenderedAppearance;
     private int LastRenderedAnimationHeightOffset = 0;
+    // [TMA-R07] A stopped visible model must never borrow the hidden owner's
+    // still-moving pose or orientation while the native route catches up.
     private Model StableStationaryModel;
     private PlayerAppearanceKey StableStationaryAppearance;
     private int StableStationaryAnimationId = NO_ANIMATION;
@@ -97,7 +107,8 @@ public class CustomMovementHandler
     private boolean bHoldingContinuingRouteBoundaryFrame = false;
     private boolean bCurrentSegmentCompletedEarly = false;
 
-    // Custom locomotion must start from an actually neutral player-composition
+    // [TMA-R03, TMA-R04] Custom locomotion must start from an actually neutral
+    // player-composition
     // model. The client keeps hidden pose/transition controllers which are only
     // refreshed during a client tick, so clearing public fields inside
     // BeforeRender cannot produce that model reliably. A bounded GameTick ->
@@ -365,9 +376,10 @@ public class CustomMovementHandler
         }
     }
 
-    // Native actor motion is authoritative while an action or accelerated
-    // displacement is active. Anchoring its delta to the last rendered point
-    // avoids snapping from the interpolated model to the server-side actor.
+    // [TMA-R05, TMA-R06] Native actor motion is authoritative while an action
+    // or accelerated displacement is active. Anchoring its delta to the last
+    // rendered point avoids snapping from the interpolated model to the
+    // server-side actor.
     private boolean bUsingNativeMotion = false;
     private boolean bAcceleratedMovementActive = false;
     private LocalPoint NativeMotionAnchor;
@@ -1483,6 +1495,8 @@ public class CustomMovementHandler
     {
         if (bRuneliteObjectsStale)
         {
+            // [TMA-R09] Keep world-space interpolation history across a scene
+            // rebuild, but never retain scene-owned renderer metadata.
             // Scene buffer metadata belongs to the old scene. The ordinary
             // idle/custom path will seed a fresh detached fallback.
             ClearStableStationaryModel();
@@ -1622,6 +1636,8 @@ public class CustomMovementHandler
 
     private boolean RebaseAfterSceneLoad()
     {
+        // [TMA-R09] Reconstruct the last displayed sub-tile point in the new
+        // local scene before falling back to the owner's current location.
         LocalPoint OwnerLocation = Owner.getLocalLocation();
         if (OwnerLocation == null)
         {
@@ -1685,6 +1701,8 @@ public class CustomMovementHandler
 
     public void Cleanup()
     {
+        // [TMA-R12] Restore capture state before disposing custom renderers so
+        // the normal actor is always a safe final owner.
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
         try
@@ -1851,6 +1869,8 @@ public class CustomMovementHandler
     }
     private void UpdateFrameTimer()
     {
+        // [TMA-R02] Monotonic time avoids wall-clock changes; the bounded delta
+        // avoids visually replaying an entire pause in one rendered frame.
         CurrentFrameNanos = System.nanoTime();
         CurrentTime = CurrentFrameNanos / 1_000_000L;
         CurrentFrameDelta = CalculateFrameDeltaMilliseconds(LastFrameNanos, CurrentFrameNanos);
@@ -1941,6 +1961,9 @@ public class CustomMovementHandler
 
     private void ObserveOwnerMovement()
     {
+        // [TMA-R06] Detect displacement from observed actor positions as well
+        // as destination changes; forced movement does not always look like a
+        // normal route update.
         LocalPoint OwnerLocation = Owner.getLocalLocation();
         int CurrentGameCycle = client.getGameCycle();
         if (OwnerLocation == null)
@@ -2026,6 +2049,8 @@ public class CustomMovementHandler
             LocalPoint LastRenderedPosition,
             boolean SegmentCompletedEarly)
     {
+        // [TMA-R07] The visible endpoint, not the hidden actor's remaining
+        // route progress, decides whether locomotion can continue.
         boolean DestinationPending = Start != null && Destination != null && !Start.equals(Destination);
         if (!DestinationPending)
         {
@@ -2654,6 +2679,8 @@ public class CustomMovementHandler
 
     private void ApplyTweening()
     {
+        // [TMA-R08] Stationary frames preserve visible facing. A coincident
+        // start/end point is deliberately not allowed to invent a direction.
         // 600ms a tick, interpolate between true local point and last true tile position
         double TweenValue = 0;
         if (CurrentAnimationRequest.bShouldTeleportToLocation)
@@ -2788,6 +2815,8 @@ public class CustomMovementHandler
 
     static boolean ShouldUseNativeActionModel(int Animation)
     {
+        // [TMA-R05] Every live action wins. A hard-coded allow-list will miss
+        // casts, flinches, food, teleports, or future game animations.
         return Animation != NO_ANIMATION;
     }
 
@@ -2860,6 +2889,8 @@ public class CustomMovementHandler
 
     private boolean FailOpenToOwner()
     {
+        // [TMA-R12] Correct native rendering is preferable to hiding the player
+        // behind a null, stale, or partially prepared replacement.
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
         if (Owner != null)
@@ -2903,6 +2934,8 @@ public class CustomMovementHandler
             int RenderOrientation,
             PlayerAppearanceKey CurrentAppearance)
     {
+        // [TMA-R07] This is a detached last-good/idle pose. Do not replace it
+        // with Owner.getModel(): the hidden owner may still be walking here.
         if (RenderLocation == null ||
                 CurrentAppearance == null ||
                 LastRenderedAppearance == null ||
@@ -3308,6 +3341,8 @@ public class CustomMovementHandler
 
     private void BeginNativeMotion(LocalPoint OwnerLocation)
     {
+        // [TMA-R06] Preserve the last point the user saw, then apply only the
+        // native displacement accumulated after this handoff.
         if (bUsingNativeMotion)
         {
             return;
@@ -3386,6 +3421,8 @@ public class CustomMovementHandler
 
     private void PrepareNativeMotionState()
     {
+        // [TMA-R05, TMA-R06] Actions/spot effects own model composition;
+        // actions/forced displacement also own motion until the exit rebase.
         int OwnerAnimation = Owner.getAnimation();
         boolean UseNativeActionModel = ShouldUseNativeActionModel(OwnerAnimation);
         boolean UseAcceleratedMovement = IsAcceleratedMovementStillActive();
@@ -3423,6 +3460,9 @@ public class CustomMovementHandler
 
     private boolean UpdateModelVisibleState()
     {
+        // [TMA-R01] This method publishes one complete model/location/
+        // orientation/height snapshot. The plugin hides the owner only after
+        // this returns a renderable result in the same world view.
         int ElapsedClientCycles = ConsumeElapsedClientCycles();
 
         if (!bAttemptToRenderOwner)
@@ -3513,10 +3553,10 @@ public class CustomMovementHandler
                 RequestedAnimation != null,
                 HasHandItemOverride(RequestedAnimation));
 
-        // Native actions and cache-refresh fallbacks do not advance locomotion
-        // behind the model being displayed. Re-enter on the configured first
-        // frame so casts, flinches, forced motion, and equipment changes cannot
-        // reveal an arbitrary mid-stride pose.
+        // [TMA-R05] Native actions and cache-refresh fallbacks do not advance
+        // locomotion behind the model being displayed. Re-enter on the
+        // configured first frame so casts, flinches, forced motion, and
+        // equipment changes cannot reveal an arbitrary mid-stride pose.
         if (UseCustomLocomotionModel && !bCustomLocomotionModelLastFrame)
         {
             InvalidateCustomAnimation();
@@ -3581,8 +3621,8 @@ public class CustomMovementHandler
                 return HoldLastRenderedFrame();
             }
 
-            // Native action/spot/forced frames are already composed by the
-            // game. They receive no second skeletal transform here.
+            // [TMA-R05] Native action/spot/forced frames are already composed
+            // by the game. They receive no second skeletal transform here.
             RenderedModel = client.mergeModels(OwnerModel);
         }
 
@@ -3675,11 +3715,12 @@ public class CustomMovementHandler
             return FailOpenToOwner();
         }
 
-        // The live actor is briefly suppressed only while a neutral appearance
-        // cache is crossing one native actor update. Keep the already composed
-        // frame untouched during that interval (and for the remainder of an
-        // appearance-race cycle): reading selectors or Owner.getModel() would
-        // expose intentionally neutral or cross-appearance state.
+        // [TMA-R03, TMA-R12] The live actor is briefly suppressed only while a
+        // neutral appearance cache is crossing one native actor update. Keep
+        // the already composed frame untouched during that interval (and for
+        // the remainder of an appearance-race cycle): reading selectors or
+        // Owner.getModel() would expose intentionally neutral or
+        // cross-appearance state.
         if (PendingNeutralCaptureState != null ||
                 NeutralCaptureHoldGameCycle == client.getGameCycle())
         {
@@ -3726,8 +3767,8 @@ public class CustomMovementHandler
                         NextLerpPosition,
                         RouteDestination))
         {
-            // Movement-speed multipliers can finish a tween before the server's
-            // 600 ms segment clock. Switch pose state on the exact frame the
+            // [TMA-R07] Movement-speed multipliers can finish a tween before
+            // the server's 600 ms segment clock. Switch pose state on the exact frame the
             // rendered model arrives instead of animating at zero velocity.
             if (MillisecondsSinceTileChange < 600)
             {

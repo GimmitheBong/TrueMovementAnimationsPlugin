@@ -19,6 +19,8 @@ import java.util.stream.Collectors;
 @Slf4j
 public class TrueMovementOverlay extends OverlayPanel
 {
+    // [TMA-R01] This overlay owns the handler that prepares the exact frame
+    // consumed by BeforeRender. It is intentionally not a second model source.
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
@@ -35,6 +37,8 @@ public class TrueMovementOverlay extends OverlayPanel
 
     public void Cleanup()
     {
+        // [TMA-R12] Cleanup is ownership transfer back to the native player,
+        // not merely removal of entries from this map.
         for (Map.Entry<Integer, CustomMovementHandler> entry : MovementHandlerCache.entrySet())
         {
             var value = entry.getValue();
@@ -55,6 +59,8 @@ public class TrueMovementOverlay extends OverlayPanel
 
     public void InvalidateRuneLiteObjects()
     {
+        // [TMA-R09] Region loading invalidates scene objects, while handlers
+        // retain enough world-space history to rebase the visible position.
         InvalidateNeutralOwnerModels();
         bRuneliteObjectsStale = true;
     }
@@ -67,6 +73,8 @@ public class TrueMovementOverlay extends OverlayPanel
 
     void BeginNeutralOwnerModelCapture(Player player)
     {
+        // [TMA-R03] Both capture callbacks must reach this overlay's exact
+        // handler instance; a separately injected unscoped overlay is invalid.
         if (player == null)
         {
             return;
@@ -123,6 +131,8 @@ public class TrueMovementOverlay extends OverlayPanel
 
     CustomMovementHandler PrepareFrame(Player player)
     {
+        // [TMA-R01, TMA-R09] Rebind or rebuild first, then return only a fully
+        // updated handler. Callers must not hide the owner on a null result.
         if (player == null)
         {
             return null;

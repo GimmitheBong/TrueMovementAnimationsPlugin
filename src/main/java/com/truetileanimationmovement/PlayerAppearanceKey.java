@@ -6,6 +6,8 @@ import net.runelite.api.PlayerComposition;
 import java.util.Arrays;
 
 /**
+ * [TMA-R04] Cache identity for detached locomotion poses.
+ *
  * Immutable identity for the geometry used to build a player's unanimated
  * equipment model. Keeping copies is important because the client mutates its
  * composition arrays in place when equipment or recolours change.

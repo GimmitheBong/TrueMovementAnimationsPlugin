@@ -72,6 +72,8 @@ public class TrueTileMovementPlugin extends Plugin
 	private volatile int hiddenLocalPlayerWorldViewId = -1;
 	private volatile boolean hideLocalPlayerScene = false;
 	private volatile boolean hideLocalPlayerUi = false;
+	// [TMA-R01] Scene and UI suppression are published only after the complete
+	// replacement frame is ready and identify this exact player/world view.
 	private final RenderCallback renderCallback = new RenderCallback()
 	{
 		@Override
@@ -155,6 +157,8 @@ public class TrueTileMovementPlugin extends Plugin
 
 	private void PublishLocalPlayerRenderState(Player player, boolean HideLocalPlayer)
 	{
+		// [TMA-R01, TMA-R12] Clearing these fields is the fail-open operation:
+		// RuneScape immediately resumes ownership of the normal player render.
 		if (!HideLocalPlayer || player == null)
 		{
 			hideLocalPlayerScene = false;
@@ -204,7 +208,8 @@ public class TrueTileMovementPlugin extends Plugin
 			bForceAdaptiveCameraOff = true;
 			if (bIsPluginSupportedCurrently && gameState == GameState.LOADING)
 			{
-				// Region rebuilds are temporary. Keep interpolation history and the
+				// [TMA-R09] Region rebuilds are temporary. Keep interpolation
+				// history and the
 				// last good model, but recreate scene-owned RuneLiteObjects when the
 				// client becomes renderable again.
 				OverlayRenderer.InvalidateRuneLiteObjects();
@@ -259,6 +264,8 @@ public class TrueTileMovementPlugin extends Plugin
 			float FootprintHeight,
 			int CameraFollowHeight)
 	{
+		// [TMA-R10] Camera position and height come from the already prepared
+		// replacement frame, never from a separately sampled hidden actor pose.
 		Player player = client.getLocalPlayer();
 		WorldPoint trueWorldTile = player.getWorldLocation();
 		LocalPoint trueLocalTile = LocalPoint.fromWorld(client, trueWorldTile);
@@ -513,6 +520,8 @@ public class TrueTileMovementPlugin extends Plugin
 	@Subscribe
 	public void onBeforeRender(BeforeRender beforeRender)
 	{
+		// [TMA-R01, TMA-R10] Prepare model, hiding state, overlays, and camera
+		// from one snapshot. No other callback is allowed to publish a frame.
 		bAdaptiveCameraRenderedThisFrame = false;
 		Player player = client.getLocalPlayer();
 		if (bForceEarlyOut ||
@@ -825,7 +834,8 @@ public class TrueTileMovementPlugin extends Plugin
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
 		bAdaptiveCameraRenderedThisFrame = false;
-		// TrueMovementOverlay is deliberately unscoped. Construct the auxiliary
+		// [TMA-R03] TrueMovementOverlay is deliberately unscoped. Construct the
+		// auxiliary
 		// subscriber with this plugin's exact overlay instance so its captures
 		// update the same movement-handler cache that is rendered on screen.
 		neutralModelCaptureSubscriber = new NeutralModelCaptureSubscriber(client, OverlayRenderer);
@@ -846,6 +856,8 @@ public class TrueTileMovementPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		// [TMA-R12] Stop capture first, expose the native player, then dispose
+		// callbacks and scene objects on the client thread.
 		bForceEarlyOut = true;
 		if (neutralModelCaptureSubscriberRegistered)
 		{
@@ -931,6 +943,8 @@ public class TrueTileMovementPlugin extends Plugin
 		GameState gameState = gameStateChanged.getGameState();
 		if (gameState == GameState.LOADING)
 		{
+			// [TMA-R09] A rebuild is not a logout: preserve interpolation history
+			// while invalidating objects and caches owned by the old scene.
 			PublishLocalPlayerRenderState(null, false);
 			OverlayRenderer.InvalidateRuneLiteObjects();
 			CurrentCameraPositionX = -1;
