@@ -24,11 +24,8 @@ public class TrueMovementOverlay extends OverlayPanel
     private final TrueTileMovementPlugin plugin;
     private final TrueTileMovementConfig config;
 
-    public boolean bEverythingIsStale = false;
     public boolean bRuneliteObjectsStale = false;
     public boolean bRecentlyClickedEvent = false;
-    public long LastTimeTeleport = 0;
-    public boolean bShouldPlayTeleportAnimation = false;
 
     // HP Bar
     public boolean bShowHPBar = true;
@@ -52,23 +49,76 @@ public class TrueMovementOverlay extends OverlayPanel
         }
 
         MovementHandlerCache.clear();
-        bEverythingIsStale = false;
         bRuneliteObjectsStale = false;
         ResetTransientState();
     }
 
-    public void Invalidate()
+    public void InvalidateRuneLiteObjects()
     {
-        bEverythingIsStale = true;
+        InvalidateNeutralOwnerModels();
         bRuneliteObjectsStale = true;
     }
 
     public void ResetTransientState()
     {
         bRecentlyClickedEvent = false;
-        LastTimeTeleport = 0;
-        bShouldPlayTeleportAnimation = false;
         bShowHPBar = false;
+    }
+
+    void BeginNeutralOwnerModelCapture(Player player)
+    {
+        if (player == null)
+        {
+            return;
+        }
+
+        CustomMovementHandler Handler = MovementHandlerCache.get(player.getId());
+        if (Handler != null && Handler.IsOwner(player))
+        {
+            Handler.BeginNeutralOwnerModelCaptureOnGameTick();
+        }
+    }
+
+    void CompleteNeutralOwnerModelCapture(Player player)
+    {
+        if (player == null)
+        {
+            return;
+        }
+
+        RemoveHandlersForOtherPlayerIds(player.getId());
+
+        CustomMovementHandler Handler = MovementHandlerCache.get(player.getId());
+        if (Handler == null)
+        {
+            return;
+        }
+        if (Handler.IsOwner(player))
+        {
+            Handler.CompleteNeutralOwnerModelCaptureOnClientTick();
+        }
+        else
+        {
+            // A scene rebuild can replace the Player wrapper between the two
+            // callbacks. Restore the old actor immediately; PrepareFrame will
+            // rebind or replace the handler before it can render again.
+            Handler.InvalidateNeutralOwnerModel();
+        }
+    }
+
+    void InvalidateNeutralOwnerModels()
+    {
+        for (CustomMovementHandler Handler : MovementHandlerCache.values())
+        {
+            try
+            {
+                Handler.InvalidateNeutralOwnerModel();
+            }
+            catch (RuntimeException ex)
+            {
+                log.debug("Unable to invalidate a neutral True Tile player model", ex);
+            }
+        }
     }
 
     CustomMovementHandler PrepareFrame(Player player)
@@ -78,17 +128,17 @@ public class TrueMovementOverlay extends OverlayPanel
             return null;
         }
 
-        if (bEverythingIsStale)
-        {
-            Cleanup();
-        }
+        RemoveHandlersForOtherPlayerIds(player.getId());
 
         CustomMovementHandler playerEntry = MovementHandlerCache.get(player.getId());
         if (playerEntry != null && !playerEntry.IsOwner(player))
         {
-            playerEntry.Cleanup();
-            MovementHandlerCache.remove(player.getId());
-            playerEntry = null;
+            if (!bRuneliteObjectsStale || !playerEntry.RebindOwnerAfterSceneLoad(player))
+            {
+                playerEntry.Cleanup();
+                MovementHandlerCache.remove(player.getId());
+                playerEntry = null;
+            }
         }
 
         if (playerEntry == null)
@@ -105,6 +155,45 @@ public class TrueMovementOverlay extends OverlayPanel
             return null;
         }
 
+        return playerEntry;
+    }
+
+    private void RemoveHandlersForOtherPlayerIds(int CurrentPlayerId)
+    {
+        Iterator<Map.Entry<Integer, CustomMovementHandler>> Iterator =
+                MovementHandlerCache.entrySet().iterator();
+        while (Iterator.hasNext())
+        {
+            Map.Entry<Integer, CustomMovementHandler> Entry = Iterator.next();
+            if (Entry.getKey() == CurrentPlayerId)
+            {
+                continue;
+            }
+
+            try
+            {
+                Entry.getValue().Cleanup();
+            }
+            catch (RuntimeException ex)
+            {
+                log.debug("Unable to remove a stale True Tile player handler", ex);
+            }
+            Iterator.remove();
+        }
+    }
+
+    CustomMovementHandler HoldLastFrame(Player player)
+    {
+        if (player == null)
+        {
+            return null;
+        }
+
+        CustomMovementHandler playerEntry = MovementHandlerCache.get(player.getId());
+        if (playerEntry == null || !playerEntry.IsOwner(player) || !playerEntry.HoldLastRenderedFrame())
+        {
+            return null;
+        }
         return playerEntry;
     }
 
@@ -342,26 +431,32 @@ public class TrueMovementOverlay extends OverlayPanel
         if (skullIcon != -1)
         {
             BufferedImage SkullImage = plugin.GetSkullIcon(skullIcon);
-            graphics.drawImage(
-                    SkullImage,
-                    point.getX() - SkullImage.getWidth() / 2,
-                    point.getY() - 30 - 2 + yOffset,
-                    null
-            );
+            if (SkullImage != null)
+            {
+                graphics.drawImage(
+                        SkullImage,
+                        point.getX() - SkullImage.getWidth() / 2,
+                        point.getY() - 30 - 2 + yOffset,
+                        null
+                );
 
-            yOffset = yOffset - 28;
+                yOffset = yOffset - 28;
+            }
         }
 
         if (headIcon != null)
         {
 
             BufferedImage PrayerImage = plugin.GetPrayerIcon(headIcon);
-            graphics.drawImage(
-                    PrayerImage,
-                    point.getX() - PrayerImage.getWidth() / 2,
-                    point.getY() - 30 - 2 + yOffset,
-                    null
-            );
+            if (PrayerImage != null)
+            {
+                graphics.drawImage(
+                        PrayerImage,
+                        point.getX() - PrayerImage.getWidth() / 2,
+                        point.getY() - 30 - 2 + yOffset,
+                        null
+                );
+            }
 
         }
     }

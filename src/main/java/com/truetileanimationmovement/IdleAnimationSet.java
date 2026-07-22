@@ -11,7 +11,6 @@ public class IdleAnimationSet
     public int WalkRotateRight = NO_ANIMATION;
     public int WalkRotate180 = NO_ANIMATION;
     public int IdlePoseAnimation = NO_ANIMATION;
-    public int PoseAnimation = NO_ANIMATION;
     public int RunAnimation = NO_ANIMATION;
 
     private String UniqueLabel;
@@ -30,7 +29,6 @@ public class IdleAnimationSet
                 WalkRotateRight + ":" +
                 WalkRotate180 + ":" +
                 IdlePoseAnimation + ":" +
-                PoseAnimation + ":" +
                 RunAnimation;
     }
 

@@ -8,12 +8,12 @@ import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
-import net.runelite.api.gameval.AnimationID;
 import net.runelite.api.gameval.VarClientID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallback;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -56,6 +56,13 @@ public class TrueTileMovementPlugin extends Plugin
 
 	@Inject
 	private DrawManager drawManager;
+
+	@Inject
+	private EventBus eventBus;
+
+	private NeutralModelCaptureSubscriber neutralModelCaptureSubscriber;
+
+	private boolean neutralModelCaptureSubscriberRegistered = false;
 
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
 	public volatile boolean bIsPluginSupportedCurrently = true;
@@ -141,6 +148,11 @@ public class TrueTileMovementPlugin extends Plugin
 				ObjectWorldViewId != HiddenLocalPlayerWorldViewId;
 	}
 
+	static boolean IsSameWorldView(WorldView First, WorldView Second)
+	{
+		return First != null && Second != null && First.getId() == Second.getId();
+	}
+
 	private void PublishLocalPlayerRenderState(Player player, boolean HideLocalPlayer)
 	{
 		if (!HideLocalPlayer || player == null)
@@ -181,17 +193,29 @@ public class TrueTileMovementPlugin extends Plugin
 	{
 		bIsPluginSupportedCurrently = client.isGpu();
 		Player player = client.getLocalPlayer();
+		GameState gameState = client.getGameState();
 
-		if (!bIsPluginSupportedCurrently ||
+		if (bForceEarlyOut ||
+				!bIsPluginSupportedCurrently ||
 				player == null ||
-				client.getGameState() != GameState.LOGGED_IN)
+				gameState != GameState.LOGGED_IN)
 		{
 			PublishLocalPlayerRenderState(null, false);
 			bForceAdaptiveCameraOff = true;
-			OverlayRenderer.Cleanup();
-			CurrentHitsplats.clear();
-			LastTimeHitSplatApplied = 0;
-			currentWorldView = null;
+			if (bIsPluginSupportedCurrently && gameState == GameState.LOADING)
+			{
+				// Region rebuilds are temporary. Keep interpolation history and the
+				// last good model, but recreate scene-owned RuneLiteObjects when the
+				// client becomes renderable again.
+				OverlayRenderer.InvalidateRuneLiteObjects();
+			}
+			else
+			{
+				OverlayRenderer.Cleanup();
+				CurrentHitsplats.clear();
+				LastTimeHitSplatApplied = 0;
+				currentWorldView = null;
+			}
 			CurrentCameraPositionX = -1;
 			CurrentCameraPositionY = Float.NaN;
 			CurrentCameraPositionZ = -1;
@@ -201,7 +225,7 @@ public class TrueTileMovementPlugin extends Plugin
 			return;
 		}
 
-		bForceAdaptiveCameraOff = client.getWorldView(-1) != player.getWorldView();
+		bForceAdaptiveCameraOff = !IsSameWorldView(client.getWorldView(-1), player.getWorldView());
 
 		// Input, menu sorting, and click detection always use the native camera.
 		// BeforeRender installs the adaptive focal point only for presentation.
@@ -209,6 +233,7 @@ public class TrueTileMovementPlugin extends Plugin
 		{
 			client.setCameraMode(0);
 		}
+
 	}
 
 	static boolean ShouldRenderAdaptiveCamera(
@@ -501,30 +526,35 @@ public class TrueTileMovementPlugin extends Plugin
 		}
 
 		WorldView PlayerWorldView = player.getWorldView();
-		if (currentWorldView != PlayerWorldView)
+		if (currentWorldView == null)
 		{
-			if (currentWorldView != null)
-			{
-				OverlayRenderer.Cleanup();
-				CurrentHitsplats.clear();
-				LastTimeHitSplatApplied = 0;
-				CurrentCameraPositionX = -1;
-				CurrentCameraPositionY = Float.NaN;
-				CurrentCameraPositionZ = -1;
-				LastAdaptiveCameraUpdateNanos = 0;
-			}
+			currentWorldView = PlayerWorldView;
+		}
+		else if (!IsSameWorldView(currentWorldView, PlayerWorldView))
+		{
+			OverlayRenderer.Cleanup();
+			CurrentHitsplats.clear();
+			LastTimeHitSplatApplied = 0;
+			CurrentCameraPositionX = -1;
+			CurrentCameraPositionY = Float.NaN;
+			CurrentCameraPositionZ = -1;
+			LastAdaptiveCameraUpdateNanos = 0;
+			currentWorldView = PlayerWorldView;
+		}
+		else if (currentWorldView != PlayerWorldView)
+		{
+			// The scene wrapper can be replaced while retaining the same logical
+			// world view. Re-register render objects without discarding movement.
+			OverlayRenderer.InvalidateRuneLiteObjects();
 			currentWorldView = PlayerWorldView;
 		}
 
-		// Prepare all scene state before the scene is drawn. The replacement model,
-		// owner suppression, camera, and later overhead rendering now consume the
-		// same frame instead of being split across consecutive frames.
-		PublishLocalPlayerRenderState(player, false);
 		try
 		{
 			CustomMovementHandler PlayerMovementHandler = OverlayRenderer.PrepareFrame(player);
 			if (PlayerMovementHandler == null)
 			{
+				PublishLocalPlayerRenderState(player, false);
 				LastAdaptiveCameraUpdateNanos = 0;
 				return;
 			}
@@ -534,6 +564,7 @@ public class TrueTileMovementPlugin extends Plugin
 			if (CameraHeightLocation == null ||
 					CameraHeightLocation.getWorldView() != PlayerWorldView.getId())
 			{
+				PublishLocalPlayerRenderState(player, false);
 				OverlayRenderer.Cleanup();
 				CurrentCameraPositionX = -1;
 				CurrentCameraPositionY = Float.NaN;
@@ -591,14 +622,29 @@ public class TrueTileMovementPlugin extends Plugin
 		}
 		catch (RuntimeException ex)
 		{
-			PublishLocalPlayerRenderState(player, false);
+			CustomMovementHandler HeldMovementHandler = null;
+			boolean HideLocalPlayer = false;
 			try
 			{
-				OverlayRenderer.Cleanup();
+				HeldMovementHandler = OverlayRenderer.HoldLastFrame(player);
+				HideLocalPlayer = HeldMovementHandler != null &&
+						HeldMovementHandler.HasRenderableModel();
 			}
-			catch (RuntimeException CleanupException)
+			catch (RuntimeException HoldException)
 			{
-				ex.addSuppressed(CleanupException);
+				ex.addSuppressed(HoldException);
+			}
+			PublishLocalPlayerRenderState(player, HideLocalPlayer);
+			if (!HideLocalPlayer)
+			{
+				try
+				{
+					OverlayRenderer.Cleanup();
+				}
+				catch (RuntimeException CleanupException)
+				{
+					ex.addSuppressed(CleanupException);
+				}
 			}
 			CurrentCameraPositionX = -1;
 			CurrentCameraPositionY = Float.NaN;
@@ -606,7 +652,7 @@ public class TrueTileMovementPlugin extends Plugin
 			LastAdaptiveCameraUpdateNanos = 0;
 			bAdaptiveCameraRenderedThisFrame = false;
 			client.setCameraMode(0);
-			log.debug("Unable to prepare True Tile render frame; using native player for this frame", ex);
+			log.debug("Unable to prepare True Tile render frame; holding the last stable frame when possible", ex);
 		}
 	}
 	private long LastTimeHitSplatApplied = 0;
@@ -655,35 +701,22 @@ public class TrueTileMovementPlugin extends Plugin
 			OverlayRenderer.bShowHPBar = false;
 		}
 
-		// Teleports
-		int CurrentAnimation = player.getAnimation();
-		if (CurrentAnimation == AnimationID.HUMAN_CASTTELEPORT ||
-				CurrentAnimation == AnimationID.AHOY_ECTO_TELEPORT ||
-				CurrentAnimation == AnimationID.HUMAN_TELEPORT_OTHER_IMPACT ||
-				CurrentAnimation == AnimationID.ZAROS_VERTICAL_CASTING ||
-				CurrentAnimation == AnimationID.TELEPORT_NARDAH_HUMAN ||
-				CurrentAnimation == AnimationID.HUMAN_COWBOSS_TELEPORT ||
-				CurrentAnimation == AnimationID.POH_SMASH_MAGIC_TABLET ||
-				CurrentAnimation == AnimationID.POH_ABSORB_TABLET_TELEPORT ||
-				CurrentAnimation == AnimationID.TELEPORT_CABBAGE_HUMAN ||
-				CurrentAnimation == AnimationID.ARCEUUS_NECROMANCY_ANIM
-		)
-		{
-			OverlayRenderer.LastTimeTeleport = System.nanoTime() / 1_000_000L;
-			OverlayRenderer.bShouldPlayTeleportAnimation = true;
-		}
-
 		WorldView newWorldView = player.getWorldView();
 		if (currentWorldView == null)
 		{
 			currentWorldView = newWorldView;
 		}
+		else if (!IsSameWorldView(newWorldView, currentWorldView))
+		{
+			currentWorldView = newWorldView;
+			OverlayRenderer.Cleanup();
+			CurrentHitsplats.clear();
+			LastTimeHitSplatApplied = 0;
+		}
 		else if (newWorldView != currentWorldView)
 		{
 			currentWorldView = newWorldView;
-			OverlayRenderer.Invalidate();
-			CurrentHitsplats.clear();
-			LastTimeHitSplatApplied = 0;
+			OverlayRenderer.InvalidateRuneLiteObjects();
 		}
 	}
 
@@ -792,6 +825,12 @@ public class TrueTileMovementPlugin extends Plugin
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
 		bAdaptiveCameraRenderedThisFrame = false;
+		// TrueMovementOverlay is deliberately unscoped. Construct the auxiliary
+		// subscriber with this plugin's exact overlay instance so its captures
+		// update the same movement-handler cache that is rendered on screen.
+		neutralModelCaptureSubscriber = new NeutralModelCaptureSubscriber(client, OverlayRenderer);
+		eventBus.register(neutralModelCaptureSubscriber);
+		neutralModelCaptureSubscriberRegistered = true;
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -808,6 +847,12 @@ public class TrueTileMovementPlugin extends Plugin
 	protected void shutDown() throws Exception
 	{
 		bForceEarlyOut = true;
+		if (neutralModelCaptureSubscriberRegistered)
+		{
+			eventBus.unregister(neutralModelCaptureSubscriber);
+			neutralModelCaptureSubscriberRegistered = false;
+		}
+		neutralModelCaptureSubscriber = null;
 		PublishLocalPlayerRenderState(null, false);
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionY = Float.NaN;
@@ -883,8 +928,19 @@ public class TrueTileMovementPlugin extends Plugin
 			return;
 		}
 
-		// Runelite objects are stale
-		if (gameStateChanged.getGameState() != GameState.LOGGED_IN)
+		GameState gameState = gameStateChanged.getGameState();
+		if (gameState == GameState.LOADING)
+		{
+			PublishLocalPlayerRenderState(null, false);
+			OverlayRenderer.InvalidateRuneLiteObjects();
+			CurrentCameraPositionX = -1;
+			CurrentCameraPositionY = Float.NaN;
+			CurrentCameraPositionZ = -1;
+			LastAdaptiveCameraUpdateNanos = 0;
+			bAdaptiveCameraRenderedThisFrame = false;
+			client.setCameraMode(0);
+		}
+		else if (gameState != GameState.LOGGED_IN)
 		{
 			PublishLocalPlayerRenderState(null, false);
 			OverlayRenderer.Cleanup();

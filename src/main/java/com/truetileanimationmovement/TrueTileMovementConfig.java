@@ -178,6 +178,16 @@ public interface TrueTileMovementConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "DisableLeapingAnimations",
+			name = "Disable Leaping Animations",
+			description = "Use normal movement animations instead of plugin-selected hopping or leaping animations"
+	)
+	default boolean DisableLeapingAnimations()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 			keyName = "StationaryCameraModelIndex",
 			name = "Stationary Camera Model",
 			description = "Index of what geometry to render the camera when stationary",

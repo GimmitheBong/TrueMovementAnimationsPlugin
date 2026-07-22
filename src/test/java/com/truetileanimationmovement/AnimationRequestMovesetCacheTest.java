@@ -13,7 +13,7 @@ public class AnimationRequestMovesetCacheTest
         IdleAnimationSet animationSet = new IdleAnimationSet();
 
         assertEquals(-1, animationSet.IdlePoseAnimation);
-        assertEquals("-1:-1:-1:-1:-1:-1:-1:-1:-1", animationSet.GetUniqueLabel());
+        assertEquals("-1:-1:-1:-1:-1:-1:-1:-1", animationSet.GetUniqueLabel());
     }
 
     @Test
@@ -50,7 +50,6 @@ public class AnimationRequestMovesetCacheTest
         animationSet.WalkRotateRight = 6;
         animationSet.WalkRotate180 = 7;
         animationSet.IdlePoseAnimation = 8;
-        animationSet.PoseAnimation = 9;
         animationSet.RunAnimation = 10;
         animationSet.CacheUniqueLabel();
         return animationSet;
