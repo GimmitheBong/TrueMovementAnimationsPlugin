@@ -136,6 +136,27 @@ public class CustomMovementHandlerTest
     }
 
     @Test
+    public void combatTargetFacingHonoursTheToggleAndConfiguredRadius()
+    {
+        assertTrue(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                true, 4, 4));
+        assertFalse(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                true, 5, 4));
+        assertFalse(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                false, 1, 4));
+        assertTrue(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                true, 1, -5));
+        assertFalse(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                true, 2, -5));
+        assertTrue(CustomMovementHandler.ShouldUseCombatTargetFacing(
+                true, 10, 50));
+
+        TrueTileMovementConfig config = new TrueTileMovementConfig() { };
+        assertTrue(config.CombatTargetFacingEnabled());
+        assertEquals(4, config.CombatTargetFacingDistance());
+    }
+
+    @Test
     public void retargetingStartsAtLastRenderedPositionWhenSafe()
     {
         LocalPoint rendered = new LocalPoint(1_000, 2_000, -1);

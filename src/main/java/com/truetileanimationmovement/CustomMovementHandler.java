@@ -2240,7 +2240,11 @@ public class CustomMovementHandler
 
         boolean TargetModelUnavailableTooLong = TargetModelUnavailableSinceNanos != 0 &&
                 CurrentFrameNanos - TargetModelUnavailableSinceNanos >= 600_000_000L;
-        int DisengageTime = TileDistanceFromTarget > 3
+        // The same radius controls the close-range timer and combat-facing,
+        // so "close" never means something different in each subsystem.
+        int DisengageTime = TileDistanceFromTarget >
+                NormalizeCombatTargetFacingDistance(
+                        config.CombatTargetFacingDistance())
                 ? config.StopEngagingInCombatTime()
                 : config.StopEngagingInCombatTimeFromCloseDistance();
 
@@ -2494,6 +2498,22 @@ public class CustomMovementHandler
 
         return LastRenderedPosition;
     }
+
+    static int NormalizeCombatTargetFacingDistance(int ConfiguredDistance)
+    {
+        return Math.max(1, Math.min(10, ConfiguredDistance));
+    }
+
+    static boolean ShouldUseCombatTargetFacing(
+            boolean Enabled,
+            int TargetDistance,
+            int ConfiguredDistance)
+    {
+        return Enabled &&
+                TargetDistance >= 0 &&
+                TargetDistance <= NormalizeCombatTargetFacingDistance(
+                        ConfiguredDistance);
+    }
     private boolean bShouldUseTrueLocationOrientation = false;
     private boolean bUseTrueLocationGraceThisFrame = false;
     private boolean bUseNativeMotionThisFrame = false;
@@ -2704,7 +2724,12 @@ public class CustomMovementHandler
         {
             TargetOrientation = CurrentOrientation;
         }
-        else if (currentTarget != null)
+        else if (currentTarget != null &&
+                ShouldUseCombatTargetFacing(
+                        config.CombatTargetFacingEnabled(),
+                        currentTarget.getWorldLocation().distanceTo(
+                                Owner.getWorldLocation()),
+                        config.CombatTargetFacingDistance()))
         {
             LocalPoint TargetLocation = currentTarget.getLocalLocation();
             if (TargetLocation != null)

@@ -3,6 +3,7 @@ package com.truetileanimationmovement;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
 
 @ConfigGroup("TrueTileMovement")
 public interface TrueTileMovementConfig extends Config
@@ -145,6 +146,27 @@ public interface TrueTileMovementConfig extends Config
 	{
 		return 7200;
 	} // 120 ticks
+
+	@ConfigItem(
+			keyName = "CombatTargetFacingEnabled",
+			name = "Combat Target Facing",
+			description = "Face the active combat target while it is within the configured combat target facing distance"
+	)
+	default boolean CombatTargetFacingEnabled()
+	{
+		return true;
+	}
+
+	@Range(min = 1, max = 10)
+	@ConfigItem(
+			keyName = "CombatTargetFacingDistance",
+			name = "Combat Target Facing Distance",
+			description = "Tile distance used for combat target facing and for selecting the close-range de-agro timer"
+	)
+	default int CombatTargetFacingDistance()
+	{
+		return 4;
+	}
 
 	@ConfigItem(
 			keyName = "SpawnModelAtCameraTile",
