@@ -22,8 +22,10 @@ import net.runelite.client.ui.overlay.OverlayManager;
 
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import net.runelite.api.Perspective;
 import net.runelite.client.util.ImageUtil;
@@ -36,6 +38,24 @@ import static net.runelite.api.HitsplatID.*;
 )
 public class TrueTileMovementPlugin extends Plugin
 {
+	@SuppressWarnings("deprecation")
+	private static final Set<MenuAction> STATIONARY_INTERACTION_ACTIONS =
+			EnumSet.of(
+					MenuAction.ITEM_USE_ON_GAME_OBJECT,
+					MenuAction.WIDGET_TARGET_ON_GAME_OBJECT,
+					MenuAction.GAME_OBJECT_FIRST_OPTION,
+					MenuAction.GAME_OBJECT_SECOND_OPTION,
+					MenuAction.GAME_OBJECT_THIRD_OPTION,
+					MenuAction.GAME_OBJECT_FOURTH_OPTION,
+					MenuAction.GAME_OBJECT_FIFTH_OPTION,
+					MenuAction.ITEM_USE_ON_NPC,
+					MenuAction.WIDGET_TARGET_ON_NPC,
+					MenuAction.NPC_FIRST_OPTION,
+					MenuAction.NPC_SECOND_OPTION,
+					MenuAction.NPC_THIRD_OPTION,
+					MenuAction.NPC_FOURTH_OPTION,
+					MenuAction.NPC_FIFTH_OPTION);
+
 	@Inject
 	private Client client;
 
@@ -921,6 +941,32 @@ public class TrueTileMovementPlugin extends Plugin
 			return;
 		}
 
+		MenuEntry Entry = event.getMenuEntry();
+		boolean StationaryInteraction = ShouldUseStationaryInteractionFacing(
+				event.getMenuAction(),
+				event.getMenuOption());
+
+		// [TMA-R13] A new world action replaces the pending interaction target.
+		// Widget clicks do not, so an interface opening cannot discard the
+		// native facing direction captured from its NPC or object.
+		if ((Entry != null && Entry.getWidget() == null) ||
+				(STATIONARY_INTERACTION_ACTIONS.contains(
+						event.getMenuAction()) &&
+						!StationaryInteraction))
+		{
+			OverlayRenderer.ClearStationaryInteractionFacing();
+		}
+		if (StationaryInteraction)
+		{
+			Player LocalPlayer = client.getLocalPlayer();
+			if (LocalPlayer != null)
+			{
+				OverlayRenderer.RequestStationaryInteractionFacing(
+						LocalPlayer,
+						Entry == null ? null : Entry.getNpc());
+			}
+		}
+
 		// TODO make less manual
 		if (event.getMenuOption().equals("Walk here") ||
 				event.getMenuOption().equals("Attack") ||
@@ -930,6 +976,16 @@ public class TrueTileMovementPlugin extends Plugin
 		{
 			OverlayRenderer.bRecentlyClickedEvent = true;
 		}
+	}
+
+	static boolean ShouldUseStationaryInteractionFacing(
+			MenuAction Action,
+			String Option)
+	{
+		return Action != null &&
+				STATIONARY_INTERACTION_ACTIONS.contains(Action) &&
+				!"Attack".equalsIgnoreCase(Option) &&
+				!"Cast".equalsIgnoreCase(Option);
 	}
 
 	@Subscribe

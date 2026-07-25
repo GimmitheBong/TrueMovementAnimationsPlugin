@@ -61,6 +61,7 @@ public class TrueMovementOverlay extends OverlayPanel
     {
         // [TMA-R09] Region loading invalidates scene objects, while handlers
         // retain enough world-space history to rebase the visible position.
+        ClearStationaryInteractionFacing();
         InvalidateNeutralOwnerModels();
         bRuneliteObjectsStale = true;
     }
@@ -69,6 +70,33 @@ public class TrueMovementOverlay extends OverlayPanel
     {
         bRecentlyClickedEvent = false;
         bShowHPBar = false;
+        ClearStationaryInteractionFacing();
+    }
+
+    void RequestStationaryInteractionFacing(
+            Player Owner,
+            Actor TargetActor)
+    {
+        if (Owner == null)
+        {
+            return;
+        }
+
+        CustomMovementHandler Handler =
+                MovementHandlerCache.get(Owner.getId());
+        if (Handler != null && Handler.IsOwner(Owner))
+        {
+            Handler.RequestStationaryInteractionFacing(TargetActor);
+        }
+    }
+
+    void ClearStationaryInteractionFacing()
+    {
+        for (CustomMovementHandler Handler :
+                MovementHandlerCache.values())
+        {
+            Handler.ClearStationaryInteractionFacing();
+        }
     }
 
     void BeginNeutralOwnerModelCapture(Player player)

@@ -46,6 +46,9 @@ public class CustomMovementHandler
     private static final int MAX_NORMAL_LOCAL_UNITS_PER_CLIENT_CYCLE = 16;
     private static final int MAX_NORMAL_DESTINATION_DELTA = Perspective.LOCAL_TILE_SIZE * 2;
     private static final int SPATIAL_DISCONTINUITY_DELTA = Perspective.LOCAL_TILE_SIZE * 8;
+    static final int STATIONARY_FACING_CONFIRM_CYCLES = 30;
+    private static final int STATIONARY_FACING_SETTLE_TIMEOUT_CYCLES = 180;
+    private static final int STATIONARY_FACING_REQUEST_TIMEOUT_CYCLES = 3000;
     private long CurrentFrameNanos = 0;
     private long LastFrameNanos = 0;
     private long TileMovementStartNanos = 0;
@@ -408,6 +411,18 @@ public class CustomMovementHandler
     private int TargetOrientation = 0;
     private int CurrentOrientation = 0;
     private boolean bStationaryThisFrame = false;
+    // [TMA-R13] An interaction-facing request survives any approach movement,
+    // but it can influence orientation only after the visible model stops.
+    private Actor StationaryFacingTargetActor;
+    private int StationaryFacingStartAnimation = NO_ANIMATION;
+    private int StationaryFacingStartOrientation = 0;
+    private int StationaryFacingStartTargetOrientation = 0;
+    private int StationaryFacingStartGameCycle = -1;
+    private int StationaryFacingStationarySinceGameCycle = -1;
+    private boolean bStationaryInteractionFacingConfirmed = false;
+    private boolean bUseStationaryInteractionFacingThisFrame = false;
+    private int LastMovementTargetOrientation = 0;
+    private boolean bFinishMovementOrientationAfterStop = false;
 
 
     // Player only
@@ -2514,6 +2529,146 @@ public class CustomMovementHandler
                 TargetDistance <= NormalizeCombatTargetFacingDistance(
                         ConfiguredDistance);
     }
+
+    static boolean ShouldConfirmStationaryInteractionFacing(
+            boolean NativeInteractionStarted,
+            int CurrentAnimation,
+            int AnimationWhenClicked,
+            int ElapsedClientCycles)
+    {
+        return NativeInteractionStarted ||
+                (CurrentAnimation != NO_ANIMATION &&
+                        CurrentAnimation != AnimationWhenClicked) ||
+                ElapsedClientCycles >= STATIONARY_FACING_CONFIRM_CYCLES;
+    }
+
+    static boolean ShouldFinishMovementOrientationAfterStop(
+            int CurrentOrientation,
+            int MovementTargetOrientation)
+    {
+        // Only finish a small partial turn. A stale or unrelated target must
+        // never recreate the old full spin after stopping.
+        return Math.abs(ShortestAngleDifference(
+                CurrentOrientation,
+                MovementTargetOrientation)) <= 128;
+    }
+
+    void RequestStationaryInteractionFacing(Actor TargetActor)
+    {
+        if (!IsPlayerOwner())
+        {
+            ClearStationaryInteractionFacing();
+            return;
+        }
+
+        StationaryFacingTargetActor = TargetActor;
+        StationaryFacingStartAnimation = Owner.getAnimation();
+        StationaryFacingStartOrientation =
+                Owner.getCurrentOrientation();
+        StationaryFacingStartTargetOrientation =
+                Owner.getOrientation();
+        StationaryFacingStartGameCycle = client.getGameCycle();
+        StationaryFacingStationarySinceGameCycle = -1;
+        bStationaryInteractionFacingConfirmed = false;
+        bUseStationaryInteractionFacingThisFrame = false;
+        bFinishMovementOrientationAfterStop = false;
+    }
+
+    void ClearStationaryInteractionFacing()
+    {
+        StationaryFacingTargetActor = null;
+        StationaryFacingStartGameCycle = -1;
+        StationaryFacingStationarySinceGameCycle = -1;
+        bStationaryInteractionFacingConfirmed = false;
+        bUseStationaryInteractionFacingThisFrame = false;
+    }
+
+    private void UpdateStationaryInteractionFacing()
+    {
+        bUseStationaryInteractionFacingThisFrame = false;
+        if (StationaryFacingStartGameCycle < 0)
+        {
+            return;
+        }
+
+        int CurrentGameCycle = client.getGameCycle();
+        int RequestElapsedCycles = CurrentGameCycle -
+                StationaryFacingStartGameCycle;
+        if (RequestElapsedCycles < 0 ||
+                RequestElapsedCycles >
+                        STATIONARY_FACING_REQUEST_TIMEOUT_CYCLES)
+        {
+            ClearStationaryInteractionFacing();
+            return;
+        }
+
+        if (!bStationaryThisFrame)
+        {
+            // Keep the request for arrival, but never steer the visible model
+            // toward the interaction target during its walk/run approach.
+            StationaryFacingStationarySinceGameCycle = -1;
+            bStationaryInteractionFacingConfirmed = false;
+            return;
+        }
+
+        if (StationaryFacingStationarySinceGameCycle < 0)
+        {
+            StationaryFacingStationarySinceGameCycle =
+                    CurrentGameCycle;
+        }
+        int StationaryElapsedCycles = CurrentGameCycle -
+                StationaryFacingStationarySinceGameCycle;
+        if (StationaryElapsedCycles >
+                STATIONARY_FACING_SETTLE_TIMEOUT_CYCLES)
+        {
+            ClearStationaryInteractionFacing();
+            return;
+        }
+
+        if (Owner.getAnimation() != NO_ANIMATION &&
+                UniqueAnimationLocationAndOrientationExceptionList
+                        .contains(Owner.getAnimation()))
+        {
+            ClearStationaryInteractionFacing();
+            return;
+        }
+
+        if (!bStationaryInteractionFacingConfirmed)
+        {
+            // RuneScape publishes a destination for object interactions even
+            // when no movement is needed. A destination is therefore only a
+            // reason to wait one stable tick; actual visible movement is
+            // handled by the branch above and never cancels this request.
+            boolean ActionAnimationStarted =
+                    Owner.getAnimation() != NO_ANIMATION &&
+                            Owner.getAnimation() !=
+                                    StationaryFacingStartAnimation;
+            boolean WaitingForMovementDecision =
+                    client.getLocalDestinationLocation() != null &&
+                            !ActionAnimationStarted &&
+                            StationaryElapsedCycles <
+                                    STATIONARY_FACING_CONFIRM_CYCLES;
+            boolean NativeInteractionStarted =
+                    (StationaryFacingTargetActor != null &&
+                            Owner.getInteracting() ==
+                                    StationaryFacingTargetActor) ||
+                            Owner.getOrientation() !=
+                                    StationaryFacingStartTargetOrientation ||
+                            Owner.getCurrentOrientation() !=
+                                    StationaryFacingStartOrientation;
+            bStationaryInteractionFacingConfirmed =
+                    !WaitingForMovementDecision &&
+                    ShouldConfirmStationaryInteractionFacing(
+                            NativeInteractionStarted,
+                            Owner.getAnimation(),
+                            StationaryFacingStartAnimation,
+                            StationaryElapsedCycles);
+        }
+
+        bUseStationaryInteractionFacingThisFrame =
+                bStationaryInteractionFacingConfirmed;
+    }
+
     private boolean bShouldUseTrueLocationOrientation = false;
     private boolean bUseTrueLocationGraceThisFrame = false;
     private boolean bUseNativeMotionThisFrame = false;
@@ -2720,9 +2875,31 @@ public class CustomMovementHandler
                 (int) (LastLerpPosition.getY() + (NextLerpPosition.getY() - LastLerpPosition.getY()) * TweenValue),
                 LastLerpPosition.getWorldView());
 
-        if (bStationaryThisFrame)
+        if (bUseStationaryInteractionFacingThisFrame)
         {
-            TargetOrientation = CurrentOrientation;
+            // [TMA-R13] Use RuneScape's native interaction orientation only
+            // after the rendered model is stationary, then ease toward it.
+            // getOrientation() is RuneScape's exact target. In contrast,
+            // getCurrentOrientation() is only an intermediate turn step.
+            TargetOrientation = Owner.getOrientation();
+            bFinishMovementOrientationAfterStop = false;
+        }
+        else if (bStationaryThisFrame)
+        {
+            boolean FinishMovementOrientation =
+                    bFinishMovementOrientationAfterStop &&
+                            ShouldFinishMovementOrientationAfterStop(
+                                    CurrentOrientation,
+                                    LastMovementTargetOrientation);
+            if (FinishMovementOrientation)
+            {
+                TargetOrientation = LastMovementTargetOrientation;
+            }
+            else
+            {
+                TargetOrientation = CurrentOrientation;
+                bFinishMovementOrientationAfterStop = false;
+            }
         }
         else if (currentTarget != null &&
                 ShouldUseCombatTargetFacing(
@@ -2732,6 +2909,7 @@ public class CustomMovementHandler
                         config.CombatTargetFacingDistance()))
         {
             LocalPoint TargetLocation = currentTarget.getLocalLocation();
+            bFinishMovementOrientationAfterStop = false;
             if (TargetLocation != null)
             {
                 TargetOrientation = getOrientationBetweenPoints(
@@ -2748,6 +2926,7 @@ public class CustomMovementHandler
         {
             // Target is toward the real player now
             TargetOrientation = Owner.getCurrentOrientation();
+            bFinishMovementOrientationAfterStop = false;
         }
         // Face towards where you are moving
         else if (!LastLerpPosition.equals(NextLerpPosition))
@@ -2759,6 +2938,8 @@ public class CustomMovementHandler
                     NextLerpPosition.getY(),
                     90,
                     CurrentOrientation);
+            LastMovementTargetOrientation = TargetOrientation;
+            bFinishMovementOrientationAfterStop = true;
         }
     }
 
@@ -3523,9 +3704,23 @@ public class CustomMovementHandler
                     RenderMotionAnchor,
                     NativeMotionAnchor,
                     OwnerLocation);
-            RenderOrientation = Owner.getCurrentOrientation();
-            CurrentOrientation = RenderOrientation;
-            TargetOrientation = RenderOrientation;
+            if (bUseStationaryInteractionFacingThisFrame)
+            {
+                int OrientationStep = (int) Math.round(
+                        CurrentAnimationRequest.OrientationSpeed *
+                                (CurrentFrameDelta / 16.667));
+                CurrentOrientation = MoveOrientationTowards(
+                        CurrentOrientation,
+                        TargetOrientation,
+                        OrientationStep);
+                RenderOrientation = CurrentOrientation;
+            }
+            else
+            {
+                RenderOrientation = Owner.getCurrentOrientation();
+                CurrentOrientation = RenderOrientation;
+                TargetOrientation = RenderOrientation;
+            }
         }
         else
         {
@@ -3538,6 +3733,12 @@ public class CustomMovementHandler
                     TargetOrientation,
                     OrientationStep);
             RenderOrientation = CurrentOrientation;
+        }
+        if (bStationaryThisFrame &&
+                bFinishMovementOrientationAfterStop &&
+                CurrentOrientation == LastMovementTargetOrientation)
+        {
+            bFinishMovementOrientationAfterStop = false;
         }
 
         if (RenderLocation == null || Model == null || AnimController == null)
@@ -3770,6 +3971,7 @@ public class CustomMovementHandler
 
         PrepareNativeMotionState();
         UpdateAnimationSelection();
+        UpdateStationaryInteractionFacing();
         UpdateMovementType();
         ApplyTweening();
         LocalPoint RouteDestination = IsPlayerOwner()

@@ -1,5 +1,6 @@
 package com.truetileanimationmovement;
 
+import net.runelite.api.MenuAction;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -62,5 +63,23 @@ public class RenderStateTest
         assertFalse(TrueTileMovementPlugin.ShouldHidePreparedPlayer(false, true, 6, 7));
         assertFalse(TrueTileMovementPlugin.ShouldHidePreparedPlayer(true, true, 7, 7));
         assertFalse(TrueTileMovementPlugin.ShouldHidePreparedPlayer(false, false, 7, 7));
+    }
+
+    @Test
+    public void stationaryFacingOnlyTracksNonCombatNpcAndObjectActions()
+    {
+        assertTrue(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.NPC_FIRST_OPTION, "Talk-to"));
+        assertTrue(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.GAME_OBJECT_SECOND_OPTION, "Pick"));
+        assertTrue(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.WIDGET_TARGET_ON_GAME_OBJECT, "Use"));
+
+        assertFalse(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.NPC_SECOND_OPTION, "Attack"));
+        assertFalse(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.WIDGET_TARGET_ON_NPC, "Cast"));
+        assertFalse(TrueTileMovementPlugin.ShouldUseStationaryInteractionFacing(
+                MenuAction.WALK, "Walk here"));
     }
 }

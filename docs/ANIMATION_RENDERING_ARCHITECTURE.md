@@ -339,6 +339,58 @@ methods, `TrueMovementOverlay.InvalidateNeutralOwnerModels`, and plugin
 **Automated coverage:** the render-state fail-open tests and lifecycle-sensitive
 neutral capture tests. In-game toggle/reload testing remains required.
 
+### TMA-R13 - Interaction facing happens after arrival
+
+**Symptoms addressed:** objects not receiving a turn, the first interaction
+turning by only a tiny amount, a slow turn fighting the walk/run direction, and
+the visible player spinning again when an approach ends.
+
+**Cause:** RuneScape exposes two orientations. `Actor.getCurrentOrientation()`
+is the actor's intermediate, currently-rendered turn; `Actor.getOrientation()`
+is the exact desired heading. Using the former as the target produces the
+one-degree/fractional-turn symptom. Also, `Client.getLocalDestinationLocation()`
+is populated for some object interactions even when the server accepts the
+interaction from the current tile. Treating that value as proof that movement
+is required cancels valid object-facing requests.
+
+**Implementation:** `TrueTileMovementPlugin` records only NPC/object world
+actions (attack and cast are intentionally excluded so combat-facing and native
+action rendering remain authoritative). A new world action replaces the pending
+request; widget clicks do not clear it. `CustomMovementHandler` keeps the
+request while the player approaches, but `UpdateStationaryInteractionFacing`
+resets confirmation on every moving frame so the target cannot steer the
+locomotion model. After the rendered model becomes stationary, the handler
+waits briefly for a route/action decision, confirms from the native interacting
+actor, a changed action animation, or the bounded fallback clock, and
+`ApplyTweening` eases toward `Owner.getOrientation()`.
+
+Movement completion still uses the last movement heading, but only when the
+remaining circular difference is at most 128 orientation units (22.5 degrees).
+This finishes a genuinely incomplete cardinal turn without resurrecting the
+old full-spin correction. Requests are bounded and are cleared by a new world
+action, scene invalidation, or timeout.
+
+**Primary code:** `STATIONARY_INTERACTION_ACTIONS` and
+`ShouldUseStationaryInteractionFacing` in `TrueTileMovementPlugin`, the request
+forwarding/cleanup methods in `TrueMovementOverlay`, and
+`RequestStationaryInteractionFacing`, `UpdateStationaryInteractionFacing`,
+`ApplyTweening`, and `ShouldFinishMovementOrientationAfterStop` in
+`CustomMovementHandler`.
+
+**Maintenance rules:** never use a non-null local destination as a standalone
+movement test; never steer an interaction target while `bStationaryThisFrame`
+is false; and never replace the exact native target orientation with the
+intermediate current orientation. If any of those rules changes, reproduce both
+an adjacent object interaction and a multi-tile approach before accepting the
+change.
+
+**Automated coverage:** `stationaryFacingWaitsForNativeInteractionOrOneStableTick`,
+`onlySmallIncompleteMovementTurnsFinishAfterStopping`, the cardinal direction
+assertions in `CustomMovementHandlerTest`, and
+`stationaryFacingOnlyTracksNonCombatNpcAndObjectActions` in `RenderStateTest`.
+In-game confirmation remains required because menu timing and object reach
+rules are revision-dependent.
+
 ## Why upper/lower body splitting was not implemented
 
 The public RuneLite model/animation API used here does not provide a stable,
@@ -368,6 +420,9 @@ not be approximated by editing vertex groups in this plugin.
 | `MAX_TOTAL_CACHED_ANIMATION_STATES` | 512 states | Bound total pose-cache memory. |
 | `MAX_NEUTRAL_CAPTURE_STATES_PER_WINDOW` | 32 states | Bound work and actor-suppression scope in one capture transaction. |
 | `NATIVE_MOTION_SETTLE_CYCLES` | 30 cycles | Keep forced/native motion authoritative until native updates have settled. |
+| `STATIONARY_FACING_CONFIRM_CYCLES` | 30 cycles | Allow an object route/action decision to settle before confirming a stationary turn. |
+| `STATIONARY_FACING_SETTLE_TIMEOUT_CYCLES` | 180 cycles | Bound the stationary interaction-facing window (about 3.6 seconds). |
+| `STATIONARY_FACING_REQUEST_TIMEOUT_CYCLES` | 3000 cycles | Bound a request that is still approaching its target (about 60 seconds). |
 | `MAX_NORMAL_LOCAL_UNITS_PER_CLIENT_CYCLE` | 16 units | Separate normal run interpolation from accelerated displacement. |
 | `MAX_NORMAL_DESTINATION_DELTA` | 2 tiles | Detect unusually large route changes. |
 | `SPATIAL_DISCONTINUITY_DELTA` | 8 tiles | Treat a very large displacement as an intentional one-time snap. |
@@ -407,6 +462,9 @@ Before merging a change, answer all of these:
    the native player?
 9. Do camera and overheads use the same prepared frame?
 10. Is there a focused unit test and a stated in-game test for the change?
+11. For interaction-facing changes, does the request survive approach movement,
+    remain inactive while moving, and use `getOrientation()` only after the
+    rendered model stops?
 
 ## In-game acceptance matrix
 

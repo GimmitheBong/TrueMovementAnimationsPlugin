@@ -126,6 +126,15 @@ public class CustomMovementHandlerTest
                 CustomMovementHandler.getOrientationBetweenPoints(0, 0, -1, 0, 270));
         assertEquals(1024,
                 CustomMovementHandler.getOrientationBetweenPoints(0, 0, 0, -1, 270));
+
+        assertEquals(0,
+                CustomMovementHandler.getOrientationBetweenPoints(0, 0, 0, -1, 90));
+        assertEquals(1024,
+                CustomMovementHandler.getOrientationBetweenPoints(0, 0, 0, 1, 90));
+        assertEquals(1536,
+                CustomMovementHandler.getOrientationBetweenPoints(0, 0, 1, 0, 90));
+        assertEquals(512,
+                CustomMovementHandler.getOrientationBetweenPoints(0, 0, -1, 0, 90));
     }
 
     @Test
@@ -154,6 +163,41 @@ public class CustomMovementHandlerTest
         TrueTileMovementConfig config = new TrueTileMovementConfig() { };
         assertTrue(config.CombatTargetFacingEnabled());
         assertEquals(4, config.CombatTargetFacingDistance());
+    }
+
+    @Test
+    public void stationaryFacingWaitsForNativeInteractionOrOneStableTick()
+    {
+        assertFalse(CustomMovementHandler
+                .ShouldConfirmStationaryInteractionFacing(
+                        false, -1, -1, 1));
+        assertTrue(CustomMovementHandler
+                .ShouldConfirmStationaryInteractionFacing(
+                        true, -1, -1, 1));
+        assertTrue(CustomMovementHandler
+                .ShouldConfirmStationaryInteractionFacing(
+                        false, 1234, -1, 1));
+        assertFalse(CustomMovementHandler
+                .ShouldConfirmStationaryInteractionFacing(
+                        false, 1234, 1234, 1));
+        assertTrue(CustomMovementHandler
+                .ShouldConfirmStationaryInteractionFacing(
+                        false, -1, -1,
+                        CustomMovementHandler
+                                .STATIONARY_FACING_CONFIRM_CYCLES));
+    }
+
+    @Test
+    public void onlySmallIncompleteMovementTurnsFinishAfterStopping()
+    {
+        assertTrue(CustomMovementHandler
+                .ShouldFinishMovementOrientationAfterStop(2040, 8));
+        assertTrue(CustomMovementHandler
+                .ShouldFinishMovementOrientationAfterStop(1000, 1128));
+        assertFalse(CustomMovementHandler
+                .ShouldFinishMovementOrientationAfterStop(1000, 1129));
+        assertFalse(CustomMovementHandler
+                .ShouldFinishMovementOrientationAfterStop(0, 1024));
     }
 
     @Test
