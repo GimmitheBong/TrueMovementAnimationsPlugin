@@ -4,6 +4,7 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
 
 @ConfigGroup("TrueTileMovement")
 public interface TrueTileMovementConfig extends Config
@@ -204,6 +205,27 @@ public interface TrueTileMovementConfig extends Config
 	} // 120 ticks
 
 	@ConfigItem(
+			keyName = "CombatTargetFacingEnabled",
+			name = "Combat Target Facing",
+			description = "Face the active combat target while it is within the configured combat target facing distance"
+	)
+	default boolean CombatTargetFacingEnabled()
+	{
+		return true;
+	}
+
+	@Range(min = 1, max = 10)
+	@ConfigItem(
+			keyName = "CombatTargetFacingDistance",
+			name = "Combat Target Facing Distance",
+			description = "Tile distance used for combat target facing and for selecting the close-range de-agro timer"
+	)
+	default int CombatTargetFacingDistance()
+	{
+		return 4;
+	}
+
+	@ConfigItem(
 			keyName = "SpawnModelAtCameraTile",
 			name = " Spawn Camera Model at Original Location",
 			description = "Whether or not to spawn a camera model for the original location",
@@ -233,6 +255,17 @@ public interface TrueTileMovementConfig extends Config
 			section = funFeatureSection
 	)
 	default boolean AlwaysHoppingMode()
+	{
+		return false;
+	}
+
+	// [TMA-R11] This is the single user-facing override for every plugin leap.
+	@ConfigItem(
+			keyName = "DisableLeapingAnimations",
+			name = "Disable Leaping Animations",
+			description = "Use normal movement animations instead of plugin-selected hopping or leaping animations"
+	)
+	default boolean DisableLeapingAnimations()
 	{
 		return false;
 	}

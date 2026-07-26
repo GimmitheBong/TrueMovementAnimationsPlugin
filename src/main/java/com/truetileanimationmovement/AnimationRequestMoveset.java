@@ -1,7 +1,5 @@
 package com.truetileanimationmovement;
 
-import java.lang.reflect.Array;
-
 public class AnimationRequestMoveset
 {
 // Juicy animations

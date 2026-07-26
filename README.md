@@ -26,3 +26,12 @@ CONTRIBUTOR LIST->
 
 ![Demo GIF](docs/screenshots/PluginFeatureGif.gif)
 
+## Maintainer documentation
+
+The animation renderer is intentionally documented as a set of labelled fixes
+and invariants. Start with
+[Animation rendering architecture](docs/ANIMATION_RENDERING_ARCHITECTURE.md)
+before changing model capture, animation selection, interpolation, actor hiding,
+scene-load handling, or the adaptive camera. Matching `[TMA-R##]` labels appear
+at the relevant decision points in the source.
+

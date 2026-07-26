@@ -1,41 +1,31 @@
 package com.truetileanimationmovement;
 
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.Point;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.MenuOptionClicked;
-import net.runelite.api.kit.KitType;
-import net.runelite.client.config.ConfigItem;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.game.SpriteManager;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.client.ui.overlay.components.LineComponent;
-import net.runelite.client.util.ColorUtil;
-import net.runelite.client.util.Text;
-import org.apache.commons.lang3.tuple.Pair;
 
 import javax.inject.Inject;
-import javax.swing.*;
 import java.awt.*;
-import java.awt.font.TextAttribute;
 import java.awt.image.BufferedImage;
-import java.text.AttributedString;
 import java.util.*;
 import java.util.List;
 import java.util.function.ToIntFunction;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+@Slf4j
 public class TrueMovementOverlay extends OverlayPanel
 {
+    // [TMA-R01] This overlay owns the handler that prepares the exact frame
+    // consumed by BeforeRender. It is intentionally not a second model source.
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
     private final TrueTileMovementConfig config;
 
-    public boolean bEverythingIsStale = false;
     public boolean bRuneliteObjectsStale = false;
     public boolean bRecentlyClickedEvent = false;
     public long LastTimeTeleport = 0;
@@ -50,18 +40,208 @@ public class TrueMovementOverlay extends OverlayPanel
 
     public void Cleanup()
     {
+        // [TMA-R12] Cleanup is ownership transfer back to the native player,
+        // not merely removal of entries from this map.
         for (Map.Entry<Integer, CustomMovementHandler> entry : MovementHandlerCache.entrySet())
         {
             var value = entry.getValue();
-            value.Cleanup();
+            try
+            {
+                value.Cleanup();
+            }
+            catch (RuntimeException ex)
+            {
+                log.debug("Unable to clean up a True Tile movement handler", ex);
+            }
         }
 
         // Do not clear the cache here to avoid rapid runelite object recreation (cleaned up at a later point)
         bEverythingIsStale = true;
+        MovementHandlerCache.clear();
+        bRuneliteObjectsStale = false;
+        ResetTransientState();
+    }
+
+    public void InvalidateRuneLiteObjects()
+    {
+        // [TMA-R09] Region loading invalidates scene objects, while handlers
+        // retain enough world-space history to rebase the visible position.
+        ClearStationaryInteractionFacing();
+        InvalidateNeutralOwnerModels();
+        bRuneliteObjectsStale = true;
+    }
+
+    public void ResetTransientState()
+    {
+        bRecentlyClickedEvent = false;
+        bShowHPBar = false;
+        ClearStationaryInteractionFacing();
+    }
+
+    void RequestStationaryInteractionFacing(
+            Player Owner,
+            Actor TargetActor)
+    {
+        if (Owner == null)
+        {
+            return;
+        }
+
+        CustomMovementHandler Handler =
+                MovementHandlerCache.get(Owner.getId());
+        if (Handler != null && Handler.IsOwner(Owner))
+        {
+            Handler.RequestStationaryInteractionFacing(TargetActor);
+        }
+    }
+
+    void ClearStationaryInteractionFacing()
+    {
+        for (CustomMovementHandler Handler :
+                MovementHandlerCache.values())
+        {
+            Handler.ClearStationaryInteractionFacing();
+        }
+    }
+
+    void BeginNeutralOwnerModelCapture(Player player)
+    {
+        // [TMA-R03] Both capture callbacks must reach this overlay's exact
+        // handler instance; a separately injected unscoped overlay is invalid.
+        if (player == null)
+        {
+            return;
+        }
+
+        CustomMovementHandler Handler = MovementHandlerCache.get(player.getId());
+        if (Handler != null && Handler.IsOwner(player))
+        {
+            Handler.BeginNeutralOwnerModelCaptureOnGameTick();
+        }
+    }
+
+    void CompleteNeutralOwnerModelCapture(Player player)
+    {
+        if (player == null)
+        {
+            return;
+        }
+
+        RemoveHandlersForOtherPlayerIds(player.getId());
+
+        CustomMovementHandler Handler = MovementHandlerCache.get(player.getId());
+        if (Handler == null)
+        {
+            return;
+        }
+        if (Handler.IsOwner(player))
+        {
+            Handler.CompleteNeutralOwnerModelCaptureOnClientTick();
+        }
+        else
+        {
+            // A scene rebuild can replace the Player wrapper between the two
+            // callbacks. Restore the old actor immediately; PrepareFrame will
+            // rebind or replace the handler before it can render again.
+            Handler.InvalidateNeutralOwnerModel();
+        }
+    }
+
+    void InvalidateNeutralOwnerModels()
+    {
+        for (CustomMovementHandler Handler : MovementHandlerCache.values())
+        {
+            try
+            {
+                Handler.InvalidateNeutralOwnerModel();
+            }
+            catch (RuntimeException ex)
+            {
+                log.debug("Unable to invalidate a neutral True Tile player model", ex);
+            }
+        }
+    }
+
+    CustomMovementHandler PrepareFrame(Player player)
+    {
+        // [TMA-R01, TMA-R09] Rebind or rebuild first, then return only a fully
+        // updated handler. Callers must not hide the owner on a null result.
+        if (player == null)
+        {
+            return null;
+        }
+
+        RemoveHandlersForOtherPlayerIds(player.getId());
+
+        CustomMovementHandler playerEntry = MovementHandlerCache.get(player.getId());
+        if (playerEntry != null && !playerEntry.IsOwner(player))
+        {
+            if (!bRuneliteObjectsStale || !playerEntry.RebindOwnerAfterSceneLoad(player))
+            {
+                playerEntry.Cleanup();
+                MovementHandlerCache.remove(player.getId());
+                playerEntry = null;
+            }
+        }
+
+        if (playerEntry == null)
+        {
+            playerEntry = new CustomMovementHandler(client, plugin, config, this, player);
+            MovementHandlerCache.put(player.getId(), playerEntry);
+        }
+
+        playerEntry.Initialize(bRuneliteObjectsStale);
+        bRuneliteObjectsStale = false;
+
+        if (!playerEntry.Update())
+        {
+            return null;
+        }
+
+        return playerEntry;
+    }
+
+    private void RemoveHandlersForOtherPlayerIds(int CurrentPlayerId)
+    {
+        Iterator<Map.Entry<Integer, CustomMovementHandler>> Iterator =
+                MovementHandlerCache.entrySet().iterator();
+        while (Iterator.hasNext())
+        {
+            Map.Entry<Integer, CustomMovementHandler> Entry = Iterator.next();
+            if (Entry.getKey() == CurrentPlayerId)
+            {
+                continue;
+            }
+
+            try
+            {
+                Entry.getValue().Cleanup();
+            }
+            catch (RuntimeException ex)
+            {
+                log.debug("Unable to remove a stale True Tile player handler", ex);
+            }
+            Iterator.remove();
+        }
+    }
+
+    CustomMovementHandler HoldLastFrame(Player player)
+    {
+        if (player == null)
+        {
+            return null;
+        }
+
+        CustomMovementHandler playerEntry = MovementHandlerCache.get(player.getId());
+        if (playerEntry == null || !playerEntry.IsOwner(player) || !playerEntry.HoldLastRenderedFrame())
+        {
+            return null;
+        }
+        return playerEntry;
     }
 
     // Tracking data for all characters we are handling the rendering (including player)
-    public Map<Integer /* character ID */, CustomMovementHandler> MovementHandlerCache = new HashMap<>();
+    private final Map<Integer /* character ID */, CustomMovementHandler> MovementHandlerCache = new HashMap<>();
 
     @Inject
     private TrueMovementOverlay(Client client, TrueTileMovementPlugin plugin, TrueTileMovementConfig config)
@@ -117,11 +297,19 @@ public class TrueMovementOverlay extends OverlayPanel
         graphics.setFont(FontManager.getRunescapeSmallFont());
 
         Player player = client.getLocalPlayer();
-        var playerEntry = MovementHandlerCache.get(player.getId());
-        if (playerEntry == null)
+        if (player == null)
         {
             return;
         }
+        var playerEntry = MovementHandlerCache.get(player.getId());
+        if (playerEntry == null || !playerEntry.HasRenderableModel())
+        {
+            return;
+        }
+
+        plugin.CurrentHitsplats.removeIf(
+                hitsplat -> hitsplat == null ||
+                        client.getGameCycle() >= hitsplat.getDisappearsOnGameCycle());
 
         Point[] HitsplatPointOffsets = {
                 new Point(0, 0),
@@ -156,21 +344,22 @@ public class TrueMovementOverlay extends OverlayPanel
 
             String text = String.valueOf(hitsplat.getAmount());
 
-            Point point = Perspective.getCanvasTextLocation(
+            FontMetrics metrics = graphics.getFontMetrics();
+            Point point = Perspective.localToCanvas(
                     client,
-                    graphics,
-                    playerEntry.Model.getLocation(),
-                    text,
-                    player.getLogicalHeight() / 2
+                    playerEntry.Model.getLocation().getWorldView(),
+                    playerEntry.Model.getLocation().getX(),
+                    playerEntry.Model.getLocation().getY(),
+                    playerEntry.Model.getZ() - player.getLogicalHeight() / 2
             );
 
             if (point != null)
             {
+                point = new Point(point.getX() - metrics.stringWidth(text) / 2, point.getY());
                 BufferedImage HitsplatImage = plugin.hitsplatImages.get(hitsplat.getHitsplatType());
                 int x = point.getX() + HitsplatPointOffsets[i].getX();
                 int y = point.getY() + 8 + HitsplatPointOffsets[i].getY();
 
-                FontMetrics metrics = graphics.getFontMetrics();
                 int textWidth = metrics.stringWidth(text);
                 int textHeight = metrics.getHeight();
 
@@ -218,6 +407,10 @@ public class TrueMovementOverlay extends OverlayPanel
         }
 
         Player player = client.getLocalPlayer();
+        if (player == null)
+        {
+            return;
+        }
         var playerEntry = MovementHandlerCache.get(player.getId());
 
         HeadIcon headIcon = player.getOverheadIcon();
@@ -225,27 +418,24 @@ public class TrueMovementOverlay extends OverlayPanel
         String OverheadText = player.getOverheadText();
         boolean bIsOverheadTextActive = OverheadText != null;
 
-        if ((!bShowHPBar && headIcon == null && skullIcon == -1 && !bIsOverheadTextActive) || playerEntry == null)
+        if ((!bShowHPBar && headIcon == null && skullIcon == -1 && !bIsOverheadTextActive) ||
+                playerEntry == null ||
+                !playerEntry.HasRenderableModel())
         {
             return;
         }
 
         final LocalPoint localLocation = playerEntry.Model.getLocation();
 
-        int groundHeight = Perspective.getFootprintTileHeight(
-                client,
-                localLocation,
-                client.getLocalPlayer().getWorldView().getPlane(),
-                player.getFootprintSize()
-        );
         // Adjust height in 3D space
         int zOffset = player.getLogicalHeight() + config.OverheadObjectOffset();
 
         Point point = Perspective.localToCanvas(
                 client,
+                localLocation.getWorldView(),
                 localLocation.getX(),
                 localLocation.getY(),
-                groundHeight - zOffset
+                playerEntry.Model.getZ() - zOffset
         );
 
         if (point == null)
@@ -286,26 +476,32 @@ public class TrueMovementOverlay extends OverlayPanel
         if (skullIcon != -1)
         {
             BufferedImage SkullImage = plugin.GetSkullIcon(skullIcon);
-            graphics.drawImage(
-                    SkullImage,
-                    point.getX() - SkullImage.getWidth() / 2,
-                    point.getY() - 30 - 2 + yOffset,
-                    null
-            );
+            if (SkullImage != null)
+            {
+                graphics.drawImage(
+                        SkullImage,
+                        point.getX() - SkullImage.getWidth() / 2,
+                        point.getY() - 30 - 2 + yOffset,
+                        null
+                );
 
-            yOffset = yOffset - 28;
+                yOffset = yOffset - 28;
+            }
         }
 
         if (headIcon != null)
         {
 
             BufferedImage PrayerImage = plugin.GetPrayerIcon(headIcon);
-            graphics.drawImage(
-                    PrayerImage,
-                    point.getX() - PrayerImage.getWidth() / 2,
-                    point.getY() - 30 - 2 + yOffset,
-                    null
-            );
+            if (PrayerImage != null)
+            {
+                graphics.drawImage(
+                        PrayerImage,
+                        point.getX() - PrayerImage.getWidth() / 2,
+                        point.getY() - 30 - 2 + yOffset,
+                        null
+                );
+            }
 
         }
     }
@@ -315,8 +511,6 @@ public class TrueMovementOverlay extends OverlayPanel
     {
         if (plugin.bForceEarlyOut || !plugin.bIsPluginSupportedCurrently)
         {
-            Cleanup();
-
             // On screen message for requiring GPU plugin
             if (!plugin.bIsPluginSupportedCurrently)
             {
@@ -353,7 +547,7 @@ public class TrueMovementOverlay extends OverlayPanel
         playerEntry.Update();
 
         bRuneliteObjectsStale = false;
-
+        
         // Overheads
         RenderOverheadObjects(graphics);
 
