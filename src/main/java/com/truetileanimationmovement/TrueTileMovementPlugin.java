@@ -117,6 +117,8 @@ public class TrueTileMovementPlugin extends Plugin
 	private static final float ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS = 16.667f;
 	private static final float MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS = 100.0f;
 	private long LastAdaptiveCameraUpdateNanos = 0;
+	// Keep free-camera mode confined to the adaptive frame: native input and menu
+	// processing run after presentation, while the normal camera is never rendered.
 	private volatile boolean bAdaptiveCameraRenderedThisFrame = false;
 	private final Runnable PostDrawCameraModeHandoff = () ->
 	{
@@ -161,7 +163,7 @@ public class TrueTileMovementPlugin extends Plugin
 	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
-		// Update the minimap, it doesn't update in free cam
+		// Update the minimap and select the normal camera before menu sorting and click detection.
 		if (IsAdaptiveCameraOn())
 		{
 			client.setCameraMode(0);
@@ -450,6 +452,9 @@ public class TrueTileMovementPlugin extends Plugin
 
 		int CameraFollowHeight = GetCameraFollowHeight();
 
+		// Input processing uses the normal camera outside the draw interval. Never
+		// expose that interaction camera during presentation: on uneven terrain its
+		// focal height belongs to the hidden owner rather than the visible model.
 		if (ShouldRenderAdaptiveCamera(
 				IsAdaptiveCameraOn(),
 				PlayerMovementHandler.bShouldRenderOwner))
@@ -458,6 +463,7 @@ public class TrueTileMovementPlugin extends Plugin
 		}
 		else
 		{
+			// Keep the normal camera position synchronized while adaptive rendering is paused.
 			LastAdaptiveCameraUpdateNanos = 0;
 			if (client.getCameraMode() == 0)
 			{
