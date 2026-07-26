@@ -31,7 +31,7 @@ public class TrueMovementOverlay extends OverlayPanel
     public long LastTimeTeleport = 0;
     public boolean bShouldPlayTeleportAnimation = false;
     public boolean bTeleportInterrupted = false;
-
+private boolean bEverythingIsStale = false;
     // HP Bar
     public boolean bShowHPBar = true;
     private static final Color BAR_FILL_COLOR = Color.green;
@@ -539,7 +539,7 @@ public class TrueMovementOverlay extends OverlayPanel
         }
 
         var playerEntry = MovementHandlerCache.get(client.getLocalPlayer().getId());
-        playerEntry.Owner = client.getLocalPlayer();
+        playerEntry.SetOwner(client.getLocalPlayer());
         // Initialize if needed
         playerEntry.Initialize(bRuneliteObjectsStale);
 

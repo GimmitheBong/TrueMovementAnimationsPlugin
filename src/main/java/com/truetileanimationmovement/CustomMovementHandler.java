@@ -57,6 +57,10 @@ public class CustomMovementHandler
 
     // Runelite object management
     private Actor Owner = null;
+public void SetOwner(Actor owner)
+{
+    Owner = owner;
+}	
     public AnimationController AnimController = null;
     public RuneLiteObject Model = null;
 
