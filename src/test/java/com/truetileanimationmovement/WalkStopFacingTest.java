@@ -44,4 +44,44 @@ public class WalkStopFacingTest
                 null,
                 Destination));
     }
+
+    @Test
+    public void catchUpIdleControllerOnlyRunsDuringAnIdleFacingHold()
+    {
+        // [TMA-IDLE-CATCH-UP] A controller is allowed only after a yellow
+        // route visibly moved and then stopped. The negative case below is
+        // the regression where a second click revived stale idle state before
+        // movement had begun.
+        assertTrue(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
+                true,
+                true,
+                -1,
+                808));
+
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
+                false,
+                true,
+                -1,
+                808));
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
+                true,
+                false,
+                -1,
+                808));
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
+                true,
+                true,
+                422,
+                808));
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                false,
+                true,
+                true,
+                -1,
+                808));
+    }
 }

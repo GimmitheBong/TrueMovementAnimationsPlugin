@@ -23,10 +23,15 @@ public class CustomMovementHandler
     private long LastTimeMilliseconds = 0;
     private long LastAnimationTickTime = 0;
     private int MillisecondsSinceTileChange = 1000;
-
     // Runelite object management
     public Actor Owner = null;
     public AnimationController AnimController = null; // Used to blend additional animations
+    // [TMA-IDLE-CATCH-UP] The hidden player is still using a locomotion clock
+    // after the visible model stops. A separate idle controller prevents that
+    // faster clock from driving the visible breathing/head-turn pose.
+    private AnimationController WalkStopIdleController = null;
+    private int LastWalkStopIdleGameCycle = -1;
+    private boolean bUsingWalkStopIdleController = false;
     public RuneLiteObject Model = null;
 
     // Targeting
@@ -72,6 +77,13 @@ public class CustomMovementHandler
     // finishing its route behind the visible model. During that catch-up only,
     // retain the visible model's final movement direction instead of adopting
     // the native actor's stale orientation and spinning at the destination.
+    //
+    // State meanings are intentionally kept separate:
+    //   Armed       = a yellow-click route is eligible for the hold.
+    //   Observed    = visible movement actually started for that route.
+    //   Preserve    = catch-up ended; keep the released facing until native
+    //                 code issues a different orientation command.
+    //   HoldThisFrame = the derived per-frame decision used by rendering.
     private boolean bWalkStopFacingHoldArmed = false;
     private boolean bWalkMovementObserved = false;
     private boolean bPreserveReleasedWalkFacing = false;
@@ -280,6 +292,8 @@ public class CustomMovementHandler
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
         CancelWalkStopFacingHold();
+        ReleaseWalkStopIdleController(false);
+        WalkStopIdleController = null;
 
         if (AnimController != null)
         {
@@ -350,7 +364,9 @@ public class CustomMovementHandler
         bWalkMovementObserved = false;
         // If the previous route is already preserving its released facing,
         // keep that stable during the short click-to-movement delay. The new
-        // route clears it as soon as visible movement actually begins.
+        // route clears it as soon as visible movement actually begins. It is
+        // important that Observed remains false here: a click alone must not
+        // restart the catch-up idle renderer before the player moves.
     }
 
     void CancelWalkStopFacingHold()
@@ -369,6 +385,9 @@ public class CustomMovementHandler
             return;
         }
 
+        // The custom model is considered moving while its rendered tile has
+        // changed recently. This also catches forced movement, which may not
+        // have a preceding yellow click.
         boolean VisibleModelIsMoving = MillisecondsSinceTileChange < 600;
         if (VisibleModelIsMoving)
         {
@@ -406,6 +425,9 @@ public class CustomMovementHandler
             return;
         }
 
+        // The visible model has stopped at the final requested tile while the
+        // hidden native actor is still approaching it. Freeze only this
+        // short-lived orientation mismatch; normal turning resumes afterward.
         bHoldWalkStopFacingThisFrame = true;
         if (HasHiddenOwnerCaughtUp(
                 Owner.getLocalLocation(),
@@ -435,6 +457,125 @@ public class CustomMovementHandler
         return OwnerLocation != null &&
                 RenderDestination != null &&
                 OwnerLocation.equals(RenderDestination);
+    }
+
+    static boolean ShouldUseWalkStopIdleController(
+            boolean HoldFacingThisFrame,
+            boolean CatchUpStillActive,
+            boolean MovementWasObserved,
+            int OwnerActionAnimation,
+            int IdlePoseAnimation)
+    {
+        // Idle smoothing is valid only during the actual catch-up interval.
+        // In particular, Preserve/Armed without MovementWasObserved means a
+        // new click is waiting to start and must remain on the native idle
+        // animation instead of reviving an old controller frame.
+        return HoldFacingThisFrame &&
+                CatchUpStillActive &&
+                MovementWasObserved &&
+                OwnerActionAnimation == -1 &&
+                IdlePoseAnimation != -1;
+    }
+
+    private boolean RenderWalkStopIdleAnimation()
+    {
+        int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
+        if (!ShouldUseWalkStopIdleController(
+                bHoldWalkStopFacingThisFrame,
+                bWalkStopFacingHoldArmed,
+                bWalkMovementObserved,
+                Owner.getAnimation(),
+                IdlePoseAnimation))
+        {
+            ReleaseWalkStopIdleController(true);
+            return false;
+        }
+
+        Animation IdleAnimation = client.loadAnimation(IdlePoseAnimation);
+        if (IdleAnimation == null)
+        {
+            ReleaseWalkStopIdleController(false);
+            return false;
+        }
+
+        int CurrentGameCycle = client.getGameCycle();
+        if (!bUsingWalkStopIdleController ||
+                WalkStopIdleController == null ||
+                WalkStopIdleController.getAnimation() == null ||
+                WalkStopIdleController.getAnimation().getId() != IdlePoseAnimation)
+        {
+            // [TMA-IDLE-CATCH-UP] Each genuine stop gets its own idle clock.
+            // Reusing the previous stop's controller made the model snap back
+            // to an unrelated old frame when catch-up began again.
+            WalkStopIdleController =
+                    new AnimationController(client, IdleAnimation);
+            int NativeIdleFrame =
+                    Owner.getPoseAnimation() == IdlePoseAnimation
+                            ? Owner.getPoseAnimationFrame()
+                            : 0;
+            if (NativeIdleFrame >= 0 &&
+                    NativeIdleFrame < IdleAnimation.getNumFrames())
+            {
+                WalkStopIdleController.setFrame(NativeIdleFrame);
+            }
+            LastWalkStopIdleGameCycle = CurrentGameCycle;
+        }
+        else if (LastWalkStopIdleGameCycle >= 0 &&
+                CurrentGameCycle >= LastWalkStopIdleGameCycle)
+        {
+            WalkStopIdleController.tick(
+                    CurrentGameCycle - LastWalkStopIdleGameCycle);
+            LastWalkStopIdleGameCycle = CurrentGameCycle;
+        }
+        else
+        {
+            LastWalkStopIdleGameCycle = CurrentGameCycle;
+        }
+
+        // Build an unposed equipment model, then apply the independent idle
+        // controller. AnimationController supplies RuneLite's packed
+        // interpolation frame whenever Animation Smoothing is enabled. The
+        // hidden actor can continue advancing its locomotion animation while
+        // it catches up, so its pose is deliberately not used as the source.
+        SetAllIdlePosesNoAnimation();
+        Owner.setPoseAnimation(NO_ANIMATION);
+        Owner.setPoseAnimationFrame(0);
+        Model.setModel(client.mergeModels(
+                WalkStopIdleController.animate(Owner.getModel())));
+
+        bUsingWalkStopIdleController = true;
+        bResetCurrentAnimation = false;
+        CurrentPoseAnimation = NO_ANIMATION;
+        return true;
+    }
+
+    private void ReleaseWalkStopIdleController(
+            boolean PreserveIdlePhase)
+    {
+        if (!bUsingWalkStopIdleController)
+        {
+            return;
+        }
+
+        // [TMA-IDLE-CATCH-UP] Hand the final idle frame back to RuneLite once
+        // the hidden actor reaches the rendered tile. This preserves breathing
+        // and head-turn phase without leaving the custom controller active.
+        if (PreserveIdlePhase &&
+                WalkStopIdleController != null &&
+                WalkStopIdleController.getAnimation() != null &&
+                !bMovingThisAction &&
+                CurrentAnimationRequest != null &&
+                CurrentAnimationRequest.PoseAnimationToPlay ==
+                        OldAnimationSet.IdlePoseAnimation)
+        {
+            Owner.setPoseAnimation(
+                    WalkStopIdleController.getAnimation().getId());
+            Owner.setPoseAnimationFrame(
+                    WalkStopIdleController.getFrame());
+        }
+
+        bUsingWalkStopIdleController = false;
+        LastWalkStopIdleGameCycle = -1;
     }
 
     private void UpdateOldIdleAnimations()
@@ -1437,10 +1578,15 @@ public class CustomMovementHandler
                 }
             }
 
-            // Custom handler
-            boolean bUsedCustomAnimation = false;
-            if ((UniqueAnimationExceptionList.contains(Owner.getAnimation()) && bMovingThisAction) ||
-                    CurrentAnimationRequest.AnimationToPlay != -1)
+            // [TMA-IDLE-CATCH-UP] This branch is evaluated before the general
+            // animation controller so the catch-up idle pose cannot be
+            // overwritten by the hidden actor's faster locomotion clock.
+            boolean bUsedCustomAnimation =
+                    RenderWalkStopIdleAnimation();
+            if (!bUsedCustomAnimation &&
+                    ((UniqueAnimationExceptionList.contains(Owner.getAnimation()) &&
+                            bMovingThisAction) ||
+                            CurrentAnimationRequest.AnimationToPlay != -1))
             {
                 bUsedCustomAnimation = true;
                 // Anim controller takes control over the pose animation or custom anim
@@ -1492,7 +1638,7 @@ public class CustomMovementHandler
 
                 Model.setModel(client.mergeModels(AnimController.animate(Owner.getModel())));
             }
-            else
+            else if (!bUsedCustomAnimation)
             {
                 // Normal controller takes back over
                 bTargetWasKilled = false; // If normal controller is taking it, cancel target killed animation
