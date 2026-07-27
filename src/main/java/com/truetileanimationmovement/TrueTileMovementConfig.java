@@ -238,6 +238,17 @@ public interface TrueTileMovementConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "AllowLeaping",
+			name = "  Allow Leaping",
+			description = "Allow plugin-selected hopping and leaping movement animations",
+			section = funFeatureSection
+	)
+	default boolean AllowLeaping()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 			keyName = "AllowOriginalModelWhenCloseProximity",
 			name = "   Original Model When Close",
 			description = "Whether or not to allow the original model to be used directly when its close in proximity, orientation, and animation.",

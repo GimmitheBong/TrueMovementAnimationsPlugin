@@ -841,7 +841,10 @@ public class CustomMovementHandler
                 CurrentAnimationRequest.StartingFrame = 0;
                 CurrentAnimationRequest.AnimationSpeed = 1;
             }
-            else if (bCurrentlyWooxWalking && config.AllowWooxWalkDetection() && bIsDefaultHumanAnimationSet)
+            else if (config.AllowLeaping() &&
+                    bCurrentlyWooxWalking &&
+                    config.AllowWooxWalkDetection() &&
+                    bIsDefaultHumanAnimationSet)
             {
                 // Handle woox walking
                 CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"WooxWalk", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
@@ -857,7 +860,10 @@ public class CustomMovementHandler
                     CurrentAnimationRequest.OrientationSpeed /= 2;
                 }
             }
-            else if ((config.AlwaysHoppingMode() || FramesSinceIdle > config.TickPerfectMovesUntilJumping()) && bIsDefaultHumanAnimationSet)
+            else if (config.AllowLeaping() &&
+                    (config.AlwaysHoppingMode() ||
+                            FramesSinceIdle > config.TickPerfectMovesUntilJumping()) &&
+                    bIsDefaultHumanAnimationSet)
             {
                 // Handle tick perfect moving
                 CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"TickPerfectMovement", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
