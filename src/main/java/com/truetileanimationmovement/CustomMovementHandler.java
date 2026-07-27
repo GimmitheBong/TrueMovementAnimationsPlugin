@@ -68,6 +68,15 @@ public class CustomMovementHandler
     // Rotation
     private int TargetOrientation = 0;
     private int CurrentOrientation = 0;
+    // [TMA-STOP-FACING] Yellow Walk clicks may leave the hidden native player
+    // finishing its route behind the visible model. During that catch-up only,
+    // retain the visible model's final movement direction instead of adopting
+    // the native actor's stale orientation and spinning at the destination.
+    private boolean bWalkStopFacingHoldArmed = false;
+    private boolean bWalkMovementObserved = false;
+    private boolean bPreserveReleasedWalkFacing = false;
+    private boolean bHoldWalkStopFacingThisFrame = false;
+    private int NativeOrientationAtWalkFacingRelease = 0;
 
 
     // Player only
@@ -270,6 +279,7 @@ public class CustomMovementHandler
         // Render once with should render owner back on
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
+        CancelWalkStopFacingHold();
 
         if (AnimController != null)
         {
@@ -327,6 +337,104 @@ public class CustomMovementHandler
             cameraModel.setActive(false);
             client.removeRuneLiteObject(cameraModel);
         }
+    }
+
+    void ArmWalkStopFacingHold()
+    {
+        if (!IsPlayerOwner())
+        {
+            return;
+        }
+
+        bWalkStopFacingHoldArmed = true;
+        bWalkMovementObserved = false;
+        // If the previous route is already preserving its released facing,
+        // keep that stable during the short click-to-movement delay. The new
+        // route clears it as soon as visible movement actually begins.
+    }
+
+    void CancelWalkStopFacingHold()
+    {
+        bWalkStopFacingHoldArmed = false;
+        bWalkMovementObserved = false;
+        bPreserveReleasedWalkFacing = false;
+        bHoldWalkStopFacingThisFrame = false;
+    }
+
+    private void UpdateWalkStopFacingHold()
+    {
+        bHoldWalkStopFacingThisFrame = false;
+        if (!IsPlayerOwner())
+        {
+            return;
+        }
+
+        boolean VisibleModelIsMoving = MillisecondsSinceTileChange < 600;
+        if (VisibleModelIsMoving)
+        {
+            if (bWalkStopFacingHoldArmed)
+            {
+                bWalkMovementObserved = true;
+            }
+
+            // Forced movement or another route can begin without a fresh
+            // yellow click. It must not inherit a completed route's facing.
+            bPreserveReleasedWalkFacing = false;
+            return;
+        }
+
+        if (bPreserveReleasedWalkFacing)
+        {
+            // The catch-up block itself has ended. Ignore only the exact stale
+            // native target which existed at release; any later native facing
+            // command restores ordinary turning.
+            if (Owner.getOrientation() == NativeOrientationAtWalkFacingRelease)
+            {
+                bHoldWalkStopFacingThisFrame = true;
+            }
+            else
+            {
+                bPreserveReleasedWalkFacing = false;
+            }
+            return;
+        }
+
+        if (!bWalkStopFacingHoldArmed ||
+                !bWalkMovementObserved ||
+                !IsAtFinalWalkDestination())
+        {
+            return;
+        }
+
+        bHoldWalkStopFacingThisFrame = true;
+        if (HasHiddenOwnerCaughtUp(
+                Owner.getLocalLocation(),
+                NextLerpPosition))
+        {
+            // Release the temporary catch-up block without immediately
+            // reapplying the stale native orientation on the next frame.
+            bWalkStopFacingHoldArmed = false;
+            bWalkMovementObserved = false;
+            bPreserveReleasedWalkFacing = true;
+            NativeOrientationAtWalkFacingRelease = Owner.getOrientation();
+        }
+    }
+
+    private boolean IsAtFinalWalkDestination()
+    {
+        LocalPoint WalkDestination = client.getLocalDestinationLocation();
+        return WalkDestination == null ||
+                (NextLerpPosition != null &&
+                        NextLerpPosition.equals(WalkDestination));
+    }
+
+    static boolean HasHiddenOwnerCaughtUp(
+            LocalPoint OwnerLocation,
+            LocalPoint RenderDestination)
+    {
+        return OwnerLocation != null &&
+                RenderDestination != null &&
+                OwnerLocation.equals(RenderDestination);
     }
 
     private void UpdateOldIdleAnimations()
@@ -933,19 +1041,28 @@ public class CustomMovementHandler
             CurrentAnimationRequest.MovementSpeedMultiplier = 1.0;
             CurrentAnimationRequest.AnimationSpeed = 1;
             CurrentAnimationRequest.StartingFrame = 0;
-            ChangeLastLerpPointForRotation();
-            int ShortestAngle = ShortestAngleDifference(CurrentOrientation, TargetOrientation);
-            if (ShortestAngle >= 10)
-            {;
-                CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdleRotateRight;
-            }
-            else if (ShortestAngle <= -10)
+            if (bHoldWalkStopFacingThisFrame)
             {
-                CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdleRotateLeft;
+                // [TMA-STOP-FACING] Do not select a turn-in-place pose while
+                // the hidden actor is completing a yellow-click route.
+                CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdlePoseAnimation;
             }
             else
-            {;
-                CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdlePoseAnimation;
+            {
+                ChangeLastLerpPointForRotation();
+                int ShortestAngle = ShortestAngleDifference(CurrentOrientation, TargetOrientation);
+                if (ShortestAngle >= 10)
+                {
+                    CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdleRotateRight;
+                }
+                else if (ShortestAngle <= -10)
+                {
+                    CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdleRotateLeft;
+                }
+                else
+                {
+                    CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdlePoseAnimation;
+                }
             }
 
             bWooxWalkBroken = true;
@@ -1065,6 +1182,11 @@ public class CustomMovementHandler
         else if (!LastLerpPosition.equals(NextLerpPosition))
         {
             TargetOrientation = (getOrientationBetweenPoints(LastLerpPosition.getX(), LastLerpPosition.getY(), NextLerpPosition.getX(), NextLerpPosition.getY(), 90));
+        }
+
+        if (bHoldWalkStopFacingThisFrame)
+        {
+            TargetOrientation = CurrentOrientation;
         }
     }
 
@@ -1437,7 +1559,9 @@ public class CustomMovementHandler
             }
 
             // If the actual owner is extremely close to what we decided (and not custom animation), just render the owner
-            if (!bUsedCustomAnimation && IsOwnerCloseEnoughToModel())
+            if (!bHoldWalkStopFacingThisFrame &&
+                    !bUsedCustomAnimation &&
+                    IsOwnerCloseEnoughToModel())
             {
                 if (Model.isActive())
                 {
@@ -1478,6 +1602,8 @@ public class CustomMovementHandler
         UpdateTrueTileLocation();
 
         UpdateLerpDestinations();
+
+        UpdateWalkStopFacingHold();
 
         UpdateAnimationSelection();
 
