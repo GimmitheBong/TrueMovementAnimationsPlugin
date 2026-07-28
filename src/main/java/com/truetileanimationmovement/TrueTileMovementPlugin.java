@@ -3,7 +3,6 @@ package com.truetileanimationmovement;
 import com.google.inject.Provides;
 import javax.inject.Inject;
 
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -32,7 +31,6 @@ import net.runelite.client.util.ImageUtil;
 import static net.runelite.api.HitsplatID.*;
 import static net.runelite.api.MenuAction.*;
 
-@Slf4j
 @PluginDescriptor(
 	name = "True Tile Movement"
 )
@@ -115,7 +113,11 @@ public class TrueTileMovementPlugin extends Plugin
 			}
 
 			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(client.getLocalPlayer().getId());
-			if (FoundHandler != null && !FoundHandler.bShouldRenderOwner)
+			if (FoundHandler != null &&
+					ShouldSuppressNativeOwner(
+							bSceneLoadVisualHandoffPending,
+							OverlayRenderer.bRuneliteObjectsStale,
+							FoundHandler.CanSuppressOwnerInCurrentScene()))
 			{
 
 				if (ui && Objects.equals(renderable.toString(), client.getLocalPlayer().toString()))
@@ -141,7 +143,11 @@ public class TrueTileMovementPlugin extends Plugin
 
 			// hide player
 			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(object.getId());
-			if (FoundHandler != null && !FoundHandler.bShouldRenderOwner && !FoundHandler.bRenderOriginalOwnerDueToProximity)
+			if (FoundHandler != null &&
+					ShouldSuppressNativeOwner(
+							bSceneLoadVisualHandoffPending,
+							OverlayRenderer.bRuneliteObjectsStale,
+							FoundHandler.CanSuppressOwnerInCurrentScene()))
 			{
 				return false;
 			}
@@ -155,9 +161,11 @@ public class TrueTileMovementPlugin extends Plugin
 	public boolean bForceAdaptiveCameraOff = false;
 
 	private float CurrentCameraPositionX = -1; // Offset in "sudo world space" (see adaptive camera function)
+	private float CurrentCameraPositionY = Float.NaN;
 	private float CurrentCameraPositionZ = -1;
 	private static final float ADAPTIVE_CAMERA_REFERENCE_FRAME_MILLISECONDS = 16.667f;
 	private static final float MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS = 100.0f;
+	private static final float ADAPTIVE_CAMERA_VERTICAL_HALF_LIFE_MILLISECONDS = 80.0f;
 	private long LastAdaptiveCameraUpdateNanos = 0;
 	// Keep free-camera mode confined to the adaptive frame: native input and menu
 	// processing run after presentation, while the normal camera is never rendered.
@@ -180,6 +188,38 @@ public class TrueTileMovementPlugin extends Plugin
 
 	private WorldView currentWorldView = null;
 	private int LastPrintedAnimation = 0;
+	// [TMA-SCENE-LOAD-CONTINUITY] onBeforeRender runs before the overlay can
+	// recreate and rebase scene-owned RuneLiteObjects. Keep one explicit
+	// native-player/native-camera handoff until the replacement model is ready
+	// so stale local coordinates can never be presented in the new scene.
+	private boolean bSceneLoadVisualHandoffPending = false;
+	private int SceneGeneration = 0;
+	private CustomMovementHandler SceneLoadPreRenderedHandler = null;
+
+	int GetSceneGeneration()
+	{
+		return SceneGeneration;
+	}
+
+	private void InvalidateScenePresentation()
+	{
+		++SceneGeneration;
+		SceneLoadPreRenderedHandler = null;
+		OverlayRenderer.bRuneliteObjectsStale = true;
+		bSceneLoadVisualHandoffPending = true;
+		LastAdaptiveCameraUpdateNanos = 0;
+		bAdaptiveCameraRenderedThisFrame = false;
+		client.setCameraMode(0);
+	}
+
+	// [TMA-MOTION-CONTINUITY] RuneLite can replace the WorldView wrapper while
+	// retaining the same logical scene. Pointer identity would treat that as a
+	// full world change and discard the visible player's interpolation state.
+	static boolean IsSameWorldView(WorldView First, WorldView Second)
+	{
+		return First != null && Second != null &&
+				First.getId() == Second.getId();
+	}
 
 	private boolean IsAdaptiveCameraOn()
 	{
@@ -200,6 +240,44 @@ public class TrueTileMovementPlugin extends Plugin
 
 		LastAdaptiveCameraUpdateNanos = CurrentUpdateNanos;
 		return FrameDeltaMilliseconds;
+	}
+
+	// [TMA-ADAPTIVE-CAMERA-VERTICAL-CONTINUITY] X/Z already approach the
+	// visible model gradually, but focal Y used to be replaced outright every
+	// frame. Scene terrain and animation-height changes could therefore turn
+	// into a one-frame vertical camera jolt. Use a frame-rate-independent
+	// half-life so the same height change has the same visual duration at
+	// different frame rates.
+	static float EaseAdaptiveCameraHeight(
+			float CurrentHeight,
+			float TargetHeight,
+			float FrameDeltaMilliseconds)
+	{
+		if (!Float.isFinite(CurrentHeight))
+		{
+			return TargetHeight;
+		}
+		if (!Float.isFinite(TargetHeight))
+		{
+			return CurrentHeight;
+		}
+
+		float SafeFrameDelta = Math.max(
+				0,
+				Math.min(
+						FrameDeltaMilliseconds,
+						MAX_ADAPTIVE_CAMERA_FRAME_DELTA_MILLISECONDS));
+		double Blend =
+				1.0 -
+						Math.pow(
+								0.5,
+								SafeFrameDelta /
+										ADAPTIVE_CAMERA_VERTICAL_HALF_LIFE_MILLISECONDS);
+		float EasedHeight = CurrentHeight +
+				(TargetHeight - CurrentHeight) * (float) Blend;
+		return Math.abs(TargetHeight - EasedHeight) < 0.01f
+				? TargetHeight
+				: EasedHeight;
 	}
 
 	@Subscribe
@@ -230,6 +308,7 @@ public class TrueTileMovementPlugin extends Plugin
 			bIsPluginSupportedCurrently = true;
 		}
 		++TicksSincePluginWasSupport;
+
 	}
 
 	private void UpdateAdaptiveCamera(
@@ -246,6 +325,16 @@ public class TrueTileMovementPlugin extends Plugin
 			return;
 		}
 		float CameraFrameDeltaMilliseconds = GetAdaptiveCameraFrameDeltaMilliseconds();
+		if (!Float.isFinite(CurrentCameraPositionY))
+		{
+			CurrentCameraPositionY =
+					client.getCameraFocalPointY();
+		}
+		float CameraHeightTarget = FootprintHeight - CameraFollowHeight;
+		CurrentCameraPositionY = EaseAdaptiveCameraHeight(
+				CurrentCameraPositionY,
+				CameraHeightTarget,
+				CameraFrameDeltaMilliseconds);
 
 		// Store in sudo world space to prevent jumps when loading new chunks
 		double CalculationOffsetVectorX = trueLocalTile.getX() - trueWorldTile.getX() * 128;
@@ -319,7 +408,7 @@ public class TrueTileMovementPlugin extends Plugin
 		client.setFreeCameraSpeed(0);
 
 		client.setCameraFocalPointX(CurrentCameraPositionX);
-		client.setCameraFocalPointY(FootprintHeight - CameraFollowHeight);
+		client.setCameraFocalPointY(CurrentCameraPositionY);
 		client.setCameraFocalPointZ(CurrentCameraPositionZ);
 		bAdaptiveCameraRenderedThisFrame = true;
 
@@ -450,7 +539,105 @@ public class TrueTileMovementPlugin extends Plugin
 			boolean AdaptiveCameraOn,
 			boolean ShouldRenderOwner)
 	{
-		return AdaptiveCameraOn && !ShouldRenderOwner;
+		return ShouldRenderAdaptiveCamera(
+				AdaptiveCameraOn,
+				ShouldRenderOwner,
+				false);
+	}
+
+	static boolean ShouldRenderAdaptiveCamera(
+			boolean AdaptiveCameraOn,
+			boolean ShouldRenderOwner,
+			boolean SceneLoadVisualHandoffPending)
+	{
+		return AdaptiveCameraOn &&
+				!ShouldRenderOwner &&
+				!SceneLoadVisualHandoffPending;
+	}
+
+	static boolean ShouldSuppressNativeOwner(
+			boolean SceneLoadVisualHandoffPending,
+			boolean SceneObjectsStale,
+			boolean CustomModelCanReplaceOwner)
+	{
+		return !SceneLoadVisualHandoffPending &&
+				!SceneObjectsStale &&
+				CustomModelCanReplaceOwner;
+	}
+
+	void CompleteSceneLoadVisualHandoff(
+			CustomMovementHandler Handler)
+	{
+		if (!bSceneLoadVisualHandoffPending ||
+				client.getGameState() != GameState.LOGGED_IN ||
+				Handler == null ||
+				!Handler.IsSceneLoadVisualReady())
+		{
+			return;
+		}
+
+		if (Handler.DidLastSceneRebaseUseNativeHandoffAnchor())
+		{
+			// The native camera can continue moving between onBeforeRender and
+			// the overlay completing its replacement model. Capture its final
+			// focal point at the exact transfer boundary before adaptive mode
+			// resumes. An atomic custom rebase deliberately retains the prior
+			// adaptive world-space camera instead.
+			SynchronizeAdaptiveCameraToNativeCamera();
+		}
+		bSceneLoadVisualHandoffPending = false;
+	}
+
+	private boolean TryPrepareSceneLoadBeforeRender(
+			Player Player,
+			CustomMovementHandler Handler)
+	{
+		if (!bSceneLoadVisualHandoffPending ||
+				!OverlayRenderer.bRuneliteObjectsStale ||
+				OverlayRenderer.bEverythingIsStale ||
+				client.getGameState() != GameState.LOGGED_IN ||
+				client.getScene() == null ||
+				Player.getLocalLocation() == null)
+		{
+			return false;
+		}
+
+		// [TMA-SCENE-LOAD-CONTINUITY] BeforeRender is the last safe point
+		// before the destination scene is presented. Recreate, world-rebase,
+		// and fully populate the custom object here so neither the character
+		// nor adaptive camera ever consumes an old-scene local coordinate.
+		Handler.Owner = Player;
+		Handler.Initialize(
+				true,
+				SceneGeneration);
+		Handler.Update();
+		if (!Handler.IsSceneLoadVisualReady())
+		{
+			return false;
+		}
+
+		OverlayRenderer.bRuneliteObjectsStale = false;
+		SceneLoadPreRenderedHandler = Handler;
+		CompleteSceneLoadVisualHandoff(Handler);
+		return true;
+	}
+
+	boolean ConsumeSceneLoadPreRenderUpdate(
+			CustomMovementHandler Handler)
+	{
+		boolean bPreparedForThisPresentation =
+				Handler != null &&
+						Handler == SceneLoadPreRenderedHandler;
+		if (bPreparedForThisPresentation)
+		{
+			// [TMA-SCENE-PRESENTATION-CLOCK] The first drawable scene frame
+			// may finish long after BeforeRender prepared the model. Mark the
+			// moment it was actually presented so the handler can defer that
+			// time instead of applying it as one large update next frame.
+			Handler.MarkSceneLoadFramePresented();
+		}
+		SceneLoadPreRenderedHandler = null;
+		return bPreparedForThisPresentation;
 	}
 	@Subscribe
 	public void onBeforeRender(BeforeRender beforeRender)
@@ -467,6 +654,31 @@ public class TrueTileMovementPlugin extends Plugin
 		if (PlayerMovementHandler == null)
 		{
 			LastAdaptiveCameraUpdateNanos = 0;
+			return;
+		}
+		boolean bSceneLoadHandoff =
+				bSceneLoadVisualHandoffPending ||
+						OverlayRenderer.bRuneliteObjectsStale;
+		if (bSceneLoadHandoff &&
+				TryPrepareSceneLoadBeforeRender(
+						player,
+						PlayerMovementHandler))
+		{
+			bSceneLoadHandoff = false;
+		}
+		if (bSceneLoadHandoff)
+		{
+			// The old RuneLiteObject location is expressed in the previous
+			// scene's local basis. Do not even sample it for camera height or
+			// destination until the overlay has recreated and rebased it.
+			if (client.getGameState() == GameState.LOGGED_IN &&
+					client.getScene() != null &&
+					client.getLocalPlayer().getLocalLocation() != null)
+			{
+				PlayerMovementHandler
+						.MarkNativeSceneLoadHandoffPresented();
+			}
+			SynchronizeAdaptiveCameraToNativeCamera();
 			return;
 		}
 		LocalPoint CameraHeightLocation = PlayerMovementHandler.Model == null
@@ -499,31 +711,53 @@ public class TrueTileMovementPlugin extends Plugin
 		// focal height belongs to the hidden owner rather than the visible model.
 		if (ShouldRenderAdaptiveCamera(
 				IsAdaptiveCameraOn(),
-				PlayerMovementHandler.bShouldRenderOwner))
+				PlayerMovementHandler.bShouldRenderOwner,
+				false))
 		{
 			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight, CameraFollowHeight);
 		}
 		else
 		{
-			// Keep the normal camera position synchronized while adaptive rendering is paused.
-			LastAdaptiveCameraUpdateNanos = 0;
-			if (client.getCameraMode() == 0)
-			{
-				// Store in sudo world space
-				WorldPoint trueWorldTile = client.getLocalPlayer().getWorldLocation();
-				LocalPoint trueLocalTile = LocalPoint.fromWorld(client, trueWorldTile);
-				if (trueLocalTile == null)
-				{
-					return;
-				}
-				double CalculationOffsetVectorX = trueLocalTile.getX() - trueWorldTile.getX() * 128;
-				double CalculationOffsetVectorY = trueLocalTile.getY() - trueWorldTile.getY() * 128;
-
-				CurrentCameraPositionX = (float) (client.getCameraFocalPointX() - CalculationOffsetVectorX);
-				CurrentCameraPositionZ = (float) (client.getCameraFocalPointZ() - CalculationOffsetVectorY);
-			}
-			client.setCameraMode(0);
+			SynchronizeAdaptiveCameraToNativeCamera();
 		}
+	}
+
+	private void SynchronizeAdaptiveCameraToNativeCamera()
+	{
+		// Keep the normal camera position synchronized while adaptive
+		// rendering is paused.
+		LastAdaptiveCameraUpdateNanos = 0;
+		if (client.getCameraMode() == 0 &&
+				client.getLocalPlayer() != null)
+		{
+			// Y has no scene-local basis. Retaining the last actually presented
+			// native focal height gives adaptive rendering a continuous source
+			// value after a native-player handoff.
+			CurrentCameraPositionY = client.getCameraFocalPointY();
+			// Store in sudo world space.
+			WorldPoint TrueWorldTile =
+					client.getLocalPlayer().getWorldLocation();
+			LocalPoint TrueLocalTile = TrueWorldTile == null
+					? null
+					: LocalPoint.fromWorld(client, TrueWorldTile);
+			if (TrueLocalTile != null)
+			{
+				double CalculationOffsetVectorX =
+						TrueLocalTile.getX() -
+								TrueWorldTile.getX() * 128;
+				double CalculationOffsetVectorY =
+						TrueLocalTile.getY() -
+								TrueWorldTile.getY() * 128;
+
+				CurrentCameraPositionX = (float)
+						(client.getCameraFocalPointX() -
+								CalculationOffsetVectorX);
+				CurrentCameraPositionZ = (float)
+						(client.getCameraFocalPointZ() -
+								CalculationOffsetVectorY);
+			}
+		}
+		client.setCameraMode(0);
 	}
 	private long LastTimeHitSplatApplied = 0;
 	@Subscribe
@@ -542,6 +776,7 @@ public class TrueTileMovementPlugin extends Plugin
 		if (bForceEarlyOut || !bIsPluginSupportedCurrently)
 		{
 			CurrentCameraPositionX = -1;
+			CurrentCameraPositionY = Float.NaN;
 			CurrentCameraPositionZ = -1;
 			client.setCameraMode(0);
 			return;
@@ -561,25 +796,6 @@ public class TrueTileMovementPlugin extends Plugin
 			OverlayRenderer.bShowHPBar = false;
 		}
 
-		// Teleports
-		if (client.getLocalPlayer().getAnimation() == 714 ||
-				client.getLocalPlayer().getAnimation() == 878 ||
-				client.getLocalPlayer().getAnimation() == 1816 ||
-				client.getLocalPlayer().getAnimation() == 1979 ||
-				client.getLocalPlayer().getAnimation() == 3872 ||
-				client.getLocalPlayer().getAnimation() == 13811 ||
-				client.getLocalPlayer().getAnimation() == 4069 ||
-				client.getLocalPlayer().getAnimation() == 4071 ||
-				client.getLocalPlayer().getAnimation() == 3869 ||
-				client.getLocalPlayer().getAnimation() == 3865 ||
-				client.getLocalPlayer().getAnimation() == 2881
-		)
-		{
-			OverlayRenderer.LastTimeTeleport = System.currentTimeMillis();
-			OverlayRenderer.bShouldPlayTeleportAnimation = true;
-			OverlayRenderer.bTeleportInterrupted = false;
-		}
-
 		// Print recent animation for convenience
 		if (config.PrintCurrentAnimationIDsToChat() && LastPrintedAnimation != client.getLocalPlayer().getAnimation())
 		{
@@ -594,11 +810,22 @@ public class TrueTileMovementPlugin extends Plugin
 		}
 
 		WorldView newWorldView = player.getWorldView();
-		if (newWorldView != currentWorldView)
+		if (currentWorldView == null)
 		{
-			WorldView old = currentWorldView;
+			currentWorldView = newWorldView;
+		}
+		else if (!IsSameWorldView(newWorldView, currentWorldView))
+		{
 			currentWorldView = newWorldView;
 			OverlayRenderer.bEverythingIsStale = true;
+			InvalidateScenePresentation();
+		}
+		else if (newWorldView != currentWorldView)
+		{
+			// Recreate only the scene-owned objects. The handler will rebase
+			// its retained world-space interpolation in the replacement scene.
+			currentWorldView = newWorldView;
+			InvalidateScenePresentation();
 		}
 	}
 
@@ -697,9 +924,12 @@ public class TrueTileMovementPlugin extends Plugin
 		overlayManager.add(OverlayRenderer);
 		bForceEarlyOut = false;
 		CurrentCameraPositionX = -1;
+		CurrentCameraPositionY = Float.NaN;
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
 		bAdaptiveCameraRenderedThisFrame = false;
+		bSceneLoadVisualHandoffPending = false;
+		SceneLoadPreRenderedHandler = null;
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -716,9 +946,12 @@ public class TrueTileMovementPlugin extends Plugin
 	protected void shutDown() throws Exception
 	{
 		CurrentCameraPositionX = -1;
+		CurrentCameraPositionY = Float.NaN;
 		CurrentCameraPositionZ = -1;
 		LastAdaptiveCameraUpdateNanos = 0;
 		bAdaptiveCameraRenderedThisFrame = false;
+		bSceneLoadVisualHandoffPending = false;
+		SceneLoadPreRenderedHandler = null;
 
 		clientThread.invoke(() ->
 		{
@@ -782,17 +1015,32 @@ public class TrueTileMovementPlugin extends Plugin
 	@Subscribe
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
+		GameState NewState = gameStateChanged.getGameState();
+		// Scene ownership changes regardless of the GPU support detector. Mark
+		// this before its early-out so a coincident support pause cannot leave
+		// an old RuneLiteObject or adaptive-camera target alive indefinitely.
+		if (NewState == GameState.LOADING ||
+				NewState == GameState.CONNECTION_LOST ||
+				NewState == GameState.HOPPING)
+		{
+			InvalidateScenePresentation();
+		}
+
 		if (bForceEarlyOut || !bIsPluginSupportedCurrently)
 		{
 			return;
 		}
 
-		// Runelite objects are stale
-		if (gameStateChanged.getGameState() == GameState.LOADING ||
-				gameStateChanged.getGameState() == GameState.CONNECTION_LOST ||
-				gameStateChanged.getGameState() == GameState.HOPPING)
+		if (NewState == GameState.LOGGED_IN)
 		{
-			OverlayRenderer.bRuneliteObjectsStale = true;
+			Player LocalPlayer = client.getLocalPlayer();
+			if (LocalPlayer != null)
+			{
+				// LOADING already invalidated the scene generation. Adopt the
+				// destination wrapper now so onGameTick does not mistake the
+				// same transition for a second invalidation.
+				currentWorldView = LocalPlayer.getWorldView();
+			}
 		}
 	}
 

@@ -11,6 +11,18 @@ import java.util.Set;
 
 public class CustomMovementHandler
 {
+    private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
+    // RuneScape rebuilds the scene as the player crosses the 16-tile margin
+    // on either side of the 104-tile scene. Route data can disappear for the
+    // last fraction of a tick at exactly that boundary.
+    private static final int SCENE_REBUILD_MARGIN_TILES = 16;
+    private static final int SCENE_BOUNDARY_BRIDGE_MAX_MILLIS = 180;
+    private static final int SCENE_BOUNDARY_BRIDGE_MAX_DISTANCE =
+            Perspective.LOCAL_TILE_SIZE / 2;
+    private static final int SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS = 34;
+    private static final int SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS = 600;
+    private static final int SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR = 5;
+
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
@@ -53,7 +65,40 @@ public class CustomMovementHandler
     private LocalPoint NewLocalPointToDraw; // Current frame draw
     private WorldPoint NextLerpPositionWorldPoint;
     private WorldPoint LastLerpPositionWorldPoint;
+    // [TMA-MOTION-CONTINUITY] Keep the last displayed world-space point so a
+    // scene rebuild can restore the visible sub-tile position, not just the
+    // hidden actor's current tile.
+    private WorldPoint LastRenderedWorldPoint;
+    private int LastRenderedWorldOffsetX = 0;
+    private int LastRenderedWorldOffsetY = 0;
 
+    private boolean bSceneRebasePending = false;
+    private int LastInitializedSceneGeneration = -1;
+    // [TMA-SCENE-LOAD-CONTINUITY] A region rebuild can consume part of the
+    // current movement tick. The first route change after the rebuild must
+    // start at the point actually drawn, not an endpoint the recovery tween
+    // has not reached yet.
+    private boolean bSceneRecoveryRetargetPending = false;
+    // [TMA-SCENE-LOAD-CONTINUITY] Derived every frame. This is deliberately
+    // limited to an outward yellow-click route at the scene rebuild margin;
+    // red-click interactions and ordinary movement can never extrapolate.
+    private boolean bSceneBoundaryBridgeActive = false;
+    // [TMA-SCENE-PRESENTATION-CLOCK] A scene can be prepared at
+    // BeforeRender and then spend ~200 ms finishing its first drawable frame.
+    // Defer that missing time and repay it gradually instead of applying the
+    // whole interval as one position/orientation jump on the following frame.
+    private boolean bScenePresentationClockActive = false;
+    private int ScenePresentationTimeDebtMilliseconds = 0;
+    // When a newer route point arrives while presentation is intentionally
+    // behind, preserve the established movement velocity by extending the
+    // tween duration rather than accelerating toward the newest point.
+    private double SceneRecoveryBaseVelocity = 0;
+    private long SceneRecoveryTweenDurationOverride = 0;
+    // The native owner is deliberately shown while a replacement
+    // RuneLiteObject is being prepared. Once that frame is presented, its
+    // position becomes the authoritative visual anchor for the rebase.
+    private boolean bNativeSceneLoadHandoffPresented = false;
+    private boolean bLastSceneRebaseUsedNativeHandoffAnchor = false;
     // Animation Handling
     private int NO_ANIMATION = -1;
     private int CurrentAnimation = 0;
@@ -181,6 +226,113 @@ public class CustomMovementHandler
         return t;
     }
 
+    static boolean IsSceneBoundaryExitSegment(
+            LocalPoint From,
+            LocalPoint To,
+            LocalPoint Destination)
+    {
+        if (From == null ||
+                To == null ||
+                Destination == null ||
+                From.getWorldView() != To.getWorldView() ||
+                To.getWorldView() != Destination.getWorldView())
+        {
+            return false;
+        }
+
+        int LowBoundary =
+                SCENE_REBUILD_MARGIN_TILES *
+                        Perspective.LOCAL_TILE_SIZE +
+                        Perspective.LOCAL_TILE_SIZE / 2;
+        int HighBoundary =
+                (Constants.SCENE_SIZE -
+                        SCENE_REBUILD_MARGIN_TILES - 1) *
+                        Perspective.LOCAL_TILE_SIZE +
+                        Perspective.LOCAL_TILE_SIZE / 2;
+        int DirectionX = To.getX() - From.getX();
+        int DirectionY = To.getY() - From.getY();
+
+        return (To.getX() == LowBoundary &&
+                        DirectionX < 0 &&
+                        Destination.getX() < To.getX()) ||
+                (To.getX() == HighBoundary &&
+                        DirectionX > 0 &&
+                        Destination.getX() > To.getX()) ||
+                (To.getY() == LowBoundary &&
+                        DirectionY < 0 &&
+                        Destination.getY() < To.getY()) ||
+                (To.getY() == HighBoundary &&
+                        DirectionY > 0 &&
+                        Destination.getY() > To.getY());
+    }
+
+    static double GetSceneBoundaryBridgeTweenValue(
+            long ElapsedMilliseconds,
+            long TweenDurationMilliseconds,
+            double SegmentDistance)
+    {
+        if (TweenDurationMilliseconds <= 0 ||
+                SegmentDistance <= 0 ||
+                ElapsedMilliseconds <= TweenDurationMilliseconds)
+        {
+            return 1.0;
+        }
+
+        long BridgeMilliseconds = Math.min(
+                ElapsedMilliseconds - TweenDurationMilliseconds,
+                SCENE_BOUNDARY_BRIDGE_MAX_MILLIS);
+        double TimeFraction =
+                (double) BridgeMilliseconds /
+                        TweenDurationMilliseconds;
+        double DistanceFraction =
+                SCENE_BOUNDARY_BRIDGE_MAX_DISTANCE /
+                        SegmentDistance;
+        return 1.0 + Math.min(TimeFraction, DistanceFraction);
+    }
+
+    static int GetScenePresentationImmediateFrameDelta(
+            int RawDeltaMilliseconds)
+    {
+        return Math.max(
+                0,
+                Math.min(
+                        RawDeltaMilliseconds,
+                        SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS));
+    }
+
+    static int GetScenePresentationDebtPayback(
+            int ImmediateDeltaMilliseconds,
+            int TimeDebtMilliseconds)
+    {
+        if (ImmediateDeltaMilliseconds <= 0 ||
+                TimeDebtMilliseconds <= 0)
+        {
+            return 0;
+        }
+
+        int MaximumPaybackThisFrame =
+                (ImmediateDeltaMilliseconds +
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR - 1) /
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR;
+        return Math.min(
+                TimeDebtMilliseconds,
+                MaximumPaybackThisFrame);
+    }
+
+    static long GetSceneRecoveryTweenDuration(
+            double Distance,
+            double BaseVelocity,
+            long FallbackDurationMilliseconds)
+    {
+        if (Distance <= 0 || BaseVelocity <= 0)
+        {
+            return Math.max(1L, FallbackDurationMilliseconds);
+        }
+
+        return Math.max(1L, (long) Math.ceil(
+                Distance / BaseVelocity));
+    }
+
     private int ShortestAngleDifference(int from, int to)
     {
         return ((to - from + 3095) % 2047) - 1048;
@@ -214,8 +366,19 @@ public class CustomMovementHandler
         return (Owner instanceof Player);
     }
 
-    public void Initialize(boolean bRuneliteObjectsStale)
+    public void Initialize(
+            boolean bRuneliteObjectsStale,
+            int SceneGeneration)
     {
+        // A stale flag can survive more than one overlay pass while the new
+        // scene is not ready for world/local conversion. Replace the
+        // scene-owned objects once per scene generation, then retain them
+        // until rebase succeeds.
+        boolean bReplaceSceneObjects =
+                bRuneliteObjectsStale &&
+                        LastInitializedSceneGeneration !=
+                                SceneGeneration;
+
         if (AnimController == null)
         {
             AnimController = new AnimationController(client, NO_ANIMATION);
@@ -227,7 +390,7 @@ public class CustomMovementHandler
             });
         }
 
-        if (Model == null || bRuneliteObjectsStale)
+        if (Model == null || bReplaceSceneObjects)
         {
             RuneLiteObject OldModel = Model;
             Model = client.createRuneLiteObject();
@@ -255,7 +418,7 @@ public class CustomMovementHandler
                     });
                 }
 
-                if (cameraModel == null || bRuneliteObjectsStale)
+                if (cameraModel == null || bReplaceSceneObjects)
                 {
                     RuneLiteObject OldModel = cameraModel;
 
@@ -284,6 +447,15 @@ public class CustomMovementHandler
                 }
             }
         }
+
+        // RuneLiteObjects belong to the scene. Preserve handler state and
+        // remap it after a replacement instead of starting from the hidden
+        // player's local point (which causes the visible pop).
+        if (bReplaceSceneObjects)
+        {
+            LastInitializedSceneGeneration = SceneGeneration;
+            bSceneRebasePending = true;
+        }
     }
 
     public void Cleanup()
@@ -294,6 +466,15 @@ public class CustomMovementHandler
         CancelWalkStopFacingHold();
         ReleaseWalkStopIdleController(false);
         WalkStopIdleController = null;
+        bSceneRebasePending = false;
+        bSceneRecoveryRetargetPending = false;
+        bSceneBoundaryBridgeActive = false;
+        bScenePresentationClockActive = false;
+        ScenePresentationTimeDebtMilliseconds = 0;
+        SceneRecoveryBaseVelocity = 0;
+        SceneRecoveryTweenDurationOverride = 0;
+        bNativeSceneLoadHandoffPresented = false;
+        bLastSceneRebaseUsedNativeHandoffAnchor = false;
 
         if (AnimController != null)
         {
@@ -667,25 +848,332 @@ public class CustomMovementHandler
     private void UpdateFrameTimer()
     {
         CurrentTime = System.currentTimeMillis();
-        CurrentFrameDelta = (int) (CurrentTime - LastTimeMilliseconds);
+        int RawFrameDelta = (int) Math.max(
+                0,
+                Math.min(
+                        Integer.MAX_VALUE,
+                        CurrentTime - LastTimeMilliseconds));
         LastTimeMilliseconds = CurrentTime;
+        CurrentFrameDelta = RawFrameDelta;
+
+        if (bScenePresentationClockActive)
+        {
+            int ImmediateDelta =
+                    GetScenePresentationImmediateFrameDelta(
+                            RawFrameDelta);
+            ScenePresentationTimeDebtMilliseconds =
+                    Math.min(
+                            SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS,
+                            ScenePresentationTimeDebtMilliseconds +
+                                    Math.max(
+                                            0,
+                                            RawFrameDelta -
+                                                    ImmediateDelta));
+            int DebtPayback =
+                    GetScenePresentationDebtPayback(
+                            ImmediateDelta,
+                            ScenePresentationTimeDebtMilliseconds);
+            CurrentFrameDelta = ImmediateDelta + DebtPayback;
+            ScenePresentationTimeDebtMilliseconds -= DebtPayback;
+
+            if (ScenePresentationTimeDebtMilliseconds == 0 &&
+                    !bSceneRecoveryRetargetPending &&
+                    SceneRecoveryTweenDurationOverride == 0)
+            {
+                bScenePresentationClockActive = false;
+            }
+        }
+
         if (CurrentFrameDelta > 0)
         {
             MillisecondsSinceTileChange += CurrentFrameDelta;
         }
     }
 
-    private void UpdateTrueTileLocation()
+    void MarkSceneLoadFramePresented()
+    {
+        if (!bScenePresentationClockActive ||
+                LastTimeMilliseconds <= 0)
+        {
+            return;
+        }
+
+        long PresentationTime = System.currentTimeMillis();
+        int DeferredMilliseconds = (int) Math.max(
+                0,
+                Math.min(
+                        SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS,
+                        PresentationTime - LastTimeMilliseconds));
+        ScenePresentationTimeDebtMilliseconds =
+                Math.min(
+                        SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS,
+                        ScenePresentationTimeDebtMilliseconds +
+                                DeferredMilliseconds);
+        // The prepared state has now actually reached the screen. Start the
+        // next delta here; the elapsed scene-build time is represented by the
+        // debt above and will be repaid at a bounded rate.
+        CurrentTime = PresentationTime;
+        LastTimeMilliseconds = PresentationTime;
+    }
+
+    private boolean UpdateTrueTileLocation()
     {
         CurrentWorldPoint = Owner.getWorldLocation();
+        if (CurrentWorldPoint == null)
+        {
+            return false;
+        }
 
         LocalPoint LocalCurrentTrueTilePosition = LocalPoint.fromWorld(client, CurrentWorldPoint);
+        if (LocalCurrentTrueTilePosition == null)
+        {
+            // Region loading may temporarily have no local conversion for a
+            // valid world point. Keep the previous fully rendered frame until
+            // the new scene can be rebased.
+            return false;
+        }
         if (!LocalCurrentTrueTilePosition.equals(CurrentTrueTilePosition))
         {
             // Also record the last one
             LastTrueTilePosition = CurrentTrueTilePosition;
             CurrentTrueTilePosition = LocalCurrentTrueTilePosition;
         }
+        return true;
+    }
+
+    private static boolean IsSameWorldView(
+            LocalPoint First,
+            LocalPoint Second)
+    {
+        return First != null &&
+                Second != null &&
+                First.getWorldView() ==
+                        Second.getWorldView();
+    }
+
+    static int GetSceneRebaseElapsedMilliseconds(int FrameDelta)
+    {
+        return Math.max(0, Math.min(
+                BASE_MOVEMENT_TWEEN_MILLIS,
+                FrameDelta));
+    }
+
+    static int GetSceneRebaseElapsedMilliseconds(
+            int FrameDelta,
+            boolean bHasRecoveryDistance)
+    {
+        return bHasRecoveryDistance
+                ? GetSceneRebaseElapsedMilliseconds(FrameDelta)
+                : BASE_MOVEMENT_TWEEN_MILLIS;
+    }
+
+    static int GetSceneRebaseElapsedMilliseconds(
+            int FrameDelta,
+            boolean bHasRecoveryDistance,
+            boolean bUseNativeHandoffAnchor)
+    {
+        if (!bHasRecoveryDistance)
+        {
+            return BASE_MOVEMENT_TWEEN_MILLIS;
+        }
+        if (bUseNativeHandoffAnchor)
+        {
+            // The native owner was just presented. Advancing before the first
+            // custom draw would create a smaller version of the same seam.
+            return 0;
+        }
+        return GetSceneRebaseElapsedMilliseconds(FrameDelta);
+    }
+
+    static boolean ShouldReanchorSceneRecovery(
+            boolean bRecoveryPending,
+            int ElapsedMilliseconds,
+            long TweenDurationMilliseconds,
+            boolean bHasDisplayedPoint)
+    {
+        return bRecoveryPending &&
+                bHasDisplayedPoint &&
+                ElapsedMilliseconds < TweenDurationMilliseconds;
+    }
+
+    static LocalPoint SelectSceneRebaseAnchor(
+            boolean bNativeHandoffPresented,
+            LocalPoint OwnerLocation,
+            LocalPoint RetainedCustomLocation)
+    {
+        return bNativeHandoffPresented &&
+                OwnerLocation != null
+                ? OwnerLocation
+                : RetainedCustomLocation;
+    }
+
+    void MarkNativeSceneLoadHandoffPresented()
+    {
+        bNativeSceneLoadHandoffPresented = true;
+    }
+
+    boolean DidLastSceneRebaseUseNativeHandoffAnchor()
+    {
+        return bLastSceneRebaseUsedNativeHandoffAnchor;
+    }
+
+    private boolean RebaseAfterSceneLoad()
+    {
+        LocalPoint OwnerLocation = Owner.getLocalLocation();
+        WorldPoint OwnerWorldPoint = Owner.getWorldLocation();
+        LocalPoint CurrentTrueLocation = OwnerWorldPoint == null
+                ? null
+                : LocalPoint.fromWorld(client, OwnerWorldPoint);
+        if (OwnerLocation == null ||
+                OwnerWorldPoint == null ||
+                CurrentTrueLocation == null)
+        {
+            return false;
+        }
+
+        LocalPoint RetainedCustomLocation =
+                LastRenderedWorldPoint == null
+                ? null
+                : LocalPoint.fromWorld(client, LastRenderedWorldPoint);
+        if (RetainedCustomLocation != null)
+        {
+            RetainedCustomLocation = new LocalPoint(
+                    RetainedCustomLocation.getX() +
+                            LastRenderedWorldOffsetX,
+                    RetainedCustomLocation.getY() +
+                            LastRenderedWorldOffsetY,
+                    RetainedCustomLocation.getWorldView());
+        }
+        boolean bUseNativeHandoffAnchor =
+                bNativeSceneLoadHandoffPresented;
+        bLastSceneRebaseUsedNativeHandoffAnchor =
+                bUseNativeHandoffAnchor;
+        LocalPoint RenderedLocation = SelectSceneRebaseAnchor(
+                bUseNativeHandoffAnchor,
+                OwnerLocation,
+                RetainedCustomLocation);
+        boolean bRealDiscontinuity =
+                !IsSameWorldView(RenderedLocation, CurrentTrueLocation) ||
+                (!bUseNativeHandoffAnchor &&
+                        (LastRenderedWorldPoint == null ||
+                                LastRenderedWorldPoint.getPlane() !=
+                                        OwnerWorldPoint.getPlane()));
+        if (!bRealDiscontinuity &&
+                !bUseNativeHandoffAnchor)
+        {
+            double DistanceInTiles =
+                    RenderedLocation.distanceTo(CurrentTrueLocation) /
+                            Perspective.LOCAL_TILE_SIZE;
+            bRealDiscontinuity = DistanceInTiles >
+                    Math.max(1, config.PlayerModelSnapDistance());
+        }
+        if (bRealDiscontinuity)
+        {
+            // A real teleport/instance change has no shared scene location.
+            // It is correct to snap once to the new native point in that case.
+            RenderedLocation = CurrentTrueLocation;
+            LastRenderedWorldOffsetX = 0;
+            LastRenderedWorldOffsetY = 0;
+        }
+
+        LastLerpPosition = RenderedLocation;
+        NewLocalPointToDraw = RenderedLocation;
+        // Use the true-tile center here. Seeding this with OwnerLocation (the
+        // hidden actor's fractional position) made generic destination logic
+        // overwrite RenderedLocation during this same update.
+        NextLerpPosition = CurrentTrueLocation;
+        LastLerpPositionWorldPoint = WorldPoint.fromLocal(client,
+                RenderedLocation);
+        NextLerpPositionWorldPoint = OwnerWorldPoint;
+        LastTrueTilePosition = RenderedLocation;
+        CurrentTrueTilePosition = CurrentTrueLocation;
+        CurrentWorldPoint = OwnerWorldPoint;
+        // Carry only time for which rendering was missed. This prevents the
+        // model pausing at the restored point and then skipping when the next
+        // server route step arrives.
+        boolean bHasRecoveryDistance =
+                !RenderedLocation.equals(CurrentTrueLocation);
+        ScenePresentationTimeDebtMilliseconds = 0;
+        SceneRecoveryTweenDurationOverride = 0;
+        SceneRecoveryBaseVelocity = bHasRecoveryDistance
+                ? RenderedLocation.distanceTo(CurrentTrueLocation) /
+                        BASE_MOVEMENT_TWEEN_MILLIS
+                : 0;
+        bScenePresentationClockActive =
+                bHasRecoveryDistance;
+        MillisecondsSinceTileChange =
+                GetSceneRebaseElapsedMilliseconds(
+                        CurrentFrameDelta,
+                        bHasRecoveryDistance,
+                        bUseNativeHandoffAnchor);
+        bSceneRecoveryRetargetPending =
+                bHasRecoveryDistance &&
+                        MillisecondsSinceTileChange <
+                                BASE_MOVEMENT_TWEEN_MILLIS;
+
+        if (Model != null)
+        {
+            Model.setLocation(RenderedLocation,
+                    Owner.getWorldView().getPlane());
+            Model.setOrientation(CurrentOrientation);
+        }
+
+        bNativeSceneLoadHandoffPresented = false;
+        return true;
+    }
+
+    boolean IsSceneLoadVisualReady()
+    {
+        if (bSceneRebasePending ||
+                Owner == null ||
+                Owner.getLocalLocation() == null)
+        {
+            return false;
+        }
+
+        if (bShouldRenderOwner)
+        {
+            return true;
+        }
+
+        return Model != null &&
+                Model.getModel() != null &&
+                Model.getLocation() != null &&
+                IsSameWorldView(
+                        Model.getLocation(),
+                        Owner.getLocalLocation());
+    }
+
+    boolean CanSuppressOwnerInCurrentScene()
+    {
+        return !bShouldRenderOwner &&
+                !bRenderOriginalOwnerDueToProximity &&
+                IsSceneLoadVisualReady() &&
+                Model.isActive();
+    }
+
+    private void RecordLastRenderedLocation(LocalPoint RenderLocation)
+    {
+        if (RenderLocation == null)
+        {
+            return;
+        }
+
+        LastRenderedWorldPoint = WorldPoint.fromLocal(client, RenderLocation);
+        LocalPoint TileLocation = LastRenderedWorldPoint == null
+                ? null
+                : LocalPoint.fromWorld(client, LastRenderedWorldPoint);
+        if (!IsSameWorldView(TileLocation, RenderLocation))
+        {
+            LastRenderedWorldOffsetX = 0;
+            LastRenderedWorldOffsetY = 0;
+            return;
+        }
+
+        LastRenderedWorldOffsetX = RenderLocation.getX() -
+                TileLocation.getX();
+        LastRenderedWorldOffsetY = RenderLocation.getY() -
+                TileLocation.getY();
     }
 
     private void UpdateTargetStatus()
@@ -848,6 +1336,10 @@ public class CustomMovementHandler
             }
 
             LocalPoint RequestedLerpPoint = LocalPoint.fromWorld(client, CurrentWorldPoint);
+            if (RequestedLerpPoint == null)
+            {
+                return;
+            }
             if (LastLerpPosition == null)
             {
                 NextLerpPosition = RequestedLerpPoint;
@@ -902,12 +1394,6 @@ public class CustomMovementHandler
                 }
                 ++FramesSinceIdle;
 
-                // Interrupt the teleport
-                if (CurrentAnimationRequest.bShouldTeleportToLocation && FramesSinceIdle > 1)
-                {
-                    overlay.bTeleportInterrupted = true;
-                }
-
                 // Fallback to quick and dirty move
 
                 int DistanceInTilesToLast = 0;
@@ -919,7 +1405,33 @@ public class CustomMovementHandler
                     DistanceInTilesToNextLerp = (int) (euclideanDistance(NextLerpPoint.getX(), NextLerpPoint.getY(), RequestedLerpPoint.getX(), RequestedLerpPoint.getY()) / 128);
                 }
 
-                if (NextLerpPoint != null &&
+                long CurrentTweenDuration =
+                        GetMovementTweenDurationMilliseconds();
+                boolean bReanchorBoundaryBridge =
+                        bSceneBoundaryBridgeActive &&
+                                NewLocalPointToDraw != null;
+                boolean bReanchorRecovery =
+                        bReanchorBoundaryBridge ||
+                                ShouldReanchorSceneRecovery(
+                                bSceneRecoveryRetargetPending ||
+                                        bScenePresentationClockActive ||
+                                        SceneRecoveryTweenDurationOverride > 0,
+                                MillisecondsSinceTileChange,
+                                CurrentTweenDuration,
+                                NewLocalPointToDraw != null);
+                if (bReanchorRecovery)
+                {
+                    // [TMA-SCENE-LOAD-CONTINUITY] The next route step arrived
+                    // before a recovery/scene-edge bridge finished. Continue
+                    // from the displayed point; snapping to the authoritative
+                    // endpoint is the skip visible in the scene-load traces.
+                    LastLerpPosition = NewLocalPointToDraw;
+                    LastLerpPositionWorldPoint =
+                            WorldPoint.fromLocal(
+                                    client,
+                                    LastLerpPosition);
+                }
+                else if (NextLerpPoint != null &&
                         DistanceInTilesToNextLerp <= config.PlayerModelSnapDistance() &&
                         DistanceInTilesToLast <= config.PlayerModelSnapDistance())
                 {
@@ -937,20 +1449,38 @@ public class CustomMovementHandler
                     LastLerpPositionWorldPoint = WorldPoint.fromLocal(client, LastLerpPosition);
                     LastTrueTilePosition = CurrentTrueTilePosition;
 
-                    // Teleport fallback (Not covered by animation in plugin)
-                    if (IsPlayerOwner() && CurrentTime - overlay.LastTimeTeleport >= 1800)
-                    {
-                        overlay.LastTimeTeleport = System.currentTimeMillis() - 600; // (We are at this location already, offset expected 1 tick animation time)
-                        overlay.bShouldPlayTeleportAnimation = false; // Fallback, do not play animation
-                        overlay.bTeleportInterrupted = false;
-                    }
                 }
+                bSceneRecoveryRetargetPending = false;
 
                 NextLerpPosition = RequestedLerpPoint;
 
                 NextLerpPositionWorldPoint = CurrentWorldPoint;
 
-                MillisecondsSinceTileChange = 0;
+                if (bReanchorRecovery)
+                {
+                    SceneRecoveryTweenDurationOverride =
+                            GetSceneRecoveryTweenDuration(
+                                    LastLerpPosition.distanceTo(
+                                            NextLerpPosition),
+                                    SceneRecoveryBaseVelocity,
+                                    CurrentTweenDuration);
+                }
+                else
+                {
+                    SceneRecoveryTweenDurationOverride = 0;
+                    if (!bScenePresentationClockActive)
+                    {
+                        SceneRecoveryBaseVelocity = 0;
+                    }
+                }
+
+                MillisecondsSinceTileChange = bReanchorRecovery
+                        ? (int) Math.max(
+                                0,
+                                Math.min(
+                                        CurrentFrameDelta,
+                                        CurrentTweenDuration))
+                        : 0;
                 bNewTileMovementStarted = true;
                 bLastMovementDestinationPotentiallyDirty = true;
             }
@@ -1005,10 +1535,9 @@ public class CustomMovementHandler
     private void UpdateAnimationSelection()
     {
         bShouldUseTrueLocationOrientation = false;
-
-        // Quick and dirty teleport to location
-        boolean bApplyQuickAndDirtyTeleport = LastLerpPosition.equals(NextLerpPosition);
-
+        bSceneBoundaryBridgeActive =
+                ShouldBridgeSceneBoundaryMovement(
+                        GetMovementTweenDurationMilliseconds());
 
         // Override all animations
         //if (devConfig.DebugAnimation() != 0)
@@ -1019,7 +1548,8 @@ public class CustomMovementHandler
         //else
 
         // Currently moving
-        if (MillisecondsSinceTileChange < 600 ) // 1 tick
+        if (MillisecondsSinceTileChange < 600 ||
+                bSceneBoundaryBridgeActive) // 1 tick, plus a bounded scene-edge bridge
         {
             bMovingThisAction = true;
 
@@ -1036,61 +1566,17 @@ public class CustomMovementHandler
                 FramesSinceIdle = 0;
             }
 
-            // Just teleported
-            if (IsPlayerOwner() && CurrentTime - overlay.LastTimeTeleport < 1800 && !overlay.bTeleportInterrupted)
-            {
-                if (overlay.bShouldPlayTeleportAnimation && bIsDefaultHumanAnimationSet)
-                {
-                    if (CurrentTime - overlay.LastTimeTeleport < 600) // Blend with the first tick
-                    {
-                        // Handle normal walking
-                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
-                        CurrentAnimationRequest.bShouldTeleportToLocation = false;
-                    }
-                    else
-                    {
-                        CurrentAnimationRequest.bShouldTeleportToLocation = true;
-                        CurrentAnimationRequest.AnimationToPlay = 715; // Teleport in
-
-                        ChangeLastLerpPointForRotation();
-                    }
-                }
-                else
-                {
-                    // Get true animation and rotation
-                    // Use orientation to identify which of the tile we are moving to
-                    double radians = Owner.getOrientation() * Math.PI / 1024.0;
-                    double cos = Math.cos(radians);
-                    double sin = Math.sin(radians);
-
-                    // Get vector between true tile last and next;
-                    // Rotate vector by orientation
-                    int DirectionX = Owner.getLocalLocation().getX() - LastTrueTilePosition.getX();
-                    int DirectionY = Owner.getLocalLocation().getY() - LastTrueTilePosition.getY();
-
-                    if (Owner.getLocalLocation().getX() == CurrentTrueTilePosition.getX() &&
-                            Owner.getLocalLocation().getY() == CurrentTrueTilePosition.getY() )
-                    {
-                        CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdlePoseAnimation;
-                    }
-                    else
-                    {
-                        int TempRotatedDirectionX = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * cos - DirectionY * sin) / 128.0))));
-                        int TempRotatedDirectionY = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * sin + DirectionY * cos) / 128.0))));
-
-                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + TempRotatedDirectionX][2 + TempRotatedDirectionY]);
-                    }
-                    bShouldUseTrueLocationOrientation = true;
-                    CurrentAnimationRequest.bShouldTeleportToLocation = true;
-
-                    ChangeLastLerpPointForRotation();
-                }
-                CurrentAnimationRequest.bUseLinearTween = true;
-                CurrentAnimationRequest.MovementSpeedMultiplier = 1.0;
-                CurrentAnimationRequest.StartingFrame = 0;
-                CurrentAnimationRequest.AnimationSpeed = 1;
-            }
-            else if (config.AllowLeaping() &&
+            // [TMA-CAST-MOVEMENT-ORDERING] Owner.getAnimation() is the single
+            // authority for an active cast. The old implementation also
+            // remembered selected cast/teleport animation IDs and later
+            // synthesized HUMAN_CASTTELEPORT_REVERSE (animation 715). If the
+            // player clicked to move first, locomotion could begin and that
+            // delayed animation would then replay the cast and request a
+            // false positional snap. Keep locomotion advancing underneath
+            // the real action animation instead. Genuine teleports and other
+            // authoritative discontinuities still use the normal movement
+            // request path; only the delayed duplicate authority was removed.
+            if (config.AllowLeaping() &&
                     bCurrentlyWooxWalking &&
                     config.AllowWooxWalkDetection() &&
                     bIsDefaultHumanAnimationSet)
@@ -1216,12 +1702,6 @@ public class CustomMovementHandler
             }
         }
 
-        if (bApplyQuickAndDirtyTeleport)
-        {
-            CurrentAnimationRequest.bShouldTeleportToLocation = true;
-            CurrentAnimationRequest.OrientationSpeed = 10000;
-        }
-
         if (CurrentAnimationRequest.bResetAnimationOnNewTile && bNewTileMovementStarted)
         {
             bResetCurrentAnimation = true; // Reset animation
@@ -1286,28 +1766,101 @@ public class CustomMovementHandler
         return false;
     }
 
+    private long GetMovementTweenDurationMilliseconds()
+    {
+        if (SceneRecoveryTweenDurationOverride > 0)
+        {
+            return SceneRecoveryTweenDurationOverride;
+        }
+
+        double RequestSpeedMultiplier =
+                CurrentAnimationRequest == null
+                        ? 1.0
+                        : CurrentAnimationRequest.MovementSpeedMultiplier;
+        double MovementSpeedMultiplier =
+                config.MovementSpeedMultiplier() *
+                        RequestSpeedMultiplier;
+        MovementSpeedMultiplier =
+                Math.max(MovementSpeedMultiplier, 1);
+        return Math.max(1L, (long)
+                (BASE_MOVEMENT_TWEEN_MILLIS /
+                        MovementSpeedMultiplier));
+    }
+
+    private boolean ShouldBridgeSceneBoundaryMovement(
+            long TweenDurationMilliseconds)
+    {
+        if (!IsPlayerOwner() ||
+                !bWalkStopFacingHoldArmed ||
+                !bWalkMovementObserved ||
+                MillisecondsSinceTileChange <
+                        TweenDurationMilliseconds)
+        {
+            return false;
+        }
+
+        return IsSceneBoundaryExitSegment(
+                LastLerpPosition,
+                NextLerpPosition,
+                client.getLocalDestinationLocation());
+    }
+
     private void ApplyTweening()
     {
         // 600ms a tick, interpolate between true local point and last true tile position
         double TweenValue = 0;
-        double MovementSpeedMultiplier = config.MovementSpeedMultiplier() * CurrentAnimationRequest.MovementSpeedMultiplier;
-        MovementSpeedMultiplier = Math.max(MovementSpeedMultiplier, 1);
+        long TweenDurationMilliseconds =
+                GetMovementTweenDurationMilliseconds();
         if (CurrentAnimationRequest.bShouldTeleportToLocation)
         {
             TweenValue = 1.0;
         }
+        else if (bSceneBoundaryBridgeActive)
+        {
+            // [TMA-SCENE-LOAD-CONTINUITY] At a rebuild boundary the final
+            // route point can be overdue before the next scene publishes its
+            // continuation. Extend the already-authoritative segment for at
+            // most 180 ms / half a tile so the model and adaptive camera do
+            // not visibly stop. The strict yellow-click + boundary test above
+            // prevents this from reviving interaction-object overshoot.
+            TweenValue = GetSceneBoundaryBridgeTweenValue(
+                    MillisecondsSinceTileChange,
+                    TweenDurationMilliseconds,
+                    LastLerpPosition.distanceTo(NextLerpPosition));
+        }
         else if (CurrentAnimationRequest.bUseLinearTween)
         {
-            TweenValue = linearTween(0L, (long) (600 / MovementSpeedMultiplier), MillisecondsSinceTileChange);
+            TweenValue = linearTween(
+                    0L,
+                    TweenDurationMilliseconds,
+                    MillisecondsSinceTileChange);
         }
         else
         {
-            TweenValue = quadraticTween(0L, (long) (600 / MovementSpeedMultiplier), MillisecondsSinceTileChange);
+            TweenValue = quadraticTween(
+                    0L,
+                    TweenDurationMilliseconds,
+                    MillisecondsSinceTileChange);
         }
 
         NewLocalPointToDraw = new LocalPoint((int) (LastLerpPosition.getX() + (NextLerpPosition.getX() - LastLerpPosition.getX()) * TweenValue),
                 (int) (LastLerpPosition.getY() + (NextLerpPosition.getY() - LastLerpPosition.getY()) * TweenValue),
                 LastLerpPosition.getWorldView());
+
+        if (MillisecondsSinceTileChange >=
+                TweenDurationMilliseconds)
+        {
+            bSceneRecoveryRetargetPending = false;
+            if (SceneRecoveryTweenDurationOverride > 0)
+            {
+                SceneRecoveryTweenDurationOverride = 0;
+                if (ScenePresentationTimeDebtMilliseconds == 0)
+                {
+                    bScenePresentationClockActive = false;
+                    SceneRecoveryBaseVelocity = 0;
+                }
+            }
+        }
 
         if (currentTarget != null)
         {
@@ -1724,6 +2277,7 @@ public class CustomMovementHandler
                 bRenderOriginalOwnerDueToProximity = false;
             }
 
+            RecordLastRenderedLocation(Model.getLocation());
             UpdateCamera();
         }
         else
@@ -1737,15 +2291,37 @@ public class CustomMovementHandler
         }
 
     }
+
     public void Update()
     {
+        if (client.getGameState() == GameState.LOADING)
+        {
+            // [TMA-MOTION-CONTINUITY] Scene-owned objects may be replaced
+            // during this interval, but the last valid handler state remains
+            // authoritative. Initialize marks a pending rebase; wait until
+            // world/local conversion is valid instead of resetting or moving
+            // the visible player to a transient local coordinate.
+            return;
+        }
+
         UpdateFrameTimer();
 
         UpdateOldIdleAnimations();
 
         UpdateTargetStatus();
 
-        UpdateTrueTileLocation();
+        if (bSceneRebasePending && RebaseAfterSceneLoad())
+        {
+            bSceneRebasePending = false;
+        }
+
+        if (!UpdateTrueTileLocation())
+        {
+            // Soft suspension while the client is rebuilding a scene: retain
+            // the last valid model/interpolation state until conversion from
+            // world coordinates is available again.
+            return;
+        }
 
         UpdateLerpDestinations();
 

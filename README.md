@@ -16,6 +16,10 @@ Features
 * Dynamic Overheads: Update overhead prayers to follow the new movement model.
 * Health Bar Sync: Adjust the player health bar to match the position of the new character model.
 
+For the causes, design constraints, and maintenance notes behind the movement,
+animation, scene-loading, and camera continuity fixes, see
+[Continuity implementation notes](docs/CONTINUITY_IMPLEMENTATION_NOTES.md).
+
 
 
 CONTRIBUTOR LIST->

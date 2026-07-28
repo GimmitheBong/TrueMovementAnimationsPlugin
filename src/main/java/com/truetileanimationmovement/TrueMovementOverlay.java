@@ -38,9 +38,6 @@ public class TrueMovementOverlay extends OverlayPanel
     public boolean bEverythingIsStale = false;
     public boolean bRuneliteObjectsStale = false;
     public boolean bRecentlyClickedEvent = false;
-    public long LastTimeTeleport = 0;
-    public boolean bShouldPlayTeleportAnimation = false;
-    public boolean bTeleportInterrupted = false;
 
     // HP Bar
     public boolean bShowHPBar = true;
@@ -332,6 +329,14 @@ public class TrueMovementOverlay extends OverlayPanel
             return null;
         }
 
+        // [TMA-SCENE-LOAD-CONTINUITY] RuneLite can invoke overlays while the
+        // current scene is being discarded. Retain stale/pending state and
+        // create nothing until the destination scene is LOGGED_IN.
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            return null;
+        }
+
         if (bEverythingIsStale)
         {
             Cleanup();
@@ -346,13 +351,31 @@ public class TrueMovementOverlay extends OverlayPanel
 
         var playerEntry = MovementHandlerCache.get(client.getLocalPlayer().getId());
         playerEntry.Owner = client.getLocalPlayer();
-        // Initialize if needed
-        playerEntry.Initialize(bRuneliteObjectsStale);
+        boolean bSceneObjectsWereStale = bRuneliteObjectsStale;
+        boolean bUpdatedBeforeSceneRender =
+                plugin.ConsumeSceneLoadPreRenderUpdate(playerEntry);
+        if (!bUpdatedBeforeSceneRender)
+        {
+            // Initialize if needed
+            playerEntry.Initialize(
+                    bSceneObjectsWereStale,
+                    plugin.GetSceneGeneration());
 
-        // True update
-        playerEntry.Update();
+            // True update
+            playerEntry.Update();
 
-        bRuneliteObjectsStale = false;
+            plugin.CompleteSceneLoadVisualHandoff(playerEntry);
+        }
+
+        // [TMA-SCENE-LOAD-CONTINUITY] Do not acknowledge a scene rebuild
+        // until world/local conversion and the replacement model are ready.
+        // Otherwise the native fallback is hidden with nothing valid to
+        // replace it.
+        if (!bSceneObjectsWereStale ||
+                playerEntry.IsSceneLoadVisualReady())
+        {
+            bRuneliteObjectsStale = false;
+        }
 
         // Overheads
         RenderOverheadObjects(graphics);
