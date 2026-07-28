@@ -102,6 +102,12 @@ public class TrueTileMovementPlugin extends Plugin
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
 	public boolean bIsPluginSupportedCurrently = true;
 	public int TicksSincePluginWasSupport = 0;
+	// [TMA-STEADY-PRESENTATION] Render callbacks can pause briefly during an
+	// ordinary long frame. The old six-client-tick threshold treated a
+	// roughly 100 ms hitch as GPU removal and tore down the model/controller.
+	// One second still detects an unsupported renderer promptly without
+	// converting a recoverable frame hitch into a visible animation restart.
+	private static final int GPU_CALLBACK_GRACE_CLIENT_TICKS = 50;
 	private final RenderCallback renderCallback = new RenderCallback()
 	{
 		@Override
@@ -226,6 +232,15 @@ public class TrueTileMovementPlugin extends Plugin
 		return !bForceAdaptiveCameraOff && config.AdaptiveCameraOn();
 	}
 
+	static boolean IsGpuCallbackStillSupported(
+			GameState CurrentGameState,
+			int TicksSinceCallback)
+	{
+		return CurrentGameState != GameState.LOGGED_IN ||
+				TicksSinceCallback <=
+						GPU_CALLBACK_GRACE_CLIENT_TICKS;
+	}
+
 	private float GetAdaptiveCameraFrameDeltaMilliseconds()
 	{
 		long CurrentUpdateNanos = System.nanoTime();
@@ -298,16 +313,19 @@ public class TrueTileMovementPlugin extends Plugin
 			bForceAdaptiveCameraOff = false;
 		}
 
-		// Plugin no longer supported (Need GPU plugin)
-		if (TicksSincePluginWasSupport > 5)
+		// Plugin no longer supported (Need GPU plugin). Only age the callback
+		// while a scene is expected to render; LOADING/HOPPING pauses are not
+		// evidence that GPU support disappeared.
+		bIsPluginSupportedCurrently =
+				IsGpuCallbackStillSupported(
+						client.getGameState(),
+						TicksSincePluginWasSupport);
+		if (client.getGameState() == GameState.LOGGED_IN)
 		{
-			bIsPluginSupportedCurrently = false;
+			TicksSincePluginWasSupport = Math.min(
+					GPU_CALLBACK_GRACE_CLIENT_TICKS + 1,
+					TicksSincePluginWasSupport + 1);
 		}
-		else
-		{
-			bIsPluginSupportedCurrently = true;
-		}
-		++TicksSincePluginWasSupport;
 
 	}
 

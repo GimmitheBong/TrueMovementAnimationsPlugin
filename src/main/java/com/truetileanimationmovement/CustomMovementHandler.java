@@ -22,6 +22,11 @@ public class CustomMovementHandler
     private static final int SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS = 34;
     private static final int SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS = 600;
     private static final int SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR = 5;
+    // Client/game tick scheduling is not perfectly aligned with overlay
+    // rendering. A small, route-qualified grace prevents a completed 600 ms
+    // segment from selecting idle for one frame immediately before the next
+    // segment is published.
+    private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 100;
 
     // General
     private final Client client;
@@ -331,6 +336,68 @@ public class CustomMovementHandler
 
         return Math.max(1L, (long) Math.ceil(
                 Distance / BaseVelocity));
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringRouteGap(
+            int MillisecondsSinceTileChange,
+            boolean WasMoving,
+            boolean WalkRouteArmed,
+            boolean WalkMovementObserved,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        return WasMoving &&
+                WalkRouteArmed &&
+                WalkMovementObserved &&
+                MillisecondsSinceTileChange >=
+                        BASE_MOVEMENT_TWEEN_MILLIS &&
+                MillisecondsSinceTileChange <
+                        BASE_MOVEMENT_TWEEN_MILLIS +
+                                MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS &&
+                CurrentSegmentDestination != null &&
+                RouteDestination != null &&
+                IsSameWorldView(
+                        CurrentSegmentDestination,
+                        RouteDestination) &&
+                !CurrentSegmentDestination.equals(RouteDestination);
+    }
+
+    static boolean ShouldUseOriginalOwnerPresentation(
+            boolean AllowOriginalModel,
+            boolean Moving,
+            boolean HoldingStopFacing,
+            boolean UsedCustomAnimation,
+            int OwnerActionAnimation,
+            int DistanceX,
+            int DistanceY,
+            int OrientationDifference,
+            int DistanceThreshold,
+            int OrientationThreshold)
+    {
+        // [TMA-STEADY-PRESENTATION] Never change render authority in the
+        // middle of locomotion or an action. At tile boundaries the native and
+        // custom locations can briefly coincide; swapping there produces a
+        // one-frame phase/visibility seam before the next segment starts.
+        return AllowOriginalModel &&
+                !Moving &&
+                !HoldingStopFacing &&
+                !UsedCustomAnimation &&
+                OwnerActionAnimation == -1 &&
+                Math.abs(DistanceX) <= DistanceThreshold &&
+                Math.abs(DistanceY) <= DistanceThreshold &&
+                Math.abs(OrientationDifference) <=
+                        OrientationThreshold;
+    }
+
+    static boolean ShouldReplaceAnimationController(
+            int CurrentAnimationId,
+            int RequestedAnimationId,
+            boolean ExplicitReset)
+    {
+        // RuneLite may replace an Animation wrapper without changing the
+        // underlying animation. Object identity must not restart its phase.
+        return ExplicitReset ||
+                CurrentAnimationId != RequestedAnimationId;
     }
 
     private int ShortestAngleDifference(int from, int to)
@@ -658,6 +725,25 @@ public class CustomMovementHandler
                 IdlePoseAnimation != -1;
     }
 
+    private boolean TrySetModel(
+            net.runelite.api.Model SourceModel)
+    {
+        if (SourceModel == null)
+        {
+            return false;
+        }
+
+        net.runelite.api.Model MergedModel =
+                client.mergeModels(SourceModel);
+        if (MergedModel == null)
+        {
+            return false;
+        }
+
+        Model.setModel(MergedModel);
+        return true;
+    }
+
     private boolean RenderWalkStopIdleAnimation()
     {
         int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
@@ -721,8 +807,20 @@ public class CustomMovementHandler
         SetAllIdlePosesNoAnimation();
         Owner.setPoseAnimation(NO_ANIMATION);
         Owner.setPoseAnimationFrame(0);
-        Model.setModel(client.mergeModels(
-                WalkStopIdleController.animate(Owner.getModel())));
+        net.runelite.api.Model OwnerModel = Owner.getModel();
+        if (OwnerModel == null ||
+                !TrySetModel(
+                        WalkStopIdleController.animate(
+                                OwnerModel)))
+        {
+            // [TMA-STEADY-PRESENTATION] A transient native model miss must
+            // not replace the last valid custom frame with null. Restore the
+            // ordinary animation fields and let the fallback branch below
+            // retry on the next rendered frame.
+            SetAllIdlePosesDefault();
+            ReleaseWalkStopIdleController(false);
+            return false;
+        }
 
         bUsingWalkStopIdleController = true;
         bResetCurrentAnimation = false;
@@ -1538,6 +1636,14 @@ public class CustomMovementHandler
         bSceneBoundaryBridgeActive =
                 ShouldBridgeSceneBoundaryMovement(
                         GetMovementTweenDurationMilliseconds());
+        boolean bKeepMovementAnimationDuringRouteGap =
+                ShouldKeepMovementAnimationDuringRouteGap(
+                        MillisecondsSinceTileChange,
+                        bMovingThisAction,
+                        bWalkStopFacingHoldArmed,
+                        bWalkMovementObserved,
+                        NextLerpPosition,
+                        client.getLocalDestinationLocation());
 
         // Override all animations
         //if (devConfig.DebugAnimation() != 0)
@@ -1548,8 +1654,9 @@ public class CustomMovementHandler
         //else
 
         // Currently moving
-        if (MillisecondsSinceTileChange < 600 ||
-                bSceneBoundaryBridgeActive) // 1 tick, plus a bounded scene-edge bridge
+        if (MillisecondsSinceTileChange < BASE_MOVEMENT_TWEEN_MILLIS ||
+                bSceneBoundaryBridgeActive ||
+                bKeepMovementAnimationDuringRouteGap)
         {
             bMovingThisAction = true;
 
@@ -1753,17 +1860,33 @@ public class CustomMovementHandler
         }
     }
 
-    private boolean IsOwnerCloseEnoughToModel()
+    private boolean ShouldRenderOriginalOwner(
+            boolean bUsedCustomAnimation)
     {
-        // Location and Orientation is close enough
-        if (config.AllowOriginalModelWhenCloseProximity() &&
-                Math.abs(Owner.getLocalLocation().getX() - Model.getLocation().getX()) <= config.OriginalModelProximityDistanceThreshold() &&
-                Math.abs(Owner.getLocalLocation().getY() - Model.getLocation().getY()) <= config.OriginalModelProximityDistanceThreshold() &&
-                ShortestAngleDifference(Owner.getOrientation(), Model.getOrientation()) <= config.OriginalModelProximityOrientationThreshold())
+        LocalPoint OwnerLocation = Owner.getLocalLocation();
+        LocalPoint ModelLocation = Model.getLocation();
+        if (OwnerLocation == null ||
+                ModelLocation == null ||
+                !IsSameWorldView(
+                        OwnerLocation,
+                        ModelLocation))
         {
-            return true;
+            return false;
         }
-        return false;
+
+        return ShouldUseOriginalOwnerPresentation(
+                config.AllowOriginalModelWhenCloseProximity(),
+                bMovingThisAction,
+                bHoldWalkStopFacingThisFrame,
+                bUsedCustomAnimation,
+                Owner.getAnimation(),
+                OwnerLocation.getX() - ModelLocation.getX(),
+                OwnerLocation.getY() - ModelLocation.getY(),
+                ShortestAngleDifference(
+                        Owner.getOrientation(),
+                        Model.getOrientation()),
+                config.OriginalModelProximityDistanceThreshold(),
+                config.OriginalModelProximityOrientationThreshold());
     }
 
     private long GetMovementTweenDurationMilliseconds()
@@ -2136,12 +2259,15 @@ public class CustomMovementHandler
             // overwritten by the hidden actor's faster locomotion clock.
             boolean bUsedCustomAnimation =
                     RenderWalkStopIdleAnimation();
-            if (!bUsedCustomAnimation &&
-                    ((UniqueAnimationExceptionList.contains(Owner.getAnimation()) &&
-                            bMovingThisAction) ||
-                            CurrentAnimationRequest.AnimationToPlay != -1))
+            boolean bControllerAnimationRequested =
+                    !bUsedCustomAnimation &&
+                            ((UniqueAnimationExceptionList.contains(
+                                    Owner.getAnimation()) &&
+                                    bMovingThisAction) ||
+                                    CurrentAnimationRequest.AnimationToPlay !=
+                                            -1);
+            if (bControllerAnimationRequested)
             {
-                bUsedCustomAnimation = true;
                 // Anim controller takes control over the pose animation or custom anim
                 Animation CustomAnim = null;
 
@@ -2156,42 +2282,71 @@ public class CustomMovementHandler
                     CustomAnim = client.loadAnimation(CurrentAnimationRequest.AnimationToPlay);
                 }
 
-                if (AnimController.getAnimation() != CustomAnim || bResetCurrentAnimation)
+                if (CustomAnim != null)
                 {
-                    AnimController.setAnimation(CustomAnim);
+                    bUsedCustomAnimation = true;
+                    int CurrentControllerAnimationId =
+                            AnimController.getAnimation() == null
+                                    ? NO_ANIMATION
+                                    : AnimController.getAnimation().getId();
+                    if (ShouldReplaceAnimationController(
+                            CurrentControllerAnimationId,
+                            CustomAnim.getId(),
+                            bResetCurrentAnimation))
+                    {
+                        AnimController.setAnimation(CustomAnim);
 
-                    if (bUsingPoseAnim &&
-                            Owner.getPoseAnimationFrame() < CustomAnim.getNumFrames() &&
-                            !bResetCurrentAnimation)
-                    {
-                        AnimController.setFrame(Owner.getPoseAnimationFrame());
+                        if (bUsingPoseAnim &&
+                                Owner.getPoseAnimationFrame() <
+                                        CustomAnim.getNumFrames() &&
+                                !bResetCurrentAnimation)
+                        {
+                            AnimController.setFrame(
+                                    Owner.getPoseAnimationFrame());
+                        }
+                        else
+                        {
+                            AnimController.setFrame(
+                                    CurrentAnimationRequest.StartingFrame);
+                        }
+                        bResetCurrentAnimation = false;
                     }
-                    else
+
+                    SetAllIdlePosesNoAnimation();
+                    Owner.setPoseAnimation(NO_ANIMATION);
+                    Owner.setPoseAnimationFrame(0);
+
+                    if (CurrentTime - LastAnimationTickTime >= 17) // 17ms per frame->60FPS
                     {
-                        AnimController.setFrame(CurrentAnimationRequest.StartingFrame);
+                        LastAnimationTickTime = CurrentTime;
+                        int CurrentFrame = AnimController.getFrame();
+                        if (CurrentFrame >=
+                                CurrentAnimationRequest.EndingFrame)
+                        {
+                            AnimController.setFrame(
+                                    CurrentAnimationRequest.EndingFrame);
+                        }
+                        else
+                        {
+                            AnimController.tick(
+                                    CurrentAnimationRequest.AnimationSpeed);
+                        }
                     }
-                    bResetCurrentAnimation = false;
+
+                    net.runelite.api.Model OwnerModel = Owner.getModel();
+                    if (OwnerModel == null ||
+                            !TrySetModel(
+                                    AnimController.animate(
+                                            OwnerModel)))
+                    {
+                        // Preserve the last drawable model and use the normal
+                        // controller for this frame. Loading/model replacement
+                        // should never create a null-frame hole.
+                        bUsedCustomAnimation = false;
+                    }
                 }
-                SetAllIdlePosesNoAnimation();
-                Owner.setPoseAnimation(NO_ANIMATION);
-                Owner.setPoseAnimationFrame(0);
-
-                if (CurrentTime - LastAnimationTickTime >= 17) // 17ms per frame->60FPS
-                {
-                    LastAnimationTickTime = CurrentTime;
-                    int CurrentFrame = AnimController.getFrame();
-                    if (CurrentFrame >= CurrentAnimationRequest.EndingFrame)
-                    {
-                        AnimController.setFrame(CurrentAnimationRequest.EndingFrame);
-                    } else
-                    {
-                        AnimController.tick(CurrentAnimationRequest.AnimationSpeed);
-                    }
-                }
-
-                Model.setModel(client.mergeModels(AnimController.animate(Owner.getModel())));
             }
-            else if (!bUsedCustomAnimation)
+            if (!bUsedCustomAnimation)
             {
                 // Normal controller takes back over
                 bTargetWasKilled = false; // If normal controller is taking it, cancel target killed animation
@@ -2210,36 +2365,65 @@ public class CustomMovementHandler
                 {
                     Animation CustomAnim = client.loadAnimation(CurrentAnimationRequest.PoseAnimationToPlay);
 
-                    if (Owner.getPoseAnimationFrame() >= CustomAnim.getNumFrames() || bResetCurrentAnimation)
+                    if (CustomAnim != null &&
+                            (Owner.getPoseAnimationFrame() >=
+                                    CustomAnim.getNumFrames() ||
+                                    bResetCurrentAnimation))
                     {
                         Owner.setPoseAnimationFrame(CurrentAnimationRequest.StartingFrame);
                     }
 
-                    Owner.setPoseAnimation(CurrentAnimationRequest.PoseAnimationToPlay);
-                    CurrentPoseAnimation = NO_ANIMATION;
-                    bResetCurrentAnimation = false;
+                    if (CustomAnim != null)
+                    {
+                        Owner.setPoseAnimation(
+                                CurrentAnimationRequest.PoseAnimationToPlay);
+                        CurrentPoseAnimation = NO_ANIMATION;
+                        bResetCurrentAnimation = false;
+                    }
                 }
-                Model.setModel(client.mergeModels(Owner.getModel()));
+                // [TMA-STEADY-PRESENTATION] Owner.getModel() can be
+                // momentarily unavailable while RuneLite rebuilds equipment
+                // or animation state. Keep the last complete model for that
+                // frame instead of assigning null and making the player pop.
+                TrySetModel(Owner.getModel());
             }
 
-            if (Model.getModel().getModelHeight() != Owner.getModel().getModelHeight())
+            net.runelite.api.Model RenderedModel = Model.getModel();
+            net.runelite.api.Model OwnerModel = Owner.getModel();
+            if (RenderedModel != null &&
+                    OwnerModel != null &&
+                    RenderedModel.getModelHeight() !=
+                            OwnerModel.getModelHeight())
             {
-                Model.getModel().setModelHeight(Owner.getModel().getModelHeight());
+                RenderedModel.setModelHeight(
+                        OwnerModel.getModelHeight());
             }
 
-            if (Model.getModel().getUvBufferOffset() != Owner.getModel().getUvBufferOffset())
+            if (RenderedModel != null &&
+                    OwnerModel != null &&
+                    RenderedModel.getUvBufferOffset() !=
+                            OwnerModel.getUvBufferOffset())
             {
-                Model.getModel().setUvBufferOffset(Owner.getModel().getUvBufferOffset());
+                RenderedModel.setUvBufferOffset(
+                        OwnerModel.getUvBufferOffset());
             }
 
-            if (Model.getModel().getBufferOffset() != Owner.getModel().getBufferOffset())
+            if (RenderedModel != null &&
+                    OwnerModel != null &&
+                    RenderedModel.getBufferOffset() !=
+                            OwnerModel.getBufferOffset())
             {
-                Model.getModel().setBufferOffset(Owner.getModel().getBufferOffset());
+                RenderedModel.setBufferOffset(
+                        OwnerModel.getBufferOffset());
             }
 
-            if (Model.getModel().getSceneId() != Owner.getModel().getSceneId())
+            if (RenderedModel != null &&
+                    OwnerModel != null &&
+                    RenderedModel.getSceneId() !=
+                            OwnerModel.getSceneId())
             {
-                Model.getModel().setSceneId(Owner.getModel().getSceneId());
+                RenderedModel.setSceneId(
+                        OwnerModel.getSceneId());
             }
 
             int FootprintHeight = Perspective.getFootprintTileHeight(client, Model.getLocation(), Owner.getWorldView().getPlane(), Owner.getFootprintSize());
@@ -2257,10 +2441,11 @@ public class CustomMovementHandler
                 Model.setZ(FootprintHeight);
             }
 
-            // If the actual owner is extremely close to what we decided (and not custom animation), just render the owner
-            if (!bHoldWalkStopFacingThisFrame &&
-                    !bUsedCustomAnimation &&
-                    IsOwnerCloseEnoughToModel())
+            // The native presentation is still useful while genuinely idle,
+            // but never switch authorities at a movement tile boundary.
+            if (RenderedModel != null &&
+                    ShouldRenderOriginalOwner(
+                            bUsedCustomAnimation))
             {
                 if (Model.isActive())
                 {
@@ -2270,11 +2455,13 @@ public class CustomMovementHandler
             }
             else
             {
-                if (!Model.isActive())
+                if (RenderedModel != null &&
+                        !Model.isActive())
                 {
                     Model.setActive(true);
                 }
-                bRenderOriginalOwnerDueToProximity = false;
+                bRenderOriginalOwnerDueToProximity =
+                        RenderedModel == null;
             }
 
             RecordLastRenderedLocation(Model.getLocation());

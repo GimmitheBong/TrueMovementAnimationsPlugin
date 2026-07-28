@@ -251,7 +251,7 @@ public interface TrueTileMovementConfig extends Config
 	@ConfigItem(
 			keyName = "AllowOriginalModelWhenCloseProximity",
 			name = "   Original Model When Close",
-			description = "Whether or not to allow the original model to be used directly when its close in proximity, orientation, and animation.",
+			description = "Allows the original model while stationary and closely matched in position and orientation. Movement keeps one stable custom model.",
 			section = generalSection
 	)
 	default boolean AllowOriginalModelWhenCloseProximity()

@@ -14,6 +14,53 @@ than to jump, stall, reverse, or advance through collision geometry.
 The continuity code must not inject input, alter the route, predict a red-click
 interaction destination, or change server-visible state.
 
+## `[TMA-STEADY-PRESENTATION]`: uninterrupted movement ownership
+
+### Causes
+
+Three independent handoffs could interrupt otherwise ordinary movement:
+
+1. At every tile boundary, the native and custom locations can coincide for a
+   frame. The "original model when close" path could therefore hide the custom
+   model for that frame and switch back on the following segment. Even when
+   both models occupy the same coordinates, their animation phases and render
+   scheduling need not match.
+2. Movement was classified as idle at exactly 600 ms. Overlay frames and game
+   ticks are not phase-locked, so the next route point can be published a few
+   milliseconds later and produce a one-frame run-to-idle-to-run transition.
+3. Six client ticks without a GPU draw callback were treated as loss of GPU
+   support. A normal render hitch could therefore clean up the model and
+   animation controller before callbacks resumed.
+
+Animation wrappers and native player models can also be replaced temporarily
+while their underlying animation/model remains logically unchanged. Comparing
+wrapper identity or assigning a transient null model turned those harmless
+replacements into visible restarts or blank frames.
+
+### Fix
+
+- The custom model remains the sole presentation authority throughout movement
+  and action animations. "Original model when close" still applies once the
+  player is genuinely idle, close, and facing within the configured threshold.
+- An unfinished yellow-click route receives up to 100 ms of animation-only
+  grace between segments. It does not extrapolate position, does not apply to
+  red-click interactions, and is disabled at the final route destination, so
+  it cannot cause persistent walking on the spot.
+- Animation controllers compare animation IDs instead of Java wrapper
+  instances.
+- If RuneLite cannot provide a complete model for one render update, the last
+  complete custom frame remains visible rather than being replaced with null.
+- GPU callback loss must persist for approximately one second while
+  `LOGGED_IN` before the plugin is considered unsupported. Scene loading and a
+  brief long frame no longer tear down animation state.
+
+### Maintenance invariant
+
+During uninterrupted movement, never alternate render authority merely because
+the native and custom coordinates coincide. Any future native/custom handoff
+must happen from a stable idle state, and a missing transient resource should
+retain the last drawable frame.
+
 ## `[TMA-CAST-MOVEMENT-ORDERING]`: casts followed by movement
 
 ### Cause
