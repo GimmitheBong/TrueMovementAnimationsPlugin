@@ -10,7 +10,7 @@ import static org.junit.Assert.assertTrue;
 public class MovementContinuityTest
 {
 	@Test
-	public void unfinishedYellowRouteBridgesOnlyTheAnimationTickGap()
+	public void unfinishedRouteBridgesOnlyTheAnimationTickGap()
 	{
 		LocalPoint SegmentDestination =
 				new LocalPoint(1280, 2560, 0);
@@ -23,6 +23,17 @@ public class MovementContinuityTest
 						true,
 						true,
 						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
+		// Captured idle-frame regressions occurred at 700-706 ms.
+		assertTrue(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						706,
+						true,
+						true,
+						true,
+						false,
 						SegmentDestination,
 						RouteDestination));
 		assertFalse(CustomMovementHandler
@@ -31,24 +42,76 @@ public class MovementContinuityTest
 						true,
 						true,
 						true,
+						false,
 						SegmentDestination,
 						SegmentDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						620,
+						false,
+						true,
+						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
 		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
 						620,
 						true,
 						false,
 						true,
+						false,
 						SegmentDestination,
 						RouteDestination));
 		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
-						700,
+						620,
+						true,
+						true,
+						false,
+						false,
+						SegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						750,
+						true,
+						true,
+						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
+	}
+
+	@Test
+	public void freshWalkClickCannotRunInPlaceBeforeItsFirstSegment()
+	{
+		LocalPoint SegmentDestination =
+				new LocalPoint(1280, 2560, 0);
+		LocalPoint RouteDestination =
+				new LocalPoint(1536, 2560, 0);
+
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						620,
+						true,
 						true,
 						true,
 						true,
 						SegmentDestination,
 						RouteDestination));
+		assertTrue(CustomMovementHandler
+				.ShouldAwaitFreshWalkMovementSegment(
+						600,
+						600,
+						false,
+						false));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitFreshWalkMovementSegment(
+						599,
+						600,
+						false,
+						false));
 	}
 
 	@Test

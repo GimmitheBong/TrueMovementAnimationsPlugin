@@ -22,12 +22,18 @@ public class CustomMovementHandler
     private static final int SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS = 34;
     private static final int SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS = 600;
     private static final int SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR = 5;
-    // Client/game tick scheduling is not perfectly aligned with overlay
-    // rendering. A small, route-qualified grace prevents a completed 600 ms
-    // segment from selecting idle for one frame immediately before the next
-    // segment is published.
-    private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 100;
-
+    // [TMA-ROUTE-GAP-ANIMATION-CONTINUITY] Client/game tick scheduling is not
+    // perfectly aligned with overlay rendering. The captures showed the next
+    // route point arriving 1-106 ms after a 600 ms segment completed. Keep
+    // only the animation moving during that bounded gap; position tweening is
+    // still clamped to the completed segment.
+    private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 150;
+    // [TMA-STOP-FACING-SETTLE] Reaching the final tile and settling the
+    // native actor's facing are separate client events. Give the hidden
+    // actor one game tick with no orientation changes before a later target
+    // orientation is treated as a genuinely new facing command.
+    private static final int WALK_STOP_NATIVE_FACING_SETTLE_MILLIS =
+            Constants.GAME_TICK_LENGTH;
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
@@ -131,14 +137,24 @@ public class CustomMovementHandler
     // State meanings are intentionally kept separate:
     //   Armed       = a yellow-click route is eligible for the hold.
     //   Observed    = visible movement actually started for that route.
+    //   Pending     = another yellow click arrived during catch-up, but its
+    //                 visible movement has not started yet.
+    //   AwaitingSegment = a yellow click was made after the visible segment
+    //                 finished; do not treat its early route publication as
+    //                 an uninterrupted-route animation gap.
     //   Preserve    = catch-up ended; keep the released facing until native
     //                 code issues a different orientation command.
     //   HoldThisFrame = the derived per-frame decision used by rendering.
     private boolean bWalkStopFacingHoldArmed = false;
     private boolean bWalkMovementObserved = false;
+    private boolean bWalkStartPendingDuringCatchUp = false;
+    private boolean bFreshWalkClickAwaitingMovement = false;
     private boolean bPreserveReleasedWalkFacing = false;
     private boolean bHoldWalkStopFacingThisFrame = false;
-    private int NativeOrientationAtWalkFacingRelease = 0;
+    private boolean bNativeWalkFacingSettled = false;
+    private int NativeTargetOrientationAtWalkFacingRelease = 0;
+    private int NativeCurrentOrientationAtWalkFacingRelease = 0;
+    private long LastNativeWalkFacingChangeTime = 0;
 
 
     // Player only
@@ -154,7 +170,6 @@ public class CustomMovementHandler
     public long LastTimeEnemyKilled = 0;
     public long LastTimeRecentlyClicked = 0;
     private int LastNPCCombatLevel = 0;
-
 
     // Camera (Player Only)
     public AnimationController cameraModelAnimController = null;
@@ -343,12 +358,14 @@ public class CustomMovementHandler
             boolean WasMoving,
             boolean WalkRouteArmed,
             boolean WalkMovementObserved,
+            boolean FreshWalkClickAwaitingMovement,
             LocalPoint CurrentSegmentDestination,
             LocalPoint RouteDestination)
     {
         return WasMoving &&
                 WalkRouteArmed &&
                 WalkMovementObserved &&
+                !FreshWalkClickAwaitingMovement &&
                 MillisecondsSinceTileChange >=
                         BASE_MOVEMENT_TWEEN_MILLIS &&
                 MillisecondsSinceTileChange <
@@ -608,21 +625,38 @@ public class CustomMovementHandler
             return;
         }
 
+        boolean bContinueActiveCatchUp =
+                ShouldContinueActiveWalkStopCatchUp(
+                        bWalkStopFacingHoldArmed,
+                        bWalkMovementObserved,
+                        bHoldWalkStopFacingThisFrame);
+        bFreshWalkClickAwaitingMovement =
+                ShouldAwaitFreshWalkMovementSegment(
+                        MillisecondsSinceTileChange,
+                        GetMovementTweenDurationMilliseconds(),
+                        bHoldWalkStopFacingThisFrame,
+                        bPreserveReleasedWalkFacing);
         bWalkStopFacingHoldArmed = true;
-        bWalkMovementObserved = false;
+        bWalkMovementObserved = bContinueActiveCatchUp;
+        bWalkStartPendingDuringCatchUp = bContinueActiveCatchUp;
         // If the previous route is already preserving its released facing,
         // keep that stable during the short click-to-movement delay. The new
         // route clears it as soon as visible movement actually begins. It is
-        // important that Observed remains false here: a click alone must not
-        // restart the catch-up idle renderer before the player moves.
+        // important that a click alone cannot revive a released controller.
+        // An actively rendered catch-up is different: retain its Observed
+        // state until the next movement segment really begins, otherwise the
+        // click creates a one-frame idle/facing release seam.
     }
 
     void CancelWalkStopFacingHold()
     {
         bWalkStopFacingHoldArmed = false;
         bWalkMovementObserved = false;
+        bWalkStartPendingDuringCatchUp = false;
+        bFreshWalkClickAwaitingMovement = false;
         bPreserveReleasedWalkFacing = false;
         bHoldWalkStopFacingThisFrame = false;
+        bNativeWalkFacingSettled = false;
     }
 
     private void UpdateWalkStopFacingHold()
@@ -636,9 +670,12 @@ public class CustomMovementHandler
         // The custom model is considered moving while its rendered tile has
         // changed recently. This also catches forced movement, which may not
         // have a preceding yellow click.
-        boolean VisibleModelIsMoving = MillisecondsSinceTileChange < 600;
+        boolean VisibleModelIsMoving =
+                MillisecondsSinceTileChange <
+                        BASE_MOVEMENT_TWEEN_MILLIS;
         if (VisibleModelIsMoving)
         {
+            bWalkStartPendingDuringCatchUp = false;
             if (bWalkStopFacingHoldArmed)
             {
                 bWalkMovementObserved = true;
@@ -647,28 +684,88 @@ public class CustomMovementHandler
             // Forced movement or another route can begin without a fresh
             // yellow click. It must not inherit a completed route's facing.
             bPreserveReleasedWalkFacing = false;
+            bNativeWalkFacingSettled = false;
             return;
         }
 
         if (bPreserveReleasedWalkFacing)
         {
-            // The catch-up block itself has ended. Ignore only the exact stale
-            // native target which existed at release; any later native facing
-            // command restores ordinary turning.
-            if (Owner.getOrientation() == NativeOrientationAtWalkFacingRelease)
+            int NativeTargetOrientation = Owner.getOrientation();
+            int NativeCurrentOrientation = Owner.getCurrentOrientation();
+
+            if (ShouldPreserveReleasedWalkFacing(
+                    bNativeWalkFacingSettled,
+                    NativeTargetOrientationAtWalkFacingRelease,
+                    NativeTargetOrientation))
             {
                 bHoldWalkStopFacingThisFrame = true;
+
+                if (!bNativeWalkFacingSettled)
+                {
+                    // [TMA-STOP-FACING-SETTLE] The native route can publish a
+                    // final target orientation after its position has already
+                    // caught up. Absorb that route-end churn while it is
+                    // hidden; otherwise it is mistaken for a new command and
+                    // the custom model turns immediately after stopping.
+                    if (NativeTargetOrientation !=
+                            NativeTargetOrientationAtWalkFacingRelease ||
+                            NativeCurrentOrientation !=
+                                    NativeCurrentOrientationAtWalkFacingRelease)
+                    {
+                        NativeTargetOrientationAtWalkFacingRelease =
+                                NativeTargetOrientation;
+                        NativeCurrentOrientationAtWalkFacingRelease =
+                                NativeCurrentOrientation;
+                        LastNativeWalkFacingChangeTime = CurrentTime;
+                    }
+                    else if (HasNativeWalkFacingSettled(
+                            CurrentTime,
+                            LastNativeWalkFacingChangeTime))
+                    {
+                        bNativeWalkFacingSettled = true;
+                    }
+                }
             }
             else
             {
+                // A target-orientation change after the native actor has
+                // settled is a new command, so ordinary smooth turning can
+                // resume. Red interactions still cancel synchronously in the
+                // menu-click handler and do not wait for this branch.
                 bPreserveReleasedWalkFacing = false;
             }
             return;
         }
 
         if (!bWalkStopFacingHoldArmed ||
-                !bWalkMovementObserved ||
-                !IsAtFinalWalkDestination())
+                !bWalkMovementObserved)
+        {
+            return;
+        }
+
+        // [TMA-YELLOW-RECLICK-HANDOFF] A second yellow click can publish its
+        // route destination before the client starts moving. During that
+        // delay, IsAtFinalWalkDestination() is false even though the visible
+        // model is still completing the previous stop. Keep the existing
+        // facing and idle controller until movement genuinely begins instead
+        // of briefly exposing the hidden native player between the routes.
+        if (ShouldHoldPendingWalkStart(
+                bWalkStartPendingDuringCatchUp,
+                bWalkStopFacingHoldArmed,
+                bWalkMovementObserved,
+                VisibleModelIsMoving))
+        {
+            bHoldWalkStopFacingThisFrame = true;
+            if (HasHiddenOwnerCaughtUp(
+                    Owner.getLocalLocation(),
+                    NextLerpPosition))
+            {
+                BeginWalkStopFacingPreservation(true);
+            }
+            return;
+        }
+
+        if (!IsAtFinalWalkDestination())
         {
             return;
         }
@@ -683,11 +780,23 @@ public class CustomMovementHandler
         {
             // Release the temporary catch-up block without immediately
             // reapplying the stale native orientation on the next frame.
-            bWalkStopFacingHoldArmed = false;
-            bWalkMovementObserved = false;
-            bPreserveReleasedWalkFacing = true;
-            NativeOrientationAtWalkFacingRelease = Owner.getOrientation();
+            BeginWalkStopFacingPreservation(false);
         }
+    }
+
+    private void BeginWalkStopFacingPreservation(
+            boolean RetainPendingWalkArm)
+    {
+        bWalkStopFacingHoldArmed = RetainPendingWalkArm;
+        bWalkMovementObserved = false;
+        bWalkStartPendingDuringCatchUp = false;
+        bPreserveReleasedWalkFacing = true;
+        bNativeWalkFacingSettled = false;
+        NativeTargetOrientationAtWalkFacingRelease =
+                Owner.getOrientation();
+        NativeCurrentOrientationAtWalkFacingRelease =
+                Owner.getCurrentOrientation();
+        LastNativeWalkFacingChangeTime = CurrentTime;
     }
 
     private boolean IsAtFinalWalkDestination()
@@ -707,20 +816,76 @@ public class CustomMovementHandler
                 OwnerLocation.equals(RenderDestination);
     }
 
+    static boolean ShouldPreserveReleasedWalkFacing(
+            boolean NativeFacingSettled,
+            int SettledNativeTargetOrientation,
+            int CurrentNativeTargetOrientation)
+    {
+        return !NativeFacingSettled ||
+                SettledNativeTargetOrientation ==
+                        CurrentNativeTargetOrientation;
+    }
+
+    static boolean HasNativeWalkFacingSettled(
+            long CurrentTime,
+            long LastNativeFacingChangeTime)
+    {
+        return CurrentTime - LastNativeFacingChangeTime >=
+                WALK_STOP_NATIVE_FACING_SETTLE_MILLIS;
+    }
+
+    static boolean ShouldContinueActiveWalkStopCatchUp(
+            boolean WalkRouteArmed,
+            boolean MovementWasObserved,
+            boolean HoldFacingThisFrame)
+    {
+        return WalkRouteArmed &&
+                MovementWasObserved &&
+                HoldFacingThisFrame;
+    }
+
+    static boolean ShouldHoldPendingWalkStart(
+            boolean WalkStartPendingDuringCatchUp,
+            boolean WalkRouteArmed,
+            boolean PreviousMovementWasObserved,
+            boolean VisibleModelIsMoving)
+    {
+        return WalkStartPendingDuringCatchUp &&
+                WalkRouteArmed &&
+                PreviousMovementWasObserved &&
+                !VisibleModelIsMoving;
+    }
+
+    static boolean ShouldAwaitFreshWalkMovementSegment(
+            int MillisecondsSinceTileChange,
+            long MovementTweenDurationMilliseconds,
+            boolean HoldingStopFacing,
+            boolean PreservingReleasedFacing)
+    {
+        return HoldingStopFacing ||
+                PreservingReleasedFacing ||
+                MillisecondsSinceTileChange >=
+                        MovementTweenDurationMilliseconds;
+    }
+
     static boolean ShouldUseWalkStopIdleController(
+            boolean AlreadyUsingIdleController,
             boolean HoldFacingThisFrame,
             boolean CatchUpStillActive,
             boolean MovementWasObserved,
             int OwnerActionAnimation,
             int IdlePoseAnimation)
     {
-        // Idle smoothing is valid only during the actual catch-up interval.
-        // In particular, Preserve/Armed without MovementWasObserved means a
-        // new click is waiting to start and must remain on the native idle
-        // animation instead of reviving an old controller frame.
+        // [TMA-IDLE-HANDOFF-CONTINUITY] Once the controller owns the visible
+        // idle pose, retain it for the full facing hold. Positional catch-up
+        // can finish before the native orientation/pose state settles; handing
+        // back at that intermediate point exposes the hidden locomotion phase
+        // and makes idle frames race forward. AlreadyUsing prevents a new
+        // click from constructing a stale controller after it was released.
         return HoldFacingThisFrame &&
-                CatchUpStillActive &&
-                MovementWasObserved &&
+                (AlreadyUsingIdleController ||
+                        (CatchUpStillActive &&
+                                MovementWasObserved)) &&
                 OwnerActionAnimation == -1 &&
                 IdlePoseAnimation != -1;
     }
@@ -747,12 +912,15 @@ public class CustomMovementHandler
     private boolean RenderWalkStopIdleAnimation()
     {
         int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
-        if (!ShouldUseWalkStopIdleController(
+        boolean bShouldUseWalkStopIdleController =
+                ShouldUseWalkStopIdleController(
+                bUsingWalkStopIdleController,
                 bHoldWalkStopFacingThisFrame,
                 bWalkStopFacingHoldArmed,
                 bWalkMovementObserved,
                 Owner.getAnimation(),
-                IdlePoseAnimation))
+                IdlePoseAnimation);
+        if (!bShouldUseWalkStopIdleController)
         {
             ReleaseWalkStopIdleController(true);
             return false;
@@ -766,6 +934,8 @@ public class CustomMovementHandler
         }
 
         int CurrentGameCycle = client.getGameCycle();
+        int NativePoseAnimation = Owner.getPoseAnimation();
+        int NativePoseFrame = Owner.getPoseAnimationFrame();
         if (!bUsingWalkStopIdleController ||
                 WalkStopIdleController == null ||
                 WalkStopIdleController.getAnimation() == null ||
@@ -777,8 +947,8 @@ public class CustomMovementHandler
             WalkStopIdleController =
                     new AnimationController(client, IdleAnimation);
             int NativeIdleFrame =
-                    Owner.getPoseAnimation() == IdlePoseAnimation
-                            ? Owner.getPoseAnimationFrame()
+                    NativePoseAnimation == IdlePoseAnimation
+                            ? NativePoseFrame
                             : 0;
             if (NativeIdleFrame >= 0 &&
                     NativeIdleFrame < IdleAnimation.getNumFrames())
@@ -1642,6 +1812,7 @@ public class CustomMovementHandler
                         bMovingThisAction,
                         bWalkStopFacingHoldArmed,
                         bWalkMovementObserved,
+                        bFreshWalkClickAwaitingMovement,
                         NextLerpPosition,
                         client.getLocalDestinationLocation());
 
@@ -1883,7 +2054,7 @@ public class CustomMovementHandler
                 OwnerLocation.getX() - ModelLocation.getX(),
                 OwnerLocation.getY() - ModelLocation.getY(),
                 ShortestAngleDifference(
-                        Owner.getOrientation(),
+                        Owner.getCurrentOrientation(),
                         Model.getOrientation()),
                 config.OriginalModelProximityDistanceThreshold(),
                 config.OriginalModelProximityOrientationThreshold());
@@ -2511,6 +2682,14 @@ public class CustomMovementHandler
         }
 
         UpdateLerpDestinations();
+
+        if (bNewTileMovementStarted)
+        {
+            // [TMA-FRESH-WALK-START] The first authoritative movement segment
+            // has arrived. Ordinary locomotion and route-gap continuity are
+            // valid again from this point onward.
+            bFreshWalkClickAwaitingMovement = false;
+        }
 
         UpdateWalkStopFacingHold();
 

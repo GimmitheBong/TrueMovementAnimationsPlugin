@@ -42,10 +42,15 @@ replacements into visible restarts or blank frames.
 - The custom model remains the sole presentation authority throughout movement
   and action animations. "Original model when close" still applies once the
   player is genuinely idle, close, and facing within the configured threshold.
-- An unfinished yellow-click route receives up to 100 ms of animation-only
+- An uninterrupted yellow-click route receives up to 150 ms of animation-only
   grace between segments. It does not extrapolate position, does not apply to
-  red-click interactions, and is disabled at the final route destination, so
-  it cannot cause persistent walking on the spot.
+  red-click interactions, and is disabled at the final route destination.
+- `[TMA-FRESH-WALK-START]` distinguishes that continuation from a new yellow
+  click made after the visible segment has completed. RuneLite can publish the
+  new route before its first authoritative movement segment; the animation
+  grace is suppressed during that delay so the completed model cannot run in
+  place. The flag clears on the first real segment and therefore does not
+  affect animation continuity during the subsequent run.
 - Animation controllers compare animation IDs instead of Java wrapper
   instances.
 - If RuneLite cannot provide a complete model for one render update, the last
@@ -112,6 +117,21 @@ facing remains controlled by the game.
 The hold is deliberately conditional: it is not a general orientation override
 and must not apply to red-click interactions.
 
+`[TMA-STOP-FACING-SETTLE]` covers the smaller handoff after positional catch-up.
+RuneLite exposes both a native target orientation (`getOrientation()`) and the
+orientation currently displayed by the native actor
+(`getCurrentOrientation()`). Reaching the destination does not guarantee those
+values have finished processing the final route update. The hidden actor is
+therefore allowed one stable game tick to settle before a later target change
+is considered a new facing command. Route-end orientation churn remains hidden;
+a red interaction still cancels immediately, and real movement clears the
+released hold.
+
+Native/custom proximity handoff compares the two orientations actually being
+displayed. Comparing the custom orientation with the native *target*
+orientation could approve a handoff while the native model was still turning,
+which made the visible player turn or pop at the end of a yellow-click route.
+
 ## `[TMA-IDLE-CATCH-UP]`: smooth idle while the native player catches up
 
 ### Cause
@@ -128,6 +148,26 @@ idle frame. It advances on the visual frame clock, then hands its phase back
 without resetting. A new click does not reuse the old catch-up controller, so
 movement starts from the current displayed pose rather than producing a
 one-frame jump.
+
+`[TMA-IDLE-HANDOFF-CONTINUITY]` keeps that same controller through the short
+native-facing settle period after positional catch-up. Diagnostics showed the
+controller itself advancing animation 808 correctly (one frame after its
+21-client-tick frame length), but the native pose could jump several frames
+within a few client cycles when ownership was returned. The hidden locomotion
+pose had retained elapsed phase which cannot be transferred through RuneLite's
+public actor API. Keeping one controller for the complete stop-facing hold
+avoids exposing that intermediate clock. It is released when real movement, a
+red interaction, or a later native facing command ends the hold.
+
+A second yellow click received during active catch-up retains the current
+Observed/idle state until movement actually starts. `[TMA-YELLOW-RECLICK-HANDOFF]`
+also records that this new route is pending: RuneLite can publish its
+destination before the first visible movement frame, and that publication must
+not make the old route fail its "final destination" check and release the model
+early. If the hidden player finishes catching up during this delay, the code
+moves directly into the normal preserved-facing state while keeping the new
+route armed. A click during an already released state still cannot resurrect an
+old controller.
 
 ## `[TMA-MOTION-CONTINUITY]`: use the last displayed state at handoff
 
@@ -221,10 +261,25 @@ custom value.
 
 ## Diagnostics and tests
 
-The temporary `[SceneLoadTrace]` instrumentation was used to compare scene
-generation, route/local/world coordinates, model presentation, camera
-presentation, and frame timing. It was removed after in-game validation so no
-per-frame diagnostic formatting remains in production.
+All diagnostic loggers were temporary and are absent from production code:
+
+- `[SceneLoadTrace]` compared scene generation, route/local/world coordinates,
+  model presentation, camera presentation, and frame timing.
+- `[VisibilityTrace]` exposed native/custom presentation changes and showed
+  that a newly published yellow-click destination could arrive before its
+  first visible movement segment.
+- `[IdleCatchUpTrace]` separated the custom idle controller clock from the
+  hidden native pose clock. It confirmed the custom clock was advancing
+  normally and the visible speed-up came from handing back to the native
+  actor's accumulated locomotion phase.
+- `[LocomotionTrace]` recorded only movement transitions, animation request
+  changes, and unexpected frame regressions. Final testing contained no
+  unexpected regressions: changes between walk and run poses matched genuine
+  one-tile and two-tile movement segments. No additional locomotion controller
+  was added.
+
+The instrumentation was removed after in-game validation so production does
+not perform diagnostic state tracking, model inspection, or log formatting.
 
 The focused tests cover:
 
@@ -232,8 +287,11 @@ The focused tests cover:
 - atomic scene generation acknowledgement;
 - bounded scene-edge bridging;
 - scene presentation time deferral and repayment;
-- recovery tween duration/velocity preservation; and
-- adaptive camera handoff, delta limiting, and vertical easing.
+- recovery tween duration/velocity preservation;
+- adaptive camera handoff, delta limiting, and vertical easing;
+- route-gap grace versus a fresh post-stop yellow click;
+- native-facing settlement and second-click handoff; and
+- idle-controller ownership across positional catch-up.
 
 These tests validate the rendering math and state transitions. In-game
 validation is still required for visual behavior because a JVM test cannot

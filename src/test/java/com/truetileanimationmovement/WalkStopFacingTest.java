@@ -46,38 +46,119 @@ public class WalkStopFacingTest
     }
 
     @Test
-    public void catchUpIdleControllerOnlyRunsDuringAnIdleFacingHold()
+    public void routeEndOrientationChangesAreAbsorbedUntilNativeFacingSettles()
     {
-        // [TMA-IDLE-CATCH-UP] A controller is allowed only after a yellow
-        // route visibly moved and then stopped. The negative case below is
-        // the regression where a second click revived stale idle state before
-        // movement had begun.
+        assertTrue(CustomMovementHandler.ShouldPreserveReleasedWalkFacing(
+                false,
+                512,
+                1024));
+        assertTrue(CustomMovementHandler.ShouldPreserveReleasedWalkFacing(
+                true,
+                1024,
+                1024));
+        assertFalse(CustomMovementHandler.ShouldPreserveReleasedWalkFacing(
+                true,
+                1024,
+                1536));
+    }
+
+    @Test
+    public void nativeFacingRequiresOneStableGameTick()
+    {
+        assertFalse(CustomMovementHandler.HasNativeWalkFacingSettled(
+                1599,
+                1000));
+        assertTrue(CustomMovementHandler.HasNativeWalkFacingSettled(
+                1600,
+                1000));
+    }
+
+    @Test
+    public void aSecondWalkClickDoesNotDropAnActiveCatchUpHold()
+    {
+        assertTrue(CustomMovementHandler
+                .ShouldContinueActiveWalkStopCatchUp(
+                        true,
+                        true,
+                        true));
+        assertFalse(CustomMovementHandler
+                .ShouldContinueActiveWalkStopCatchUp(
+                        true,
+                        true,
+                        false));
+        assertFalse(CustomMovementHandler
+                .ShouldContinueActiveWalkStopCatchUp(
+                        false,
+                        false,
+                        true));
+    }
+
+    @Test
+    public void aPublishedRouteCannotReleaseCatchUpBeforeMovementStarts()
+    {
+        assertTrue(CustomMovementHandler.ShouldHoldPendingWalkStart(
+                true,
+                true,
+                true,
+                false));
+        assertFalse(CustomMovementHandler.ShouldHoldPendingWalkStart(
+                true,
+                true,
+                true,
+                true));
+        assertFalse(CustomMovementHandler.ShouldHoldPendingWalkStart(
+                false,
+                true,
+                true,
+                false));
+    }
+
+    @Test
+    public void catchUpIdleControllerContinuesAcrossTheSettlingHandoff()
+    {
+        // Start only after a yellow route visibly moved and stopped.
         assertTrue(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                false,
                 true,
                 true,
                 true,
                 -1,
                 808));
 
-        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+        // Once active, keep the same controller through positional catch-up
+        // and the native-facing settle period.
+        assertTrue(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
                 true,
                 false,
+                false,
+                -1,
+                808));
+
+        // A click waiting to move must not revive an already released clock.
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                false,
                 true,
+                false,
+                false,
+                -1,
+                808));
+        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                false,
+                true,
+                true,
+                false,
                 -1,
                 808));
         assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
                 true,
-                true,
-                false,
-                -1,
-                808));
-        assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
                 true,
                 true,
                 true,
                 422,
                 808));
         assertFalse(CustomMovementHandler.ShouldUseWalkStopIdleController(
+                true,
                 false,
                 true,
                 true,
