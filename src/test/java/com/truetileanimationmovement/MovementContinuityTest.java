@@ -22,24 +22,31 @@ public class MovementContinuityTest
 						620,
 						true,
 						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
+		// The latest area-transition captures reached 852-858 ms before the
+		// next authoritative route segment was published.
+		assertTrue(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						858,
+						true,
 						true,
 						false,
 						SegmentDestination,
 						RouteDestination));
-		// Captured idle-frame regressions occurred at 700-706 ms.
-		assertTrue(CustomMovementHandler
+		// Red-click interactions cancel the yellow-walk continuity arm.
+		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
-						706,
+						620,
 						true,
-						true,
-						true,
+						false,
 						false,
 						SegmentDestination,
 						RouteDestination));
 		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
 						620,
-						true,
 						true,
 						true,
 						false,
@@ -50,6 +57,21 @@ public class MovementContinuityTest
 						620,
 						false,
 						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						599,
+						true,
+						true,
+						false,
+						SegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						900,
+						true,
 						true,
 						false,
 						SegmentDestination,
@@ -58,12 +80,21 @@ public class MovementContinuityTest
 				.ShouldKeepMovementAnimationDuringRouteGap(
 						620,
 						true,
-						false,
 						true,
 						false,
 						SegmentDestination,
-						RouteDestination));
+						new LocalPoint(1536, 2560, 1)));
 		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringRouteGap(
+						620,
+						true,
+						true,
+						false,
+						SegmentDestination,
+						null));
+		// A stop-facing handoff owns the endpoint pose. Route-gap grace must
+		// never keep locomotion alive at the same time.
+		assertTrue(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
 						620,
 						true,
@@ -74,11 +105,11 @@ public class MovementContinuityTest
 						RouteDestination));
 		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
-						750,
-						true,
+						620,
 						true,
 						true,
 						false,
+						true,
 						SegmentDestination,
 						RouteDestination));
 	}
@@ -94,7 +125,6 @@ public class MovementContinuityTest
 		assertFalse(CustomMovementHandler
 				.ShouldKeepMovementAnimationDuringRouteGap(
 						620,
-						true,
 						true,
 						true,
 						true,
@@ -206,4 +236,5 @@ public class MovementContinuityTest
 						GameState.LOADING,
 						500));
 	}
+
 }

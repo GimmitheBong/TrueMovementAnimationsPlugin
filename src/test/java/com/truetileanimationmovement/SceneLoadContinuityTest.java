@@ -3,6 +3,8 @@ package com.truetileanimationmovement;
 import net.runelite.api.coords.LocalPoint;
 import org.junit.Test;
 
+import java.util.Collections;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
@@ -10,6 +12,64 @@ import static org.junit.Assert.assertTrue;
 
 public class SceneLoadContinuityTest
 {
+	@Test
+	public void unfinishedYellowRouteWaitsForItsFirstPostSceneSegment()
+	{
+		LocalPoint CurrentSegmentDestination =
+				new LocalPoint(6208, 6208, 0);
+		LocalPoint RouteDestination =
+				new LocalPoint(6208, 6464, 0);
+
+		assertTrue(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						false,
+						false,
+						true,
+						true,
+						CurrentSegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						true,
+						false,
+						true,
+						true,
+						CurrentSegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						false,
+						true,
+						true,
+						true,
+						CurrentSegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						false,
+						false,
+						false,
+						true,
+						CurrentSegmentDestination,
+						RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						false,
+						false,
+						true,
+						true,
+						CurrentSegmentDestination,
+						CurrentSegmentDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldAwaitPostSceneWalkSegment(
+						false,
+						false,
+						true,
+						true,
+						CurrentSegmentDestination,
+						new LocalPoint(6208, 6464, 1)));
+	}
+
 	@Test
 	public void rebaseCarriesOnlyMissedFrameTime()
 	{
@@ -44,6 +104,75 @@ public class SceneLoadContinuityTest
 						.GetSceneRebaseElapsedMilliseconds(
 								228,
 								false,
+								true));
+		assertEquals(
+				34,
+				CustomMovementHandler
+						.GetSceneRebaseImmediateElapsedMilliseconds(
+								49,
+								true,
+								false));
+		assertEquals(
+				15,
+				CustomMovementHandler
+						.GetSceneRebaseDeferredMilliseconds(
+								49,
+								true,
+								false));
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetSceneRebaseImmediateElapsedMilliseconds(
+								49,
+								true,
+								true));
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetSceneRebaseDeferredMilliseconds(
+								49,
+								true,
+								true));
+		assertEquals(
+				600,
+				CustomMovementHandler
+						.GetSceneRebaseImmediateElapsedMilliseconds(
+								49,
+								false,
+								false));
+		assertEquals(
+				135,
+				CustomMovementHandler.AddScenePresentationDebt(
+						120,
+						15));
+		assertEquals(
+				600,
+				CustomMovementHandler.AddScenePresentationDebt(
+						590,
+						15));
+		assertEquals(
+				135,
+				CustomMovementHandler
+						.SelectScenePresentationDebtAfterRebase(
+								120,
+								15,
+								true,
+								false));
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.SelectScenePresentationDebtAfterRebase(
+								120,
+								15,
+								false,
+								false));
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.SelectScenePresentationDebtAfterRebase(
+								120,
+								15,
+								true,
 								true));
 	}
 
@@ -210,5 +339,349 @@ public class SceneLoadContinuityTest
 						0,
 						runVelocity,
 						600));
+	}
+
+	@Test
+	public void productionSceneVelocityRetainsFractionalPrecision()
+	{
+		LocalPoint Start = new LocalPoint(1280, 2560, 0);
+		LocalPoint OneTileAway = new LocalPoint(1408, 2560, 0);
+
+		assertEquals(
+				128.0 / 600.0,
+				CustomMovementHandler
+						.GetPreservedSceneMovementVelocity(
+								true,
+								Start,
+								OneTileAway,
+								600),
+				0.000001);
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetPreservedSceneMovementVelocity(
+								false,
+								Start,
+								OneTileAway,
+								600),
+				0.000001);
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetPreservedSceneMovementVelocity(
+								true,
+								Start,
+								new LocalPoint(1408, 2560, 1),
+								600),
+				0.000001);
+	}
+
+	@Test
+	public void partialSceneRecoveryKeepsPreLoadMovementSpeed()
+	{
+		double RunVelocity = 256.0 / 600.0;
+		double RecoveryVelocity =
+				CustomMovementHandler.GetSceneRecoveryBaseVelocity(
+						RunVelocity,
+						192,
+						600);
+
+		assertEquals(RunVelocity, RecoveryVelocity, 0.000001);
+		assertEquals(
+				450,
+				CustomMovementHandler.GetSceneRecoveryTweenDuration(
+						192,
+						RecoveryVelocity,
+						600));
+	}
+
+	@Test
+	public void tinyHandoffOffsetCannotCreateMultiSecondRecovery()
+	{
+		assertEquals(
+				128.0 / 600.0,
+				CustomMovementHandler.GetSceneRecoveryBaseVelocity(
+						0,
+						2,
+						600),
+				0.000001);
+		assertEquals(
+				0,
+				CustomMovementHandler.GetSceneRecoveryBaseVelocity(
+						256.0 / 600.0,
+						0,
+						600),
+				0.000001);
+		assertEquals(
+				128.0 / 600.0,
+				CustomMovementHandler.GetSceneRecoveryBaseVelocity(
+						0.000001,
+						128,
+						600),
+				0.000001);
+		assertEquals(
+				1200,
+				CustomMovementHandler.GetSceneRecoveryTweenDuration(
+						128,
+						0.000001,
+						600));
+	}
+
+	@Test
+	public void recoveryAndBoundaryBridgeCannotOwnTheSameFrame()
+	{
+		assertTrue(CustomMovementHandler.CanUseSceneBoundaryBridge(
+				false,
+				false,
+				0));
+		assertFalse(CustomMovementHandler.CanUseSceneBoundaryBridge(
+				true,
+				false,
+				0));
+		assertFalse(CustomMovementHandler.CanUseSceneBoundaryBridge(
+				false,
+				true,
+				0));
+		assertFalse(CustomMovementHandler.CanUseSceneBoundaryBridge(
+				false,
+				false,
+				450));
+	}
+
+	@Test
+	public void presentationClockWaitsForPreparedFrameAndRecovery()
+	{
+		assertTrue(CustomMovementHandler
+				.ShouldReleaseScenePresentationClock(
+						0,
+						false,
+						0,
+						false));
+		assertFalse(CustomMovementHandler
+				.ShouldReleaseScenePresentationClock(
+						0,
+						false,
+						0,
+						true));
+		assertFalse(CustomMovementHandler
+				.ShouldReleaseScenePresentationClock(
+						1,
+						false,
+						0,
+						false));
+		assertFalse(CustomMovementHandler
+				.ShouldReleaseScenePresentationClock(
+						0,
+						true,
+						0,
+						false));
+		assertFalse(CustomMovementHandler
+				.ShouldReleaseScenePresentationClock(
+						0,
+						false,
+						450,
+						false));
+	}
+
+	@Test
+	public void onlyActiveYellowBoundaryBridgePreservesPreLoadVelocity()
+	{
+		assertTrue(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						true,
+						true,
+						true,
+						false));
+		assertFalse(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						false,
+						true,
+						true,
+						false));
+		assertFalse(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						true,
+						false,
+						true,
+						false));
+		assertFalse(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						true,
+						true,
+						false,
+						false));
+		assertFalse(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						true,
+						true,
+						true,
+						true));
+	}
+
+	@Test
+	public void rejectedVelocityIsNotReusedAsPreservedSpeed()
+	{
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetRetainedSceneRecoveryBaseVelocity(
+								0,
+								192,
+								600),
+				0.000001);
+		assertEquals(
+				0,
+				CustomMovementHandler.SelectSceneRecoveryVelocity(
+						0,
+						CustomMovementHandler
+								.GetRetainedSceneRecoveryBaseVelocity(
+										0,
+										192,
+										600)),
+				0.000001);
+	}
+
+	@Test
+	public void completedShortRecoveryCannotRewindAgainstNormalDuration()
+	{
+		assertFalse(CustomMovementHandler
+				.ShouldCompleteSceneRecoveryOverride(
+						449,
+						450));
+		assertTrue(CustomMovementHandler
+				.ShouldCompleteSceneRecoveryOverride(
+						466,
+						450));
+		assertEquals(
+				600,
+				CustomMovementHandler
+						.GetSceneMovementAnimationDuration(450));
+		assertEquals(
+				736,
+				CustomMovementHandler
+						.GetSceneMovementAnimationDuration(736));
+	}
+
+	@Test
+	public void authoritativeWalkOrRunSpeedOverridesPreLoadSpeed()
+	{
+		double WalkVelocity = 128.0 / 600.0;
+		double RunVelocity = 256.0 / 600.0;
+
+		assertEquals(
+				WalkVelocity,
+				CustomMovementHandler.SelectSceneRecoveryVelocity(
+						WalkVelocity,
+						RunVelocity),
+				0.000001);
+		assertEquals(
+				RunVelocity,
+				CustomMovementHandler.SelectSceneRecoveryVelocity(
+						RunVelocity,
+						WalkVelocity),
+				0.000001);
+		assertEquals(
+				RunVelocity,
+				CustomMovementHandler.SelectSceneRecoveryVelocity(
+						0,
+						RunVelocity),
+				0.000001);
+	}
+
+	@Test
+	public void onlyPlausibleNativeStepsSetPostLoadVelocity()
+	{
+		LocalPoint Start = new LocalPoint(1280, 2560, 0);
+
+		assertTrue(CustomMovementHandler
+				.IsPlausibleAuthoritativeSceneSegment(
+						true,
+						true,
+						false,
+						Start,
+						new LocalPoint(1536, 2816, 0)));
+		assertFalse(CustomMovementHandler
+				.IsPlausibleAuthoritativeSceneSegment(
+						true,
+						true,
+						false,
+						Start,
+						new LocalPoint(1664, 2560, 0)));
+		assertFalse(CustomMovementHandler
+				.IsPlausibleAuthoritativeSceneSegment(
+						false,
+						true,
+						false,
+						Start,
+						new LocalPoint(1408, 2560, 0)));
+		assertFalse(CustomMovementHandler
+				.IsPlausibleAuthoritativeSceneSegment(
+						true,
+						true,
+						false,
+						Start,
+						new LocalPoint(1408, 2560, 1)));
+	}
+
+	@Test
+	public void teleportAndSpecialAnimationsRejectVelocityContinuity()
+	{
+		assertTrue(CustomMovementHandler.IsSceneMovementDiscontinuity(
+				714,
+				-1,
+				false,
+				Collections.singleton(714),
+				Collections.singleton(749)));
+		assertTrue(CustomMovementHandler.IsSceneMovementDiscontinuity(
+				-1,
+				749,
+				false,
+				Collections.singleton(714),
+				Collections.singleton(749)));
+		assertTrue(CustomMovementHandler.IsSceneMovementDiscontinuity(
+				-1,
+				-1,
+				true,
+				Collections.singleton(714),
+				Collections.singleton(749)));
+		assertFalse(CustomMovementHandler.IsSceneMovementDiscontinuity(
+				-1,
+				-1,
+				false,
+				Collections.singleton(714),
+				Collections.singleton(749)));
+	}
+
+	@Test
+	public void sceneSnapDistanceUsesRuneScapeTileSteps()
+	{
+		LocalPoint Origin = new LocalPoint(1280, 2560, 0);
+
+		assertFalse(CustomMovementHandler
+				.ExceedsSceneRecoverySnapDistance(
+						Origin,
+						new LocalPoint(
+								1280 + 2 * 128,
+								2560 + 2 * 128,
+								0),
+						2));
+		assertTrue(CustomMovementHandler
+				.ExceedsSceneRecoverySnapDistance(
+						Origin,
+						new LocalPoint(
+								1280 + 2 * 128 + 1,
+								2560,
+								0),
+						2));
+		assertTrue(CustomMovementHandler
+				.ExceedsSceneRecoverySnapDistance(
+						Origin,
+						new LocalPoint(1280, 2560, 1),
+						5));
+		assertTrue(CustomMovementHandler
+				.ExceedsSceneRecoverySnapDistance(
+						null,
+						Origin,
+						5));
 	}
 }

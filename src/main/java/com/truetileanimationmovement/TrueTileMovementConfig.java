@@ -161,7 +161,7 @@ public interface TrueTileMovementConfig extends Config
 	@ConfigItem(
 			keyName = "PlayerModelSnapDistance",
 			name = "Player Model Snap Distance",
-			description = "Distance from the player will 'snap' directly to the location instead of lerping (in # of tiles).",
+			description = "Maximum tile difference on either axis before the player snaps directly to the location instead of lerping.",
 			section = advancedSection
 	)
 	default int PlayerModelSnapDistance()

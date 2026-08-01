@@ -3,7 +3,6 @@ package com.truetileanimationmovement;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.config.ConfigItem;
 
 import javax.inject.Inject;
 import java.util.HashSet;
@@ -22,12 +21,22 @@ public class CustomMovementHandler
     private static final int SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS = 34;
     private static final int SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS = 600;
     private static final int SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR = 5;
-    // [TMA-ROUTE-GAP-ANIMATION-CONTINUITY] Client/game tick scheduling is not
-    // perfectly aligned with overlay rendering. The captures showed the next
-    // route point arriving 1-106 ms after a 600 ms segment completed. Keep
-    // only the animation moving during that bounded gap; position tweening is
-    // still clamped to the completed segment.
-    private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 150;
+    // [TMA-UNFINISHED-ROUTE-ANIMATION-CONTINUITY] Client/game tick scheduling
+    // is not perfectly aligned with overlay rendering. The 2026-07-30 traces
+    // captured 72 cases where the custom model stayed ready, active and
+    // authoritative, but an unfinished route selected idle/turn immediately
+    // after its 600 ms segment expired. Most next segments arrived at
+    // 608-619 ms. A later area-transition capture found five valid routes
+    // selecting idle at 810-816 ms, including one clean post-load case where
+    // the next authoritative segment arrived about 22 ms later. The next
+    // validation run found five more valid publications at 852-858 ms.
+    //
+    // Keep only the locomotion animation alive during this bounded feed gap,
+    // and only while the yellow-walk continuity arm remains active. Red-click
+    // interactions cancel that arm. ApplyTweening remains clamped to the
+    // completed segment, so this cannot extrapolate through scenery or move
+    // the model onto an interaction object.
+    private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 300;
     // [TMA-STOP-FACING-SETTLE] Reaching the final tile and settling the
     // native actor's facing are separate client events. Give the hidden
     // actor one game tick with no orientation changes before a later target
@@ -99,6 +108,7 @@ public class CustomMovementHandler
     // Defer that missing time and repay it gradually instead of applying the
     // whole interval as one position/orientation jump on the following frame.
     private boolean bScenePresentationClockActive = false;
+    private boolean bSceneLoadFramePresentationPending = false;
     private int ScenePresentationTimeDebtMilliseconds = 0;
     // When a newer route point arrives while presentation is intentionally
     // behind, preserve the established movement velocity by extending the
@@ -111,7 +121,7 @@ public class CustomMovementHandler
     private boolean bNativeSceneLoadHandoffPresented = false;
     private boolean bLastSceneRebaseUsedNativeHandoffAnchor = false;
     // Animation Handling
-    private int NO_ANIMATION = -1;
+    private static final int NO_ANIMATION = -1;
     private int CurrentAnimation = 0;
     private int CurrentPoseAnimation = 0;
     private boolean bResetCurrentAnimation = true;
@@ -137,18 +147,18 @@ public class CustomMovementHandler
     // State meanings are intentionally kept separate:
     //   Armed       = a yellow-click route is eligible for the hold.
     //   Observed    = visible movement actually started for that route.
-    //   Pending     = another yellow click arrived during catch-up, but its
-    //                 visible movement has not started yet.
-    //   AwaitingSegment = a yellow click was made after the visible segment
-    //                 finished; do not treat its early route publication as
-    //                 an uninterrupted-route animation gap.
+    //   Pending     = a yellow route is waiting for an authoritative visible
+    //                 segment, either after a re-click or a scene rebuild.
+    //   AwaitingSegment = a destination is published before its authoritative
+    //                 segment, after either a fresh click or a scene rebuild;
+    //                 do not treat that delay as an animation-only route gap.
     //   Preserve    = catch-up ended; keep the released facing until native
     //                 code issues a different orientation command.
     //   HoldThisFrame = the derived per-frame decision used by rendering.
     private boolean bWalkStopFacingHoldArmed = false;
     private boolean bWalkMovementObserved = false;
     private boolean bWalkStartPendingDuringCatchUp = false;
-    private boolean bFreshWalkClickAwaitingMovement = false;
+    private boolean bWalkSegmentAwaitingMovement = false;
     private boolean bPreserveReleasedWalkFacing = false;
     private boolean bHoldWalkStopFacingThisFrame = false;
     private boolean bNativeWalkFacingSettled = false;
@@ -344,28 +354,264 @@ public class CustomMovementHandler
             double BaseVelocity,
             long FallbackDurationMilliseconds)
     {
-        if (Distance <= 0 || BaseVelocity <= 0)
+        long SafeFallbackDuration =
+                Math.max(1L, FallbackDurationMilliseconds);
+        long MaximumRecoveryDuration =
+                SafeFallbackDuration > Long.MAX_VALUE / 2
+                        ? Long.MAX_VALUE
+                        : SafeFallbackDuration * 2;
+        if (!Double.isFinite(Distance) ||
+                Distance <= 0 ||
+                !Double.isFinite(BaseVelocity) ||
+                BaseVelocity <= 0)
         {
-            return Math.max(1L, FallbackDurationMilliseconds);
+            return SafeFallbackDuration;
         }
 
-        return Math.max(1L, (long) Math.ceil(
-                Distance / BaseVelocity));
+        double CalculatedDuration = Math.ceil(
+                Distance / BaseVelocity);
+        if (!Double.isFinite(CalculatedDuration) ||
+                CalculatedDuration >= MaximumRecoveryDuration)
+        {
+            return MaximumRecoveryDuration;
+        }
+
+        return Math.max(1L, (long) CalculatedDuration);
+    }
+
+    static double GetPreservedSceneMovementVelocity(
+            boolean MovementCanContinue,
+            LocalPoint SegmentStart,
+            LocalPoint SegmentEnd,
+            long TweenDurationMilliseconds)
+    {
+        if (!MovementCanContinue ||
+                TweenDurationMilliseconds <= 0 ||
+                SegmentStart == null ||
+                SegmentEnd == null ||
+                !IsSameWorldView(SegmentStart, SegmentEnd) ||
+                SegmentStart.equals(SegmentEnd))
+        {
+            return 0;
+        }
+
+        // Keep this division explicitly floating point. The old production
+        // calculation divided two integers, which reduced every normal
+        // sub-600-local-unit recovery velocity to zero.
+        return SegmentStart.distanceTo(SegmentEnd) /
+                (double) TweenDurationMilliseconds;
+    }
+
+    static double GetSceneRecoveryBaseVelocity(
+            double PreservedMovementVelocity,
+            double RecoveryDistance,
+            long FallbackDurationMilliseconds)
+    {
+        if (!Double.isFinite(RecoveryDistance) ||
+                RecoveryDistance <= 0)
+        {
+            return 0;
+        }
+
+        long SafeFallbackDuration =
+                Math.max(1L, FallbackDurationMilliseconds);
+        double MinimumRecoveryVelocity =
+                Perspective.LOCAL_TILE_SIZE /
+                        (double) SafeFallbackDuration;
+        if (Double.isFinite(PreservedMovementVelocity) &&
+                PreservedMovementVelocity > 0)
+        {
+            return Math.max(
+                    PreservedMovementVelocity,
+                    MinimumRecoveryVelocity);
+        }
+
+        // A fractional native handoff offset can be only one or two local
+        // units. Do not treat that tiny offset as the speed of the next real
+        // segment or its recovery could take several seconds.
+        return Math.max(
+                RecoveryDistance /
+                        (double) SafeFallbackDuration,
+                MinimumRecoveryVelocity);
+    }
+
+    static double GetRetainedSceneRecoveryBaseVelocity(
+            double PreservedMovementVelocity,
+            double RecoveryDistance,
+            long FallbackDurationMilliseconds)
+    {
+        return Double.isFinite(PreservedMovementVelocity) &&
+                PreservedMovementVelocity > 0
+                ? GetSceneRecoveryBaseVelocity(
+                        PreservedMovementVelocity,
+                        RecoveryDistance,
+                        FallbackDurationMilliseconds)
+                : 0;
+    }
+
+    static boolean CanUseSceneBoundaryBridge(
+            boolean SceneRecoveryPending,
+            boolean ScenePresentationClockActive,
+            long SceneRecoveryDurationOverride)
+    {
+        return !SceneRecoveryPending &&
+                !ScenePresentationClockActive &&
+                SceneRecoveryDurationOverride <= 0;
+    }
+
+    static boolean ShouldReleaseScenePresentationClock(
+            int ScenePresentationTimeDebtMilliseconds,
+            boolean SceneRecoveryPending,
+            long SceneRecoveryDurationOverride,
+            boolean SceneLoadFramePresentationPending)
+    {
+        return ScenePresentationTimeDebtMilliseconds <= 0 &&
+                !SceneRecoveryPending &&
+                SceneRecoveryDurationOverride <= 0 &&
+                !SceneLoadFramePresentationPending;
+    }
+
+    static boolean IsSceneMovementDiscontinuity(
+            int OwnerAnimation,
+            int RequestedAnimation,
+            boolean RequestedTeleport,
+            Set<Integer> AnimationExceptions,
+            Set<Integer> LocationAndOrientationExceptions)
+    {
+        if (RequestedTeleport)
+        {
+            return true;
+        }
+
+        return OwnerAnimation != NO_ANIMATION &&
+                        (AnimationExceptions.contains(OwnerAnimation) ||
+                                LocationAndOrientationExceptions.contains(
+                                        OwnerAnimation)) ||
+                RequestedAnimation != NO_ANIMATION &&
+                        (AnimationExceptions.contains(RequestedAnimation) ||
+                                LocationAndOrientationExceptions.contains(
+                                        RequestedAnimation));
+    }
+
+    static boolean CanPreserveSceneMovementVelocity(
+            boolean BoundaryBridgeActive,
+            boolean YellowWalkRouteActive,
+            boolean SamePlane,
+            boolean SpecialMovementDiscontinuity)
+    {
+        return BoundaryBridgeActive &&
+                YellowWalkRouteActive &&
+                SamePlane &&
+                !SpecialMovementDiscontinuity;
+    }
+
+    static boolean IsPlausibleAuthoritativeSceneSegment(
+            boolean YellowWalkRouteActive,
+            boolean SamePlane,
+            boolean SpecialMovementDiscontinuity,
+            LocalPoint SegmentStart,
+            LocalPoint SegmentEnd)
+    {
+        if (!YellowWalkRouteActive ||
+                !SamePlane ||
+                SpecialMovementDiscontinuity ||
+                SegmentStart == null ||
+                SegmentEnd == null ||
+                !IsSameWorldView(SegmentStart, SegmentEnd) ||
+                SegmentStart.equals(SegmentEnd))
+        {
+            return false;
+        }
+
+        int MaximumNativeStep =
+                Perspective.LOCAL_TILE_SIZE * 2;
+        return Math.abs(
+                SegmentEnd.getX() - SegmentStart.getX()) <=
+                        MaximumNativeStep &&
+                Math.abs(
+                        SegmentEnd.getY() - SegmentStart.getY()) <=
+                        MaximumNativeStep;
+    }
+
+    static double SelectSceneRecoveryVelocity(
+            double AuthoritativeSegmentVelocity,
+            double PreservedMovementVelocity)
+    {
+        if (Double.isFinite(AuthoritativeSegmentVelocity) &&
+                AuthoritativeSegmentVelocity > 0)
+        {
+            return AuthoritativeSegmentVelocity;
+        }
+        return Double.isFinite(PreservedMovementVelocity) &&
+                PreservedMovementVelocity > 0
+                ? PreservedMovementVelocity
+                : 0;
+    }
+
+    static boolean ExceedsSceneRecoverySnapDistance(
+            LocalPoint DisplayedLocation,
+            LocalPoint AuthoritativeLocation,
+            int SnapDistanceInTiles)
+    {
+        if (!IsSameWorldView(
+                DisplayedLocation,
+                AuthoritativeLocation))
+        {
+            return true;
+        }
+
+        // [TMA-SCENE-RECOVERY-TILE-DISTANCE] RuneScape movement distance is
+        // measured in tile steps, where a diagonal (2, 2) displacement is
+        // still two tiles. Euclidean distance classified that valid run as
+        // sqrt(8) tiles and snapped the model forward whenever the configured
+        // threshold was two. Keep the setting authoritative on each axis so
+        // ordinary diagonal scene advances recover while a displacement that
+        // exceeds the configured tile count in either direction still snaps.
+        long MaximumLocalDifference =
+                (long) Math.max(1, SnapDistanceInTiles) *
+                        Perspective.LOCAL_TILE_SIZE;
+        long DifferenceX = Math.abs(
+                (long) AuthoritativeLocation.getX() -
+                        DisplayedLocation.getX());
+        long DifferenceY = Math.abs(
+                (long) AuthoritativeLocation.getY() -
+                        DisplayedLocation.getY());
+        return DifferenceX > MaximumLocalDifference ||
+                DifferenceY > MaximumLocalDifference;
+    }
+
+    static long GetSceneMovementAnimationDuration(
+            long SceneRecoveryDurationOverride)
+    {
+        return Math.max(
+                BASE_MOVEMENT_TWEEN_MILLIS,
+                SceneRecoveryDurationOverride);
+    }
+
+    static boolean ShouldCompleteSceneRecoveryOverride(
+            int ElapsedMilliseconds,
+            long SceneRecoveryDurationOverride)
+    {
+        return SceneRecoveryDurationOverride > 0 &&
+                ElapsedMilliseconds >=
+                        SceneRecoveryDurationOverride;
     }
 
     static boolean ShouldKeepMovementAnimationDuringRouteGap(
             int MillisecondsSinceTileChange,
             boolean WasMoving,
-            boolean WalkRouteArmed,
-            boolean WalkMovementObserved,
-            boolean FreshWalkClickAwaitingMovement,
+            boolean WalkRouteContinuityArmed,
+            boolean WalkSegmentAwaitingMovement,
             LocalPoint CurrentSegmentDestination,
             LocalPoint RouteDestination)
     {
+        // A route destination alone is not enough: red-click interactions
+        // publish destinations too. Their synchronous cancel clears this
+        // yellow-walk arm so object/NPC stops cannot inherit locomotion grace
+        // and appear to run in place.
         return WasMoving &&
-                WalkRouteArmed &&
-                WalkMovementObserved &&
-                !FreshWalkClickAwaitingMovement &&
+                WalkRouteContinuityArmed &&
+                !WalkSegmentAwaitingMovement &&
                 MillisecondsSinceTileChange >=
                         BASE_MOVEMENT_TWEEN_MILLIS &&
                 MillisecondsSinceTileChange <
@@ -377,6 +623,55 @@ public class CustomMovementHandler
                         CurrentSegmentDestination,
                         RouteDestination) &&
                 !CurrentSegmentDestination.equals(RouteDestination);
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringRouteGap(
+            int MillisecondsSinceTileChange,
+            boolean WasMoving,
+            boolean WalkRouteContinuityArmed,
+            boolean WalkSegmentAwaitingMovement,
+            boolean HoldingStopFacing,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        // A deliberate stop-facing handoff takes priority over animation-only
+        // route grace. Combining both states leaves the position clamped while
+        // locomotion continues, which is the post-scene run-in-place seam.
+        return !HoldingStopFacing &&
+                ShouldKeepMovementAnimationDuringRouteGap(
+                        MillisecondsSinceTileChange,
+                        WasMoving,
+                        WalkRouteContinuityArmed,
+                        WalkSegmentAwaitingMovement,
+                        CurrentSegmentDestination,
+                        RouteDestination);
+    }
+
+    static boolean HasUnfinishedRoute(
+            LocalPoint SegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        return SegmentDestination != null &&
+                RouteDestination != null &&
+                IsSameWorldView(SegmentDestination, RouteDestination) &&
+                !SegmentDestination.equals(RouteDestination);
+    }
+
+    static boolean ShouldAwaitPostSceneWalkSegment(
+            boolean RealDiscontinuity,
+            boolean SpecialMovementDiscontinuity,
+            boolean WalkRouteArmed,
+            boolean MovementWasObserved,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        return !RealDiscontinuity &&
+                !SpecialMovementDiscontinuity &&
+                WalkRouteArmed &&
+                MovementWasObserved &&
+                HasUnfinishedRoute(
+                        CurrentSegmentDestination,
+                        RouteDestination);
     }
 
     static boolean ShouldUseOriginalOwnerPresentation(
@@ -554,12 +849,12 @@ public class CustomMovementHandler
         bSceneRecoveryRetargetPending = false;
         bSceneBoundaryBridgeActive = false;
         bScenePresentationClockActive = false;
+        bSceneLoadFramePresentationPending = false;
         ScenePresentationTimeDebtMilliseconds = 0;
         SceneRecoveryBaseVelocity = 0;
         SceneRecoveryTweenDurationOverride = 0;
         bNativeSceneLoadHandoffPresented = false;
         bLastSceneRebaseUsedNativeHandoffAnchor = false;
-
         if (AnimController != null)
         {
             AnimController = null;
@@ -630,7 +925,7 @@ public class CustomMovementHandler
                         bWalkStopFacingHoldArmed,
                         bWalkMovementObserved,
                         bHoldWalkStopFacingThisFrame);
-        bFreshWalkClickAwaitingMovement =
+        bWalkSegmentAwaitingMovement =
                 ShouldAwaitFreshWalkMovementSegment(
                         MillisecondsSinceTileChange,
                         GetMovementTweenDurationMilliseconds(),
@@ -653,7 +948,7 @@ public class CustomMovementHandler
         bWalkStopFacingHoldArmed = false;
         bWalkMovementObserved = false;
         bWalkStartPendingDuringCatchUp = false;
-        bFreshWalkClickAwaitingMovement = false;
+        bWalkSegmentAwaitingMovement = false;
         bPreserveReleasedWalkFacing = false;
         bHoldWalkStopFacingThisFrame = false;
         bNativeWalkFacingSettled = false;
@@ -667,15 +962,15 @@ public class CustomMovementHandler
             return;
         }
 
-        // The custom model is considered moving while its rendered tile has
-        // changed recently. This also catches forced movement, which may not
-        // have a preceding yellow click.
+        // Scene recovery can deliberately take longer than one normal game
+        // tick. Use the same duration as animation selection so stop-facing
+        // cannot begin while the visible model is still traversing recovery.
         boolean VisibleModelIsMoving =
                 MillisecondsSinceTileChange <
-                        BASE_MOVEMENT_TWEEN_MILLIS;
+                        GetSceneMovementAnimationDuration(
+                                SceneRecoveryTweenDurationOverride);
         if (VisibleModelIsMoving)
         {
-            bWalkStartPendingDuringCatchUp = false;
             if (bWalkStopFacingHoldArmed)
             {
                 bWalkMovementObserved = true;
@@ -743,12 +1038,12 @@ public class CustomMovementHandler
             return;
         }
 
-        // [TMA-YELLOW-RECLICK-HANDOFF] A second yellow click can publish its
-        // route destination before the client starts moving. During that
-        // delay, IsAtFinalWalkDestination() is false even though the visible
-        // model is still completing the previous stop. Keep the existing
-        // facing and idle controller until movement genuinely begins instead
-        // of briefly exposing the hidden native player between the routes.
+        // [TMA-YELLOW-RECLICK-HANDOFF] [TMA-POST-SCENE-YELLOW-HANDOFF]
+        // A second yellow click or replacement scene can publish a route
+        // destination before the client publishes its authoritative movement
+        // segment. During that delay, IsAtFinalWalkDestination() is false even
+        // though the visible model is stopped. Keep the existing facing and
+        // idle controller until movement genuinely begins.
         if (ShouldHoldPendingWalkStart(
                 bWalkStartPendingDuringCatchUp,
                 bWalkStopFacingHoldArmed,
@@ -1144,11 +1439,14 @@ public class CustomMovementHandler
             CurrentFrameDelta = ImmediateDelta + DebtPayback;
             ScenePresentationTimeDebtMilliseconds -= DebtPayback;
 
-            if (ScenePresentationTimeDebtMilliseconds == 0 &&
-                    !bSceneRecoveryRetargetPending &&
-                    SceneRecoveryTweenDurationOverride == 0)
+            if (ShouldReleaseScenePresentationClock(
+                    ScenePresentationTimeDebtMilliseconds,
+                    bSceneRecoveryRetargetPending,
+                    SceneRecoveryTweenDurationOverride,
+                    bSceneLoadFramePresentationPending))
             {
                 bScenePresentationClockActive = false;
+                SceneRecoveryBaseVelocity = 0;
             }
         }
 
@@ -1177,6 +1475,7 @@ public class CustomMovementHandler
                         SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS,
                         ScenePresentationTimeDebtMilliseconds +
                                 DeferredMilliseconds);
+        bSceneLoadFramePresentationPending = false;
         // The prepared state has now actually reached the screen. Start the
         // next delta here; the elapsed scene-build time is represented by the
         // debt above and will be repaid at a bounded rate.
@@ -1219,6 +1518,27 @@ public class CustomMovementHandler
                         Second.getWorldView();
     }
 
+    private boolean HasSceneMovementDiscontinuity()
+    {
+        int OwnerAnimation = Owner == null
+                ? NO_ANIMATION
+                : Owner.getAnimation();
+        int RequestedAnimation =
+                CurrentAnimationRequest == null
+                        ? NO_ANIMATION
+                        : CurrentAnimationRequest.AnimationToPlay;
+        boolean RequestedTeleport =
+                CurrentAnimationRequest != null &&
+                        CurrentAnimationRequest
+                                .bShouldTeleportToLocation;
+        return IsSceneMovementDiscontinuity(
+                OwnerAnimation,
+                RequestedAnimation,
+                RequestedTeleport,
+                UniqueAnimationExceptionList,
+                UniqueAnimationLocationAndOrientationExceptionList);
+    }
+
     static int GetSceneRebaseElapsedMilliseconds(int FrameDelta)
     {
         return Math.max(0, Math.min(
@@ -1251,6 +1571,76 @@ public class CustomMovementHandler
             return 0;
         }
         return GetSceneRebaseElapsedMilliseconds(FrameDelta);
+    }
+
+    static int GetSceneRebaseImmediateElapsedMilliseconds(
+            int FrameDelta,
+            boolean bHasRecoveryDistance,
+            boolean bUseNativeHandoffAnchor)
+    {
+        int RebaseElapsedMilliseconds =
+                GetSceneRebaseElapsedMilliseconds(
+                        FrameDelta,
+                        bHasRecoveryDistance,
+                        bUseNativeHandoffAnchor);
+        return bHasRecoveryDistance &&
+                !bUseNativeHandoffAnchor
+                ? GetScenePresentationImmediateFrameDelta(
+                        RebaseElapsedMilliseconds)
+                : RebaseElapsedMilliseconds;
+    }
+
+    static int GetSceneRebaseDeferredMilliseconds(
+            int FrameDelta,
+            boolean bHasRecoveryDistance,
+            boolean bUseNativeHandoffAnchor)
+    {
+        if (!bHasRecoveryDistance ||
+                bUseNativeHandoffAnchor)
+        {
+            return 0;
+        }
+
+        int RebaseElapsedMilliseconds =
+                GetSceneRebaseElapsedMilliseconds(
+                        FrameDelta,
+                        true,
+                        false);
+        return Math.max(
+                0,
+                RebaseElapsedMilliseconds -
+                        GetSceneRebaseImmediateElapsedMilliseconds(
+                                FrameDelta,
+                                true,
+                                false));
+    }
+
+    static int AddScenePresentationDebt(
+            int ExistingDebtMilliseconds,
+            int AdditionalDebtMilliseconds)
+    {
+        return (int) Math.min(
+                SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS,
+                (long) Math.max(0, ExistingDebtMilliseconds) +
+                        Math.max(0, AdditionalDebtMilliseconds));
+    }
+
+    static int SelectScenePresentationDebtAfterRebase(
+            int ExistingDebtMilliseconds,
+            int AdditionalDebtMilliseconds,
+            boolean bHasRecoveryDistance,
+            boolean bUseNativeHandoffAnchor)
+    {
+        // Debt describes time still owed to a retained custom movement path.
+        // A native handoff or a zero-distance rebase has no such path, so
+        // carrying old debt into it would leave stale debt with no active
+        // presentation clock.
+        return bHasRecoveryDistance &&
+                !bUseNativeHandoffAnchor
+                ? AddScenePresentationDebt(
+                        ExistingDebtMilliseconds,
+                        AdditionalDebtMilliseconds)
+                : 0;
     }
 
     static boolean ShouldReanchorSceneRecovery(
@@ -1299,6 +1689,35 @@ public class CustomMovementHandler
             return false;
         }
 
+        long PreservedTweenDuration =
+                GetMovementTweenDurationMilliseconds();
+        boolean bSpecialMovementDiscontinuity =
+                HasSceneMovementDiscontinuity();
+        boolean bRetainedSegmentOnCurrentPlane =
+                LastLerpPositionWorldPoint != null &&
+                        NextLerpPositionWorldPoint != null &&
+                        LastLerpPositionWorldPoint.getPlane() ==
+                                NextLerpPositionWorldPoint.getPlane() &&
+                        NextLerpPositionWorldPoint.getPlane() ==
+                                OwnerWorldPoint.getPlane();
+        boolean bCanPreserveMovementVelocity =
+                CanPreserveSceneMovementVelocity(
+                        bSceneBoundaryBridgeActive,
+                        bWalkStopFacingHoldArmed &&
+                                bWalkMovementObserved,
+                        bRetainedSegmentOnCurrentPlane,
+                        bSpecialMovementDiscontinuity);
+        // [TMA-SCENE-RECOVERY-VELOCITY] LOADING soft-suspends Update(), so
+        // these endpoints still describe the last pre-load segment. Capture
+        // its scalar speed before the rebase overwrites them. Direction is
+        // deliberately not retained or extrapolated.
+        double PreservedMovementVelocity =
+                GetPreservedSceneMovementVelocity(
+                        bCanPreserveMovementVelocity,
+                        LastLerpPosition,
+                        NextLerpPosition,
+                        PreservedTweenDuration);
+
         LocalPoint RetainedCustomLocation =
                 LastRenderedWorldPoint == null
                 ? null
@@ -1329,11 +1748,11 @@ public class CustomMovementHandler
         if (!bRealDiscontinuity &&
                 !bUseNativeHandoffAnchor)
         {
-            double DistanceInTiles =
-                    RenderedLocation.distanceTo(CurrentTrueLocation) /
-                            Perspective.LOCAL_TILE_SIZE;
-            bRealDiscontinuity = DistanceInTiles >
-                    Math.max(1, config.PlayerModelSnapDistance());
+            bRealDiscontinuity =
+                    ExceedsSceneRecoverySnapDistance(
+                            RenderedLocation,
+                            CurrentTrueLocation,
+                            config.PlayerModelSnapDistance());
         }
         if (bRealDiscontinuity)
         {
@@ -1361,23 +1780,79 @@ public class CustomMovementHandler
         // server route step arrives.
         boolean bHasRecoveryDistance =
                 !RenderedLocation.equals(CurrentTrueLocation);
-        ScenePresentationTimeDebtMilliseconds = 0;
-        SceneRecoveryTweenDurationOverride = 0;
-        SceneRecoveryBaseVelocity = bHasRecoveryDistance
-                ? RenderedLocation.distanceTo(CurrentTrueLocation) /
-                        BASE_MOVEMENT_TWEEN_MILLIS
+        boolean bAwaitingPostSceneWalkSegment =
+                ShouldAwaitPostSceneWalkSegment(
+                        bRealDiscontinuity,
+                        bSpecialMovementDiscontinuity,
+                        bWalkStopFacingHoldArmed,
+                        bWalkMovementObserved,
+                        CurrentTrueLocation,
+                        client.getLocalDestinationLocation());
+        if (bRealDiscontinuity ||
+                bSpecialMovementDiscontinuity)
+        {
+            // A teleport, plane/view replacement, or animation-authoritative
+            // displacement must not inherit a yellow route from the old scene.
+            CancelWalkStopFacingHold();
+        }
+        else if (bAwaitingPostSceneWalkSegment)
+        {
+            // [TMA-POST-SCENE-YELLOW-HANDOFF] The replacement scene may expose
+            // the old destination before its first new route segment. Reuse
+            // the pending-yellow state so the endpoint keeps a stable idle and
+            // facing instead of running in place and then chasing the hidden
+            // actor's orientation. No position is invented; the state releases
+            // as soon as UpdateLerpDestinations sees a real segment.
+            bWalkStartPendingDuringCatchUp = true;
+            bWalkSegmentAwaitingMovement = true;
+        }
+        double RecoveryDistance = bHasRecoveryDistance
+                ? RenderedLocation.distanceTo(CurrentTrueLocation)
                 : 0;
+        // [TMA-SCENE-REBASE-FIRST-DELTA] UpdateFrameTimer runs before the
+        // scene presentation clock becomes active. Without applying the same
+        // cap here, the first recovered frame could consume a raw 20-49 ms
+        // delta while every later frame was capped at 34 ms. Preserve that
+        // time as debt instead of turning it into a larger first position and
+        // camera step after an unavoidable native scene pause.
+        ScenePresentationTimeDebtMilliseconds =
+                SelectScenePresentationDebtAfterRebase(
+                        ScenePresentationTimeDebtMilliseconds,
+                        GetSceneRebaseDeferredMilliseconds(
+                                CurrentFrameDelta,
+                                bHasRecoveryDistance,
+                                bUseNativeHandoffAnchor),
+                        bHasRecoveryDistance,
+                        bUseNativeHandoffAnchor);
+        SceneRecoveryBaseVelocity =
+                GetRetainedSceneRecoveryBaseVelocity(
+                        PreservedMovementVelocity,
+                        RecoveryDistance,
+                        PreservedTweenDuration);
+        // A partial rebased segment must take a proportional fraction of the
+        // original segment time. Previously it always took a full 600 ms,
+        // visibly slowing after the scene-edge bridge before catching up.
+        SceneRecoveryTweenDurationOverride =
+                bHasRecoveryDistance &&
+                        PreservedMovementVelocity > 0
+                        ? GetSceneRecoveryTweenDuration(
+                                RecoveryDistance,
+                                SceneRecoveryBaseVelocity,
+                                PreservedTweenDuration)
+                        : 0;
         bScenePresentationClockActive =
                 bHasRecoveryDistance;
+        bSceneLoadFramePresentationPending =
+                bHasRecoveryDistance;
         MillisecondsSinceTileChange =
-                GetSceneRebaseElapsedMilliseconds(
+                GetSceneRebaseImmediateElapsedMilliseconds(
                         CurrentFrameDelta,
                         bHasRecoveryDistance,
                         bUseNativeHandoffAnchor);
         bSceneRecoveryRetargetPending =
                 bHasRecoveryDistance &&
                         MillisecondsSinceTileChange <
-                                BASE_MOVEMENT_TWEEN_MILLIS;
+                                GetMovementTweenDurationMilliseconds();
 
         if (Model != null)
         {
@@ -1675,8 +2150,35 @@ public class CustomMovementHandler
 
                 long CurrentTweenDuration =
                         GetMovementTweenDurationMilliseconds();
+                long NormalTweenDuration =
+                        GetNormalMovementTweenDurationMilliseconds();
+                boolean bSameAuthoritativeSegmentPlane =
+                        NextLerpPositionWorldPoint != null &&
+                                CurrentWorldPoint != null &&
+                                NextLerpPositionWorldPoint.getPlane() ==
+                                        CurrentWorldPoint.getPlane();
+                boolean bSpecialMovementDiscontinuity =
+                        HasSceneMovementDiscontinuity();
+                boolean bPlausibleAuthoritativeSegment =
+                        IsPlausibleAuthoritativeSceneSegment(
+                                bWalkStopFacingHoldArmed &&
+                                        bWalkMovementObserved,
+                                bSameAuthoritativeSegmentPlane,
+                                bSpecialMovementDiscontinuity,
+                                NextLerpPoint,
+                                RequestedLerpPoint);
+                double AuthoritativeSegmentVelocity =
+                        GetPreservedSceneMovementVelocity(
+                                bPlausibleAuthoritativeSegment,
+                                NextLerpPoint,
+                                RequestedLerpPoint,
+                                NormalTweenDuration);
                 boolean bReanchorBoundaryBridge =
                         bSceneBoundaryBridgeActive &&
+                                CanUseSceneBoundaryBridge(
+                                        bSceneRecoveryRetargetPending,
+                                        bScenePresentationClockActive,
+                                        SceneRecoveryTweenDurationOverride) &&
                                 NewLocalPointToDraw != null;
                 boolean bReanchorRecovery =
                         bReanchorBoundaryBridge ||
@@ -1726,12 +2228,44 @@ public class CustomMovementHandler
 
                 if (bReanchorRecovery)
                 {
-                    SceneRecoveryTweenDurationOverride =
-                            GetSceneRecoveryTweenDuration(
-                                    LastLerpPosition.distanceTo(
-                                            NextLerpPosition),
-                                    SceneRecoveryBaseVelocity,
-                                    CurrentTweenDuration);
+                    // Prefer the newly published native segment. This matters
+                    // when the player changes from walking to running (or the
+                    // reverse) across the load. The pre-load scalar is only a
+                    // fallback when the old endpoint cannot be converted in
+                    // the replacement scene.
+                    boolean bCanUsePreLoadVelocity =
+                            NextLerpPoint == null &&
+                                    bWalkStopFacingHoldArmed &&
+                                    bWalkMovementObserved &&
+                                    bSameAuthoritativeSegmentPlane &&
+                                    !bSpecialMovementDiscontinuity;
+                    double SelectedVelocity =
+                            SelectSceneRecoveryVelocity(
+                                    AuthoritativeSegmentVelocity,
+                                    bCanUsePreLoadVelocity
+                                            ? SceneRecoveryBaseVelocity
+                                            : 0);
+                    double RecoveryDistance =
+                            LastLerpPosition.distanceTo(
+                                    NextLerpPosition);
+                    if (SelectedVelocity > 0)
+                    {
+                        SceneRecoveryBaseVelocity =
+                                GetSceneRecoveryBaseVelocity(
+                                        SelectedVelocity,
+                                        RecoveryDistance,
+                                        NormalTweenDuration);
+                        SceneRecoveryTweenDurationOverride =
+                                GetSceneRecoveryTweenDuration(
+                                        RecoveryDistance,
+                                        SceneRecoveryBaseVelocity,
+                                        NormalTweenDuration);
+                    }
+                    else
+                    {
+                        SceneRecoveryBaseVelocity = 0;
+                        SceneRecoveryTweenDurationOverride = 0;
+                    }
                 }
                 else
                 {
@@ -1810,9 +2344,10 @@ public class CustomMovementHandler
                 ShouldKeepMovementAnimationDuringRouteGap(
                         MillisecondsSinceTileChange,
                         bMovingThisAction,
-                        bWalkStopFacingHoldArmed,
-                        bWalkMovementObserved,
-                        bFreshWalkClickAwaitingMovement,
+                        bWalkStopFacingHoldArmed &&
+                                bWalkMovementObserved,
+                        bWalkSegmentAwaitingMovement,
+                        bHoldWalkStopFacingThisFrame,
                         NextLerpPosition,
                         client.getLocalDestinationLocation());
 
@@ -1825,7 +2360,9 @@ public class CustomMovementHandler
         //else
 
         // Currently moving
-        if (MillisecondsSinceTileChange < BASE_MOVEMENT_TWEEN_MILLIS ||
+        if (MillisecondsSinceTileChange <
+                        GetSceneMovementAnimationDuration(
+                                SceneRecoveryTweenDurationOverride) ||
                 bSceneBoundaryBridgeActive ||
                 bKeepMovementAnimationDuringRouteGap)
         {
@@ -2060,13 +2597,8 @@ public class CustomMovementHandler
                 config.OriginalModelProximityOrientationThreshold());
     }
 
-    private long GetMovementTweenDurationMilliseconds()
+    private long GetNormalMovementTweenDurationMilliseconds()
     {
-        if (SceneRecoveryTweenDurationOverride > 0)
-        {
-            return SceneRecoveryTweenDurationOverride;
-        }
-
         double RequestSpeedMultiplier =
                 CurrentAnimationRequest == null
                         ? 1.0
@@ -2081,10 +2613,21 @@ public class CustomMovementHandler
                         MovementSpeedMultiplier));
     }
 
+    private long GetMovementTweenDurationMilliseconds()
+    {
+        return SceneRecoveryTweenDurationOverride > 0
+                ? SceneRecoveryTweenDurationOverride
+                : GetNormalMovementTweenDurationMilliseconds();
+    }
+
     private boolean ShouldBridgeSceneBoundaryMovement(
             long TweenDurationMilliseconds)
     {
-        if (!IsPlayerOwner() ||
+        if (!CanUseSceneBoundaryBridge(
+                bSceneRecoveryRetargetPending,
+                bScenePresentationClockActive,
+                SceneRecoveryTweenDurationOverride) ||
+                !IsPlayerOwner() ||
                 !bWalkStopFacingHoldArmed ||
                 !bWalkMovementObserved ||
                 MillisecondsSinceTileChange <
@@ -2145,12 +2688,24 @@ public class CustomMovementHandler
                 TweenDurationMilliseconds)
         {
             bSceneRecoveryRetargetPending = false;
-            if (SceneRecoveryTweenDurationOverride > 0)
+            if (ShouldCompleteSceneRecoveryOverride(
+                    MillisecondsSinceTileChange,
+                    SceneRecoveryTweenDurationOverride))
             {
+                // [TMA-SCENE-RECOVERY-COMPLETION] A short proportional
+                // recovery may finish before the normal 600 ms movement
+                // duration. Collapse the completed segment before clearing
+                // its override; otherwise the next frame would reinterpret
+                // the same elapsed time against 600 ms and move backward.
+                LastLerpPosition = NextLerpPosition;
+                LastLerpPositionWorldPoint =
+                        NextLerpPositionWorldPoint;
+                NewLocalPointToDraw = NextLerpPosition;
+                MillisecondsSinceTileChange =
+                        BASE_MOVEMENT_TWEEN_MILLIS;
                 SceneRecoveryTweenDurationOverride = 0;
-                if (ScenePresentationTimeDebtMilliseconds == 0)
+                if (!bScenePresentationClockActive)
                 {
-                    bScenePresentationClockActive = false;
                     SceneRecoveryBaseVelocity = 0;
                 }
             }
@@ -2685,10 +3240,12 @@ public class CustomMovementHandler
 
         if (bNewTileMovementStarted)
         {
-            // [TMA-FRESH-WALK-START] The first authoritative movement segment
-            // has arrived. Ordinary locomotion and route-gap continuity are
-            // valid again from this point onward.
-            bFreshWalkClickAwaitingMovement = false;
+            // [TMA-FRESH-WALK-START] A real authoritative movement segment has
+            // arrived. This clears both an ordinary re-click delay and the
+            // first-segment wait carried through a scene rebuild. Recovery
+            // tweening alone never clears either state.
+            bWalkSegmentAwaitingMovement = false;
+            bWalkStartPendingDuringCatchUp = false;
         }
 
         UpdateWalkStopFacingHold();

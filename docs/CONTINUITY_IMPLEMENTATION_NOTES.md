@@ -42,7 +42,7 @@ replacements into visible restarts or blank frames.
 - The custom model remains the sole presentation authority throughout movement
   and action animations. "Original model when close" still applies once the
   player is genuinely idle, close, and facing within the configured threshold.
-- An uninterrupted yellow-click route receives up to 150 ms of animation-only
+- An uninterrupted yellow-click route receives up to 300 ms of animation-only
   grace between segments. It does not extrapolate position, does not apply to
   red-click interactions, and is disabled at the final route destination.
 - `[TMA-FRESH-WALK-START]` distinguishes that continuation from a new yellow
@@ -216,6 +216,73 @@ boundary bridge may preserve forward momentum until the next route point is
 available. It is excluded from red-click interactions and is capped so it
 cannot become route prediction or recreate the “run onto the object” bug.
 
+## `[TMA-POST-SCENE-YELLOW-HANDOFF]`: wait for the first replacement-scene segment
+
+### Cause
+
+A scene can finish rebasing before the client publishes the first movement
+segment belonging to that replacement scene. In the clearest captured case,
+the displayed segment, draw point, and hidden owner all coincided while the old
+yellow-click destination still appeared one segment ahead. The generic
+unfinished-route grace therefore kept locomotion active against a clamped
+position. Once that grace expired, the destination still looked unfinished,
+so the ordinary final-stop facing hold was denied and the visible orientation
+started chasing the hidden player's new target. This produced the reported
+run-in-place followed by a spin.
+
+### Fix
+
+After a successful same-view, non-teleport rebase, an already observed yellow
+route with an unfinished destination is marked as waiting for its first
+authoritative post-scene segment. This deliberately reuses the existing
+pending-yellow handoff:
+
+- scene-recovery movement may continue, but cannot clear the pending state;
+- once the displayed recovery reaches its endpoint, facing and the independent
+  idle controller remain stable;
+- route-gap locomotion cannot run at the same time as that stop-facing hold;
+- the first real tile segment clears the wait immediately and resumes ordinary
+  locomotion; and
+- a red interaction or real discontinuity clears the state synchronously.
+
+No destination is predicted and no position is extrapolated. The handoff only
+selects the stable pose/facing to display while RuneLite has not yet published
+the next segment. Stop detection also uses the active scene-recovery duration,
+so a recovery longer than the normal 600 ms cannot be misclassified as idle
+while it is still visibly moving.
+
+## `[TMA-SCENE-RECOVERY-TILE-DISTANCE]`: do not mistake diagonal running for a teleport
+
+### Cause
+
+`Player Model Snap Distance` is expressed in RuneScape tiles, but the scene
+rebase path compared the straight-line Euclidean distance between the last
+displayed point and the new authoritative point. With the setting at two, an
+ordinary two-tile diagonal scene advance measured `sqrt(2^2 + 2^2) = 2.83`
+and was classified as a discontinuity.
+
+The later capture set made the cutoff deterministic. Of 36 ordinary
+non-teleport transitions, all 22 retained displacements at or below 2.00 kept
+continuity without snapping. All 14 ordinary displacements between 2.24 and
+2.83 snapped directly to the hidden player, disabled recovery/presentation
+timing, and commonly
+selected idle before the next route segment. Genuine teleports in the same
+captures were hundreds or thousands of tiles away.
+
+### Fix
+
+Scene snap distance now uses tile-step distance: the absolute X and Y
+differences are checked independently against the configured tile count. A
+two-by-two diagonal is therefore two RuneScape tiles, while a displacement
+that exceeds the setting on either axis still snaps.
+
+This changes only the scene-rebase discontinuity test. World-view and plane
+changes still snap, while teleport/special-animation guards continue to reject
+preserved pre-load velocity. Recovery still targets only RuneScape's current
+authoritative true tile. It does not interpolate toward the farther route
+destination and does not alter ordinary movement or object-interaction
+interpolation.
+
 ## `[TMA-SCENE-PRESENTATION-CLOCK]`: pay back scene-build time gradually
 
 ### Cause
@@ -240,6 +307,89 @@ This creates a gradual ease into current authoritative state. It does not
 discard movement or change the route; the rendered model may simply trail it by
 a small amount while continuity is restored.
 
+The later traces also establish the hard limit of this mechanism. Six
+ordinary moving transitions had complete client/presentation gaps of
+142-225 ms, and a stationary transition also paused for 142 ms. Most of that
+interval appeared as presentation debt between pre-render preparation and the
+completed scene draw. No plugin can synthesize frames while RuneLite's
+client/render thread is not drawing. The continuity path can, however,
+prevent a second visible fault after that native pause: the corrected
+tile-distance check resumes from the retained presentation and eases toward
+the current true tile instead of snapping several tiles forward.
+
+`[TMA-SCENE-REBASE-FIRST-DELTA]` closes the final smaller timing asymmetry.
+`UpdateFrameTimer()` runs before a replacement scene activates the
+presentation clock, so the first recovered update previously consumed its raw
+20-49 ms delta even though later updates were capped at 34 ms. The initial
+rebase now uses the same 34 ms cap and moves any excess into presentation
+debt. Consecutive retained-custom recoveries saturating-add that new debt
+instead of discarding time still owed by the preceding recovery. A native
+handoff or zero-distance rebase resets it because no custom recovery clock
+remains to repay it. This can soften the first position/camera step after
+rendering resumes; it cannot fill the preceding interval in which RuneLite
+drew no frames.
+
+`[TMA-SCENE-RECOVERY-VELOCITY]` corrects the timing of that authoritative
+recovery. The 2026-07-30 captures showed `SceneRecoveryBaseVelocity=0.0` for
+all 23 moving scene transitions. Production calculated the value with integer
+division, so an ordinary recovery shorter than 600 local units was truncated
+to zero; whenever proportional duration was requested,
+`GetSceneRecoveryTweenDuration()` therefore fell back to a complete 600 ms
+tick.
+
+This was most visible in the six captures where the scene-edge bridge was
+active. Their shorter rebased segments were still stretched over 600 ms,
+slowing by 10-25% (20.6% on average) before deferred-time repayment
+accelerated them again.
+Immediately before rebasing overwrites the old endpoints, the handler now
+retains the last segment's floating-point scalar velocity. A partial recovery
+uses a proportional duration—for example, 192 remaining local units at a
+256-units-per-600-ms run rate takes 450 ms. The six measured bridge recoveries
+now calculate to 450-541 ms instead of all taking 600 ms.
+
+The retained value is deliberately narrow:
+
+- it is scalar timing only; old direction and route destinations are never
+  extrapolated;
+- it is retained only when the scene-edge bridge proves that an observed
+  yellow-click route was still moving out through the rebuild margin;
+- red-click object/NPC/player interactions do not opt into this timing change;
+- owner and requested teleport/agility exceptions, plane changes, and real
+  discontinuities reject it;
+- when the first plausible one/two-step authoritative segment arrives, that
+  segment's actual walk/run velocity replaces the pre-load value; and
+- a segment that is too large to be a normal native step cannot provide a
+  recovery velocity.
+
+Interpolation therefore remains between the last presented position and
+RuneScape's current authoritative tile. The scene-edge bridge is disabled while
+recovery, its presentation clock, or a duration override owns the frame, so the
+two continuity mechanisms cannot compose into an overshoot. Recovery duration
+has a one-tile-per-normal-tween minimum velocity and a two-tween maximum
+duration, preventing tiny offsets or malformed values from creating long
+tails.
+
+When a proportional recovery is shorter than 600 ms, completion collapses its
+endpoints before clearing the duration override. Without that state transition,
+the following frame would reinterpret (for example) 466 elapsed milliseconds
+against 600 ms and visibly move the model backward. A longer recovery also
+keeps locomotion selected for its full duration.
+
+The presentation clock also remains alive until the prepared scene frame is
+actually marked as presented. Finishing a short positional recovery inside the
+pre-render update no longer drops deferred render time before it can be
+recorded.
+
+The 18 supplied attachments were cumulative rolling captures, not 18
+independent transitions. Deduplication produced 198 unique scene events:
+23 moving transitions and 14 stationary transitions. The eight Corrupted
+Gauntlet room openings were all stationary. They showed 16-49 ms native
+`LOGGED_IN` gaps while bridge, recovery, clock, and debt were all disabled.
+No safe plugin-generated motion exists for those pauses because the
+client/render thread is not presenting frames. The velocity correction
+therefore changes moving recovery only and does not synthesize movement for
+stationary room openings.
+
 ## Adaptive camera continuity
 
 The camera follows the same presented model state, expressed in pseudo-world
@@ -261,7 +411,8 @@ custom value.
 
 ## Diagnostics and tests
 
-All diagnostic loggers were temporary and are absent from production code:
+The earlier diagnostic loggers were temporary and were removed after their
+original investigations:
 
 - `[SceneLoadTrace]` compared scene generation, route/local/world coordinates,
   model presentation, camera presentation, and frame timing.
@@ -277,9 +428,59 @@ All diagnostic loggers were temporary and are absent from production code:
   unexpected regressions: changes between walk and run poses matched genuine
   one-tile and two-tile movement segments. No additional locomotion controller
   was added.
+- `[MovementContinuityTrace]` isolated unfinished-route idle/turn requests from
+  real model loss. It established the bounded route-gap grace and the delayed
+  first-segment condition after scene replacement.
+- `[SceneMotionTrace]` correlated scene generation, rebase/recovery ownership,
+  movement speed, and retained camera state. It established which scene-load
+  corrections were plugin-side and which pauses contained no drawable client
+  frame at all.
 
-The instrumentation was removed after in-game validation so production does
-not perform diagnostic state tracking, model inspection, or log formatting.
+The instrumentation and its temporary chat correlation marker were removed
+after the investigations. Production therefore performs no continuity-specific
+diagnostic state tracking, model inspection, chat output, or log formatting.
+The conclusions below are retained because they explain the otherwise
+non-obvious timing bounds in production code.
+
+The first full capture set contained 72 unfinished-route idle transitions.
+They consistently occurred just after a 600 ms movement segment expired:
+most at 608-619 ms and five at 751-758 ms. A later current-build capture found
+five more at 810-816 ms around area transitions. The cleanest example resumed
+an authoritative movement segment roughly 22 ms after requesting idle. The
+next validation run found five additional publications at 852-858 ms.
+Sample spacing remained normal, the custom model remained
+ready/active/authoritative, controller state did not reset, and there was no
+native/custom presentation swap. The visible "flicker" in these captured
+events was therefore a one- or multi-frame request for idle animation 808 or
+turn animation 823 between two valid locomotion requests, not a missing model.
+
+`[TMA-UNFINISHED-ROUTE-ANIMATION-CONTINUITY]` fixes that underlying selection
+seam. Locomotion remains selected for at most 300 ms when:
+
+- the previous frame was moving;
+- an observed yellow-click route still owns continuity;
+- the current segment has reached its 600 ms endpoint;
+- the client still publishes a different, same-world-view route destination;
+  and
+- this is not the pre-movement delay after a fresh yellow click.
+
+Only animation selection is preserved. Position tweening remains clamped to
+the completed segment, so the fix cannot cut corners, overshoot, enter an
+object, or invent a route. Red-click interactions synchronously cancel the
+yellow-walk arm, so object/NPC routes cannot inherit this grace and run in
+place. Equal/null/different-world-view destinations still stop normally. The
+300 ms limit covers the supplied 852-858 ms traces with 42 ms of scheduling
+margin while preventing an indefinitely stale destination from causing
+running in place.
+
+The latest capture set also verified what was *not* failing. During stable
+frames there were no model-readiness losses, custom-authority drops,
+native/custom presentation swaps, controller resets, recovery rewinds, or
+large retained-camera rebases. Moving scene recoveries remained monotonic and
+the native handoff was used when it had already been presented. Consequently
+the post-scene yellow fix changes only the pose/facing choice while awaiting a
+real segment; it does not replace the already-valid position, scene-anchor,
+recovery, or camera paths.
 
 The focused tests cover:
 
@@ -290,6 +491,7 @@ The focused tests cover:
 - recovery tween duration/velocity preservation;
 - adaptive camera handoff, delta limiting, and vertical easing;
 - route-gap grace versus a fresh post-stop yellow click;
+- delayed first-segment handoff after a same-view yellow-click scene rebase;
 - native-facing settlement and second-click handoff; and
 - idle-controller ownership across positional catch-up.
 
