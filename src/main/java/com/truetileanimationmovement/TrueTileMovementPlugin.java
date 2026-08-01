@@ -327,6 +327,19 @@ public class TrueTileMovementPlugin extends Plugin
 					TicksSincePluginWasSupport + 1);
 		}
 
+		// [TMA-PLAYER-FLICKER-DIAGNOSTICS] This is the sole live-state
+		// sampling point. It runs on RuneLite's client thread; render and
+		// overlay callbacks never inspect a RuneLiteObject for diagnostics.
+		CustomMovementHandler LocalPlayerHandler =
+				GetLocalPlayerMovementHandler();
+		if (LocalPlayerHandler != null)
+		{
+			LocalPlayerHandler.CapturePlayerFlickerSampleOnClientThread(
+					SceneGeneration,
+					bSceneLoadVisualHandoffPending,
+					OverlayRenderer.bRuneliteObjectsStale);
+		}
+
 	}
 
 	private void UpdateAdaptiveCamera(

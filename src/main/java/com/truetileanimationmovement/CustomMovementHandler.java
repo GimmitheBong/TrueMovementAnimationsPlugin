@@ -6,11 +6,23 @@ import net.runelite.api.coords.WorldPoint;
 
 import javax.inject.Inject;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 
 public class CustomMovementHandler
 {
     private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
+    // [TMA-CONTINUOUS-MOVEMENT-SPEED] A multiplier cannot make the visible
+    // model move faster than RuneScape publishes collision-valid route steps
+    // indefinitely without either waiting at the endpoint or predicting a
+    // path through walls/objects. Keep the published 600 ms segment clock and
+    // use the user-facing multiplier only as a bounded within-segment lead.
+    // The cap keeps the C1 progress curve strictly monotonic even when a user
+    // enters a value above the range that can be represented safely.
+    private static final double MAX_CONTINUOUS_MOVEMENT_LEAD_MULTIPLIER =
+            1.75;
+    private static final double CONTINUOUS_MOVEMENT_LEAD_STRENGTH_SCALE =
+            3.0 * Math.sqrt(3.0);
     // RuneScape rebuilds the scene as the player crosses the 16-tile margin
     // on either side of the 104-tile scene. Route data can disappear for the
     // last fraction of a tick at exactly that boundary.
@@ -47,6 +59,10 @@ public class CustomMovementHandler
     private final Client client;
     private final TrueTileMovementPlugin plugin;
     private final TrueTileMovementConfig config;
+    // Created only for the local player while the opt-in diagnostic is on;
+    // NPC handlers and normal plugin use carry no recorder allocation.
+    private PlayerFlickerDiagnostics PlayerFlickerRecorder = null;
+    private int ConsecutiveDiagnosticEndpointSamples = 0;
     TrueMovementOverlay overlay;
 
     // Time management
@@ -162,6 +178,13 @@ public class CustomMovementHandler
     private boolean bPreserveReleasedWalkFacing = false;
     private boolean bHoldWalkStopFacingThisFrame = false;
     private boolean bNativeWalkFacingSettled = false;
+    // [TMA-YELLOW-RECLICK-ROUTE-GRACE] Route-gap animation continuity belongs
+    // only to the yellow click which produced the displayed segment. A newer
+    // click can publish its destination before its first movement segment;
+    // letting the old segment inherit that destination produces up to 300 ms
+    // of locomotion at a stationary endpoint.
+    private long WalkClickRevision = 0;
+    private long WalkClickRevisionAtMovementSegment = 0;
     private int NativeTargetOrientationAtWalkFacingRelease = 0;
     private int NativeCurrentOrientationAtWalkFacingRelease = 0;
     private long LastNativeWalkFacingChangeTime = 0;
@@ -254,6 +277,88 @@ public class CustomMovementHandler
 
         // Linear easing
         return t;
+    }
+
+    static double GetConfiguredMovementLeadMultiplier(
+            double ConfiguredMultiplier)
+    {
+        if (!Double.isFinite(ConfiguredMultiplier))
+        {
+            return 1.0;
+        }
+
+        return Math.min(
+                Math.max(1.0, ConfiguredMultiplier),
+                MAX_CONTINUOUS_MOVEMENT_LEAD_MULTIPLIER);
+    }
+
+    static long GetRequestMovementTweenDurationMilliseconds(
+            double RequestMultiplier)
+    {
+        // Animation-request multipliers are authored choreography for the
+        // optional leap/Woox animations. Preserve their established travel
+        // timing; only the user-facing config multiplier is reinterpreted as
+        // a continuous within-segment lead.
+        if (!Double.isFinite(RequestMultiplier) ||
+                RequestMultiplier <= 1.0)
+        {
+            return BASE_MOVEMENT_TWEEN_MILLIS;
+        }
+        return Math.max(
+                1L,
+                (long) (BASE_MOVEMENT_TWEEN_MILLIS /
+                        RequestMultiplier));
+    }
+
+    static boolean ShouldApplyContinuousMovementSpeedLead(
+            boolean ShouldTeleport,
+            boolean SceneBoundaryBridgeActive,
+            boolean SceneRebasePending,
+            long SceneRecoveryDurationOverride,
+            boolean SceneRecoveryRetargetPending,
+            boolean ScenePresentationClockActive,
+            boolean SceneLoadFramePresentationPending)
+    {
+        return !ShouldTeleport &&
+                !SceneBoundaryBridgeActive &&
+                !SceneRebasePending &&
+                SceneRecoveryDurationOverride == 0 &&
+                !SceneRecoveryRetargetPending &&
+                !ScenePresentationClockActive &&
+                !SceneLoadFramePresentationPending;
+    }
+
+    static double ApplyContinuousMovementSpeedLead(
+            double BaseProgress,
+            double CombinedMultiplier)
+    {
+        if (!Double.isFinite(BaseProgress))
+        {
+            return 0.0;
+        }
+        double Progress = Math.max(
+                0.0,
+                Math.min(1.0, BaseProgress));
+        if (!Double.isFinite(CombinedMultiplier) ||
+                CombinedMultiplier <= 1.0 ||
+                Progress == 0.0 ||
+                Progress == 1.0)
+        {
+            return Progress;
+        }
+
+        double EffectiveMultiplier = Math.min(
+                CombinedMultiplier,
+                MAX_CONTINUOUS_MOVEMENT_LEAD_MULTIPLIER);
+        double CurveStrength =
+                (EffectiveMultiplier - 1.0) *
+                        CONTINUOUS_MOVEMENT_LEAD_STRENGTH_SCALE;
+        double Remaining = 1.0 - Progress;
+        double LedProgress = Progress +
+                CurveStrength *
+                        Progress * Progress *
+                        Remaining * Remaining;
+        return Math.max(0.0, Math.min(1.0, LedProgress));
     }
 
     static boolean IsSceneBoundaryExitSegment(
@@ -925,22 +1030,31 @@ public class CustomMovementHandler
                         bWalkStopFacingHoldArmed,
                         bWalkMovementObserved,
                         bHoldWalkStopFacingThisFrame);
-        bWalkSegmentAwaitingMovement =
-                ShouldAwaitFreshWalkMovementSegment(
+        boolean bVisibleMovementSegmentInProgress =
+                IsVisibleMovementSegmentInProgress(
+                        bMovingThisAction,
                         MillisecondsSinceTileChange,
                         GetMovementTweenDurationMilliseconds(),
-                        bHoldWalkStopFacingThisFrame,
-                        bPreserveReleasedWalkFacing);
+                        LastLerpPosition,
+                        NextLerpPosition);
+        ++WalkClickRevision;
+        // Every yellow click waits for a segment published after that click.
+        // The already-visible segment continues normally until its endpoint;
+        // only stale route-gap locomotion is excluded.
+        bWalkSegmentAwaitingMovement = true;
         bWalkStopFacingHoldArmed = true;
-        bWalkMovementObserved = bContinueActiveCatchUp;
-        bWalkStartPendingDuringCatchUp = bContinueActiveCatchUp;
+        bWalkMovementObserved =
+                bContinueActiveCatchUp ||
+                        bVisibleMovementSegmentInProgress;
+        bWalkStartPendingDuringCatchUp =
+                bContinueActiveCatchUp ||
+                        bVisibleMovementSegmentInProgress;
         // If the previous route is already preserving its released facing,
-        // keep that stable during the short click-to-movement delay. The new
-        // route clears it as soon as visible movement actually begins. It is
-        // important that a click alone cannot revive a released controller.
-        // An actively rendered catch-up is different: retain its Observed
-        // state until the next movement segment really begins, otherwise the
-        // click creates a one-frame idle/facing release seam.
+        // keep that stable during the short click-to-movement delay. A click
+        // during a genuinely moving segment also retains its observed state
+        // through that segment's endpoint. The first segment published after
+        // this click clears both pending flags. A click made from established
+        // idle still cannot revive an old controller.
     }
 
     void CancelWalkStopFacingHold()
@@ -952,6 +1066,8 @@ public class CustomMovementHandler
         bPreserveReleasedWalkFacing = false;
         bHoldWalkStopFacingThisFrame = false;
         bNativeWalkFacingSettled = false;
+        WalkClickRevision = 0;
+        WalkClickRevisionAtMovementSegment = 0;
     }
 
     private void UpdateWalkStopFacingHold()
@@ -1151,16 +1267,26 @@ public class CustomMovementHandler
                 !VisibleModelIsMoving;
     }
 
-    static boolean ShouldAwaitFreshWalkMovementSegment(
+    static boolean IsMovementSegmentFromLatestWalkClick(
+            long LatestWalkClickRevision,
+            long MovementSegmentWalkClickRevision)
+    {
+        return LatestWalkClickRevision ==
+                MovementSegmentWalkClickRevision;
+    }
+
+    static boolean IsVisibleMovementSegmentInProgress(
+            boolean MovementSelected,
             int MillisecondsSinceTileChange,
             long MovementTweenDurationMilliseconds,
-            boolean HoldingStopFacing,
-            boolean PreservingReleasedFacing)
+            LocalPoint SegmentStart,
+            LocalPoint SegmentEnd)
     {
-        return HoldingStopFacing ||
-                PreservingReleasedFacing ||
-                MillisecondsSinceTileChange >=
-                        MovementTweenDurationMilliseconds;
+        return MovementSelected &&
+                MillisecondsSinceTileChange <
+                        MovementTweenDurationMilliseconds &&
+                IsSameWorldView(SegmentStart, SegmentEnd) &&
+                !SegmentStart.equals(SegmentEnd);
     }
 
     static boolean ShouldUseWalkStopIdleController(
@@ -1895,6 +2021,391 @@ public class CustomMovementHandler
                 Model.isActive();
     }
 
+    /**
+     * [TMA-PLAYER-FLICKER-DIAGNOSTICS]
+     *
+     * Collect the local player's diagnostic snapshot on the client thread.
+     * This is intentionally called only by TrueTileMovementPlugin.onClientTick.
+     * No overlay/render callback may inspect a RuneLiteObject for diagnostics:
+     * scene replacement can invalidate that object between render callbacks.
+     */
+    void CapturePlayerFlickerSampleOnClientThread(
+            int SceneGeneration,
+            boolean SceneLoadVisualHandoffPending,
+            boolean RuneliteObjectsStale)
+    {
+        if (!config.AutoLogPlayerFlickers())
+        {
+            if (PlayerFlickerRecorder != null)
+            {
+                PlayerFlickerRecorder.resetContext("diagnostic-disabled");
+                PlayerFlickerRecorder = null;
+            }
+            ConsecutiveDiagnosticEndpointSamples = 0;
+            return;
+        }
+
+        if (PlayerFlickerRecorder == null)
+        {
+            PlayerFlickerRecorder = new PlayerFlickerDiagnostics();
+        }
+
+        boolean StableScene =
+                IsPlayerOwner() &&
+                        client.getGameState() == GameState.LOGGED_IN &&
+                        !plugin.bForceEarlyOut &&
+                        plugin.bIsPluginSupportedCurrently &&
+                        !SceneLoadVisualHandoffPending &&
+                        !RuneliteObjectsStale &&
+                        !bSceneRebasePending &&
+                        !bSceneRecoveryRetargetPending &&
+                        !bSceneBoundaryBridgeActive &&
+                        !bScenePresentationClockActive &&
+                        !bSceneLoadFramePresentationPending &&
+                        (LastInitializedSceneGeneration < 0 ||
+                                LastInitializedSceneGeneration ==
+                                        SceneGeneration) &&
+                        Owner != null &&
+                        Owner.getLocalLocation() != null &&
+                        TrueTileMovementPlugin.IsSameWorldView(
+                                Owner.getWorldView(),
+                                client.getWorldView(-1));
+        if (!StableScene)
+        {
+            // Most importantly, do not dereference Model while scene-owned
+            // RuneLiteObjects are stale or being replaced.
+            PlayerFlickerRecorder.resetContext("scene-or-client-state-changed");
+            ConsecutiveDiagnosticEndpointSamples = 0;
+            return;
+        }
+
+        long SampleTime = System.currentTimeMillis();
+        long SampleMonotonicNanos = System.nanoTime();
+        LocalPoint OwnerLocation = Owner.getLocalLocation();
+        LocalPoint RouteDestination =
+                client.getLocalDestinationLocation();
+        long TweenDuration =
+                GetMovementTweenDurationMilliseconds();
+        long MovementAnimationDuration =
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride);
+        boolean ActiveSegment =
+                IsSameWorldView(LastLerpPosition, NextLerpPosition) &&
+                        !LastLerpPosition.equals(NextLerpPosition) &&
+                        MillisecondsSinceTileChange <
+                                MovementAnimationDuration;
+        boolean UnfinishedYellowRoute =
+                !bWalkStartPendingDuringCatchUp &&
+                        ShouldKeepMovementAnimationDuringRouteGap(
+                                MillisecondsSinceTileChange,
+                                true,
+                                bWalkStopFacingHoldArmed &&
+                                        bWalkMovementObserved &&
+                                        IsMovementSegmentFromLatestWalkClick(
+                                                WalkClickRevision,
+                                                WalkClickRevisionAtMovementSegment),
+                                bWalkSegmentAwaitingMovement,
+                                bHoldWalkStopFacingThisFrame,
+                                NextLerpPosition,
+                                RouteDestination);
+        boolean MovementExpected =
+                ActiveSegment || UnfinishedYellowRoute;
+
+        int OwnerActionAnimation = Owner.getAnimation();
+        int OwnerActionFrame = Owner.getAnimationFrame();
+        int OwnerPoseAnimation = Owner.getPoseAnimation();
+        int OwnerPoseFrame = Owner.getPoseAnimationFrame();
+        int RequestedActionAnimation =
+                CurrentAnimationRequest == null
+                        ? NO_ANIMATION
+                        : CurrentAnimationRequest.AnimationToPlay;
+        int RequestedPoseAnimation =
+                CurrentAnimationRequest == null
+                        ? NO_ANIMATION
+                        : CurrentAnimationRequest.PoseAnimationToPlay;
+        boolean ActionAnimationActive =
+                OwnerActionAnimation != NO_ANIMATION ||
+                        RequestedActionAnimation != NO_ANIMATION;
+        boolean MovementDiscontinuity =
+                HasSceneMovementDiscontinuity();
+        boolean DetectionEligible =
+                !MovementDiscontinuity &&
+                        !bTransitioningToBattleMode &&
+                        !bWalkSegmentAwaitingMovement &&
+                        !bWalkStartPendingDuringCatchUp &&
+                        !bHoldWalkStopFacingThisFrame;
+        boolean IdleDetectionEligible =
+                DetectionEligible &&
+                        !ActionAnimationActive;
+        boolean IdleSelected =
+                !bMovingThisAction ||
+                        bUsingWalkStopIdleController ||
+                        IsExclusiveIdlePoseAnimation(
+                                RequestedPoseAnimation);
+
+        // All RuneLiteObject reads are confined to this client-thread block.
+        RuneLiteObject DiagnosticModel = Model;
+        LocalPoint ModelLocation =
+                DiagnosticModel == null
+                        ? null
+                        : DiagnosticModel.getLocation();
+        boolean ModelExists = DiagnosticModel != null;
+        boolean ModelActive =
+                ModelExists && DiagnosticModel.isActive();
+        boolean ModelHasGeometry =
+                ModelExists && DiagnosticModel.getModel() != null;
+        boolean ModelInOwnerWorldView =
+                ModelExists &&
+                        IsSameWorldView(ModelLocation, OwnerLocation);
+        boolean CustomPresentationRequired =
+                MovementExpected &&
+                        !bAttemptToRenderOwner &&
+                        !bTransitioningToBattleMode;
+        boolean CustomPresentationReady =
+                !bShouldRenderOwner &&
+                        !bRenderOriginalOwnerDueToProximity &&
+                        ModelActive &&
+                        ModelHasGeometry &&
+                        ModelInOwnerWorldView;
+        boolean ModelAtSegmentEndpoint =
+                IsSameWorldView(ModelLocation, NextLerpPosition) &&
+                        ModelLocation.equals(NextLerpPosition);
+        boolean EndpointStallSample =
+                DetectionEligible &&
+                        MovementExpected &&
+                        bMovingThisAction &&
+                        CustomPresentationReady &&
+                        ModelAtSegmentEndpoint &&
+                        !bNewTileMovementStarted;
+        if (EndpointStallSample)
+        {
+            ++ConsecutiveDiagnosticEndpointSamples;
+        }
+        else
+        {
+            ConsecutiveDiagnosticEndpointSamples = 0;
+        }
+        // Two consecutive ClientTicks at the authoritative endpoint filters
+        // the ordinary one-sample handoff while still capturing a visible
+        // 40ms+ run-in-place/position pause.
+        boolean PositionStalled =
+                ConsecutiveDiagnosticEndpointSamples >= 2;
+        String PacingCause = !PositionStalled
+                ? "none"
+                : UnfinishedYellowRoute
+                        ? "route-gap-clamp"
+                        : "active-segment-endpoint-clamp";
+
+        int ControllerAnimation =
+                AnimController == null ||
+                        AnimController.getAnimation() == null
+                        ? NO_ANIMATION
+                        : AnimController.getAnimation().getId();
+        int ControllerFrame =
+                AnimController == null
+                        ? -1
+                        : AnimController.getFrame();
+        int StopIdleAnimation =
+                WalkStopIdleController == null ||
+                        WalkStopIdleController.getAnimation() == null
+                        ? NO_ANIMATION
+                        : WalkStopIdleController.getAnimation().getId();
+        int StopIdleFrame =
+                WalkStopIdleController == null
+                        ? -1
+                        : WalkStopIdleController.getFrame();
+
+        // Snapshot every value now, but defer the expensive formatting until
+        // this sample is actually emitted as part of a confirmed incident.
+        // The lambda captures no handler, actor, client, or RuneLiteObject.
+        int GameCycle = client.getGameCycle();
+        int FrameDelta = CurrentFrameDelta;
+        int ElapsedMilliseconds = MillisecondsSinceTileChange;
+        boolean MovementSelected = bMovingThisAction;
+        boolean ResetAnimation = bResetCurrentAnimation;
+        boolean NewMovementSegment = bNewTileMovementStarted;
+        int MovementDirectionX = RotatedDirectionX;
+        int MovementDirectionY = RotatedDirectionY;
+        int VisibleOrientation = CurrentOrientation;
+        int VisibleTargetOrientation = TargetOrientation;
+        boolean StopIdleControllerActive =
+                bUsingWalkStopIdleController;
+        WorldPoint WorldLocation = CurrentWorldPoint;
+        LocalPoint SegmentStart = LastLerpPosition;
+        LocalPoint SegmentEnd = NextLerpPosition;
+        LocalPoint DrawLocation = NewLocalPointToDraw;
+        WorldPoint RenderedWorldLocation = LastRenderedWorldPoint;
+        int RenderedWorldOffsetX = LastRenderedWorldOffsetX;
+        int RenderedWorldOffsetY = LastRenderedWorldOffsetY;
+        boolean WalkArmed = bWalkStopFacingHoldArmed;
+        boolean WalkObserved = bWalkMovementObserved;
+        boolean WalkStartPending = bWalkStartPendingDuringCatchUp;
+        boolean WalkSegmentAwaiting = bWalkSegmentAwaitingMovement;
+        boolean WalkFacingHeld = bHoldWalkStopFacingThisFrame;
+        boolean ReleasedWalkFacingPreserved =
+                bPreserveReleasedWalkFacing;
+        long LatestWalkClickRevision = WalkClickRevision;
+        long SegmentWalkClickRevision =
+                WalkClickRevisionAtMovementSegment;
+        boolean SegmentFromLatestWalkClick =
+                IsMovementSegmentFromLatestWalkClick(
+                        LatestWalkClickRevision,
+                        SegmentWalkClickRevision);
+        boolean SceneRebasePending = bSceneRebasePending;
+        boolean SceneRecoveryPending = bSceneRecoveryRetargetPending;
+        boolean SceneBridgeActive = bSceneBoundaryBridgeActive;
+        boolean SceneClockActive = bScenePresentationClockActive;
+        boolean SceneFramePending = bSceneLoadFramePresentationPending;
+        int InitializedSceneGeneration =
+                LastInitializedSceneGeneration;
+        boolean ShouldRenderOwner = bShouldRenderOwner;
+        boolean AttemptToRenderOwner = bAttemptToRenderOwner;
+        boolean ProximityOwner =
+                bRenderOriginalOwnerDueToProximity;
+        double ConfiguredMovementMultiplier =
+                config.MovementSpeedMultiplier();
+        double RequestMovementMultiplier =
+                CurrentAnimationRequest == null
+                        ? 1.0
+                        : CurrentAnimationRequest.MovementSpeedMultiplier;
+        double AppliedMovementLeadMultiplier =
+                GetConfiguredMovementLeadMultiplier(
+                        ConfiguredMovementMultiplier);
+        int EndpointSampleCount =
+                ConsecutiveDiagnosticEndpointSamples;
+
+        PlayerFlickerDiagnostics.StateFormatter StateFormatter = () ->
+                String.format(
+                        Locale.ROOT,
+                        "time=%d cycle=%d scene=%d frameDelta=%d elapsed=%d tween=%d animationTween=%d " +
+                                "expected=%s activeSegment=%s unfinishedYellowRoute=%s " +
+                                "movingSelected=%s idleSelected=%s idleEligible=%s positionStalled=%s pacingCause=%s endpointSamples=%d " +
+                                "speed[configured=%.3f request=%.3f appliedLead=%.3f] actionActive=%s discontinuity=%s " +
+                                "request[action=%d pose=%d reset=%s newSegment=%s direction=%d,%d] " +
+                                "native[action=%d frame=%d pose=%d poseFrame=%d orientation=%d targetOrientation=%d] " +
+                                "controller[action=%d frame=%d stopIdle=%d stopIdleFrame=%d stopIdleActive=%s] " +
+                                "position[world=%s owner=%s last=%s next=%s draw=%s route=%s renderedWorld=%s offset=%d,%d model=%s] " +
+                                "yellow[armed=%s observed=%s startPending=%s segmentAwaiting=%s hold=%s preserve=%s clickRevision=%d segmentRevision=%d segmentIsCurrent=%s] " +
+                                "sceneState[rebase=%s recovery=%s bridge=%s clock=%s framePending=%s generation=%d] " +
+                                "presentation[required=%s ready=%s shouldOwner=%s attemptOwner=%s proximityOwner=%s modelExists=%s modelActive=%s modelGeometry=%s modelWorldView=%s]",
+                        SampleTime,
+                        GameCycle,
+                        SceneGeneration,
+                        FrameDelta,
+                        ElapsedMilliseconds,
+                        TweenDuration,
+                        MovementAnimationDuration,
+                        MovementExpected,
+                        ActiveSegment,
+                        UnfinishedYellowRoute,
+                        MovementSelected,
+                        IdleSelected,
+                        IdleDetectionEligible,
+                        PositionStalled,
+                        PacingCause,
+                        EndpointSampleCount,
+                        ConfiguredMovementMultiplier,
+                        RequestMovementMultiplier,
+                        AppliedMovementLeadMultiplier,
+                        ActionAnimationActive,
+                        MovementDiscontinuity,
+                        RequestedActionAnimation,
+                        RequestedPoseAnimation,
+                        ResetAnimation,
+                        NewMovementSegment,
+                        MovementDirectionX,
+                        MovementDirectionY,
+                        OwnerActionAnimation,
+                        OwnerActionFrame,
+                        OwnerPoseAnimation,
+                        OwnerPoseFrame,
+                        VisibleOrientation,
+                        VisibleTargetOrientation,
+                        ControllerAnimation,
+                        ControllerFrame,
+                        StopIdleAnimation,
+                        StopIdleFrame,
+                        StopIdleControllerActive,
+                        WorldLocation,
+                        OwnerLocation,
+                        SegmentStart,
+                        SegmentEnd,
+                        DrawLocation,
+                        RouteDestination,
+                        RenderedWorldLocation,
+                        RenderedWorldOffsetX,
+                        RenderedWorldOffsetY,
+                        ModelLocation,
+                        WalkArmed,
+                        WalkObserved,
+                        WalkStartPending,
+                        WalkSegmentAwaiting,
+                        WalkFacingHeld,
+                        ReleasedWalkFacingPreserved,
+                        LatestWalkClickRevision,
+                        SegmentWalkClickRevision,
+                        SegmentFromLatestWalkClick,
+                        SceneRebasePending,
+                        SceneRecoveryPending,
+                        SceneBridgeActive,
+                        SceneClockActive,
+                        SceneFramePending,
+                        InitializedSceneGeneration,
+                        CustomPresentationRequired,
+                        CustomPresentationReady,
+                        ShouldRenderOwner,
+                        AttemptToRenderOwner,
+                        ProximityOwner,
+                        ModelExists,
+                        ModelActive,
+                        ModelHasGeometry,
+                        ModelInOwnerWorldView);
+
+        PlayerFlickerDiagnostics.Detection Detection =
+                PlayerFlickerRecorder.accept(
+                        new PlayerFlickerDiagnostics.Sample(
+                                SampleMonotonicNanos,
+                                true,
+                                DetectionEligible,
+                                IdleDetectionEligible,
+                                MovementExpected,
+                                MovementSelected,
+                                IdleSelected,
+                                PositionStalled,
+                                CustomPresentationRequired,
+                                CustomPresentationReady,
+                                StateFormatter));
+        if (Detection.openedIncident())
+        {
+            client.addChatMessage(
+                    ChatMessageType.GAMEMESSAGE,
+                    "",
+                    "True Movement: possible flicker #" +
+                            Detection.incidentId +
+                            " recorded (" + Detection.reason + ")",
+                    null);
+        }
+    }
+
+    private boolean IsExclusiveIdlePoseAnimation(int AnimationId)
+    {
+        boolean IdleAnimation =
+                AnimationId != NO_ANIMATION &&
+                        (AnimationId ==
+                                OldAnimationSet.IdlePoseAnimation ||
+                                AnimationId ==
+                                        OldAnimationSet.IdleRotateLeft ||
+                                AnimationId ==
+                                        OldAnimationSet.IdleRotateRight);
+        boolean MovementAlias =
+                AnimationId == OldAnimationSet.WalkAnimation ||
+                        AnimationId == OldAnimationSet.WalkRotateLeft ||
+                        AnimationId == OldAnimationSet.WalkRotateRight ||
+                        AnimationId == OldAnimationSet.WalkRotate180 ||
+                        AnimationId == OldAnimationSet.RunAnimation;
+        return IdleAnimation && !MovementAlias;
+    }
+
     private void RecordLastRenderedLocation(LocalPoint RenderLocation)
     {
         if (RenderLocation == null)
@@ -2345,7 +2856,10 @@ public class CustomMovementHandler
                         MillisecondsSinceTileChange,
                         bMovingThisAction,
                         bWalkStopFacingHoldArmed &&
-                                bWalkMovementObserved,
+                                bWalkMovementObserved &&
+                                IsMovementSegmentFromLatestWalkClick(
+                                        WalkClickRevision,
+                                        WalkClickRevisionAtMovementSegment),
                         bWalkSegmentAwaitingMovement,
                         bHoldWalkStopFacingThisFrame,
                         NextLerpPosition,
@@ -2599,18 +3113,25 @@ public class CustomMovementHandler
 
     private long GetNormalMovementTweenDurationMilliseconds()
     {
-        double RequestSpeedMultiplier =
+        // [TMA-CONTINUOUS-MOVEMENT-SPEED] Authoritative walking/running route
+        // steps arrive on the game-tick clock. Shortening this duration made
+        // the model reach NextLerpPosition early and wait there with its legs
+        // still moving. ApplyTweening now expresses the user-facing
+        // multiplier as bounded progress lead over the ordinary duration.
+        // Animation-specific request multipliers retain their authored
+        // leap/Woox choreography.
+        double RequestMultiplier =
                 CurrentAnimationRequest == null
                         ? 1.0
                         : CurrentAnimationRequest.MovementSpeedMultiplier;
-        double MovementSpeedMultiplier =
-                config.MovementSpeedMultiplier() *
-                        RequestSpeedMultiplier;
-        MovementSpeedMultiplier =
-                Math.max(MovementSpeedMultiplier, 1);
-        return Math.max(1L, (long)
-                (BASE_MOVEMENT_TWEEN_MILLIS /
-                        MovementSpeedMultiplier));
+        return GetRequestMovementTweenDurationMilliseconds(
+                RequestMultiplier);
+    }
+
+    private double GetCurrentMovementLeadMultiplier()
+    {
+        return GetConfiguredMovementLeadMultiplier(
+                config.MovementSpeedMultiplier());
     }
 
     private long GetMovementTweenDurationMilliseconds()
@@ -2648,6 +3169,16 @@ public class CustomMovementHandler
         double TweenValue = 0;
         long TweenDurationMilliseconds =
                 GetMovementTweenDurationMilliseconds();
+        boolean bApplyNormalMovementLead =
+                ShouldApplyContinuousMovementSpeedLead(
+                        CurrentAnimationRequest
+                                .bShouldTeleportToLocation,
+                        bSceneBoundaryBridgeActive,
+                        bSceneRebasePending,
+                        SceneRecoveryTweenDurationOverride,
+                        bSceneRecoveryRetargetPending,
+                        bScenePresentationClockActive,
+                        bSceneLoadFramePresentationPending);
         if (CurrentAnimationRequest.bShouldTeleportToLocation)
         {
             TweenValue = 1.0;
@@ -2671,6 +3202,12 @@ public class CustomMovementHandler
                     0L,
                     TweenDurationMilliseconds,
                     MillisecondsSinceTileChange);
+            if (bApplyNormalMovementLead)
+            {
+                TweenValue = ApplyContinuousMovementSpeedLead(
+                        TweenValue,
+                        GetCurrentMovementLeadMultiplier());
+            }
         }
         else
         {
@@ -2678,6 +3215,12 @@ public class CustomMovementHandler
                     0L,
                     TweenDurationMilliseconds,
                     MillisecondsSinceTileChange);
+            if (bApplyNormalMovementLead)
+            {
+                TweenValue = ApplyContinuousMovementSpeedLead(
+                        TweenValue,
+                        GetCurrentMovementLeadMultiplier());
+            }
         }
 
         NewLocalPointToDraw = new LocalPoint((int) (LastLerpPosition.getX() + (NextLerpPosition.getX() - LastLerpPosition.getX()) * TweenValue),
@@ -3244,6 +3787,7 @@ public class CustomMovementHandler
             // arrived. This clears both an ordinary re-click delay and the
             // first-segment wait carried through a scene rebuild. Recovery
             // tweening alone never clears either state.
+            WalkClickRevisionAtMovementSegment = WalkClickRevision;
             bWalkSegmentAwaitingMovement = false;
             bWalkStartPendingDuringCatchUp = false;
         }

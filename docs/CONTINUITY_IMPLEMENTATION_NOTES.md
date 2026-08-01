@@ -169,6 +169,87 @@ moves directly into the normal preserved-facing state while keeping the new
 route armed. A click during an already released state still cannot resurrect an
 old controller.
 
+`[TMA-YELLOW-RECLICK-ROUTE-GRACE]` covers the same publication ordering while
+an ordinary movement segment is still active. The focused recorder captured a
+new yellow destination appearing at 533 ms of the old segment. Because the old
+segment had not yet reached 600 ms, it was not marked as awaiting movement.
+When it completed, the newer destination was mistaken for continuation of the
+old route and the 300 ms route-gap grace played locomotion at a stationary
+endpoint from roughly 630 through 891 ms.
+
+Each yellow click now receives a revision. A movement segment records the
+latest revision only when RuneScape actually publishes that segment. Route-gap
+animation grace is permitted only when those revisions match. A mid-segment
+re-click therefore leaves the already-visible segment untouched, but if that
+segment finishes before a newer one arrives, the existing stable idle/facing
+handoff owns the endpoint instead of stale locomotion. The first genuine new
+segment clears the wait immediately. Red interactions still cancel the whole
+yellow-click state, and no route position is predicted or extrapolated.
+
+## `[TMA-CONTINUOUS-MOVEMENT-SPEED]`: do not arrive before the route clock
+
+### Cause
+
+`Movement Speed Multiplier` used to shorten the positional tween from the
+normal 600 ms route-step interval. Animation selection and route publication
+still followed the 600 ms game-tick clock. The visible model therefore reached
+the authoritative segment endpoint early, stayed on that exact point, and
+continued playing locomotion until the next route step arrived.
+
+The size of that stationary interval was deterministic. With an ordinary
+request multiplier of 1.0, settings 1.1, 1.2, and 1.3 completed position at
+approximately 545, 500, and 461 ms, leaving about 55, 100, and 139 ms of
+running or walking in place. Running commonly publishes a two-tile segment,
+which made the pause appear every second or third tile.
+
+There is no safe way to sustain a visible speed above RuneScape's
+authoritative route publication rate. At the end of the known `Last -> Next`
+segment, the plugin must either wait for RuneScape or predict an unpublished
+tile. Predicting toward the final clicked destination previously caused wall
+crossing, corner cutting, and movement onto interaction objects, so it is not
+used here.
+
+### Fix
+
+Ordinary route segments keep their complete 600 ms clock. The user-facing
+multiplier now produces a bounded lead *inside* that known segment:
+
+`f(t) = t + k * t^2 * (1 - t)^2`
+
+The curve is deliberately constrained:
+
+- `1.0` is exactly normal progress;
+- values above `1.0` keep the model closer to the true tile during the middle
+  of the segment;
+- every rendered point remains between the two authoritative endpoints;
+- progress stays monotonic and cannot reach `Next` before 600 ms;
+- the added lead has normal velocity at both endpoints, so consecutive linear
+  movement segments join without a stop or speed jump; and
+- the effective lead is capped at 1.75, keeping the curve strictly monotonic
+  even if a larger value is entered manually.
+
+The animation-request multipliers used by optional leap, Woox-walk, and
+tick-perfect animations remain separate. Those values are authored
+choreography and retain their existing `600 / request multiplier` duration;
+folding them into the new cap would make distinct jump animations travel at
+the same rate and could desynchronise their landing frames.
+
+Teleport snaps, scene-boundary bridging, scene rebase/recovery, and the scene
+presentation clock retain their specialised timing and bypass this curve. The
+unfinished-route animation grace is also retained because captures proved it
+prevents real `run -> idle -> run` seams when the next route segment is
+published late. The opt-in recorder distinguishes that separate
+`route-gap-clamp` case from an ordinary active-segment endpoint clamp, so it
+can be changed from evidence rather than by reopening the earlier flicker bug.
+
+### Maintenance invariant
+
+Do not restore multiplication of the user setting into positional duration or
+extrapolate toward `client.getLocalDestinationLocation()`. A user movement
+speed adjustment must stay inside the currently published segment and must not
+arrive at its endpoint before the authoritative route-step clock. Preserve
+animation-request timing unless that animation is being deliberately retuned.
+
 ## `[TMA-MOTION-CONTINUITY]`: use the last displayed state at handoff
 
 ### Cause
@@ -436,11 +517,94 @@ original investigations:
   corrections were plugin-side and which pauses contained no drawable client
   frame at all.
 
-The instrumentation and its temporary chat correlation marker were removed
-after the investigations. Production therefore performs no continuity-specific
-diagnostic state tracking, model inspection, chat output, or log formatting.
-The conclusions below are retained because they explain the otherwise
-non-obvious timing bounds in production code.
+Those investigation-specific instruments and their temporary area-load chat
+marker were removed. They are not part of normal production execution. The
+conclusions below are retained because they explain the otherwise non-obvious
+timing bounds in production code.
+
+### Opt-in player flicker recorder
+
+`[TMA-PLAYER-FLICKER-DIAGNOSTICS]` is a separate, disabled-by-default tool for
+the remaining rare one-frame player interruption. It exists because recording
+at 60 fps showed a visual `run -> idle -> run` seam which is too brief to
+identify reliably from a report made after the route has finished.
+
+The recorder does not alter movement or rendering. Its safety boundary is
+deliberate:
+
+- `TrueTileMovementPlugin.onClientTick` is its only live sampling point;
+- `CustomMovementHandler` reads the native actor and custom `RuneLiteObject`
+  only there, while the scene is stable;
+- the recorder itself receives immutable copied/value snapshots and has no
+  access to live actors, the client, or `RuneLiteObject`; and
+- render callbacks and overlays never inspect a `RuneLiteObject` for this
+  diagnostic. This avoids the crash previously caused by reading a scene-owned
+  object while RuneLite was replacing it.
+
+The detector derives expected movement independently from the selected
+animation. A same-scene interpolation segment is expected to move until its
+tween ends; an observed yellow-click route with a different published
+destination is also expected to continue while it is not waiting for its first
+authoritative segment. This independence matters: using
+`bMovingThisAction` as both the expected value and the value under test would
+hide the exact idle-selection bug being investigated.
+
+A single suspicious sample is not reported immediately. It becomes an
+incident only when movement/custom presentation recovers within the next few
+client ticks (`moving -> suspicious -> moving`), or when the bad state persists
+for three samples. Genuine route completion, stop-facing handoffs, new-click
+first-segment waits, teleports/special movement, scene rebase/recovery, loading,
+hopping, renderer fallback, and logout cancel the candidate. During a real
+spell/attack/eat animation, native idle-pose fields are not considered proof of
+a flicker, but a missing custom presentation is still reportable. This keeps
+combat visibility failures observable without misclassifying the action itself
+as idle. A three-second monotonic cooldown and a single active post-window
+prevent one visual interruption from producing repeated messages.
+
+When `(Debug) Auto-Log Player Flickers` is enabled, a confirmed incident:
+
+- writes up to 12 pre-trigger samples, the candidate/confirmation, and 20
+  post-trigger samples under `[PlayerFlickerTrace]`;
+- records animation requests and frames, interpolation timing and endpoints,
+  route state, orientations, scene-continuity state, and native/custom render
+  authority; and
+- posts `True Movement: possible flicker #N recorded` locally. The same
+  `incident=N` appears in the debug log, so the player can identify and export
+  the exact event they saw.
+
+The recorder recognises three independent incident reasons:
+
+- `idle-selected-during-movement` for a locomotion-to-idle/turn selection seam;
+- `custom-presentation-missing` when the custom model should own the frame but
+  is not ready; and
+- `position-stalled-during-movement` when locomotion remains selected while
+  the model stays at the current segment endpoint for at least two consecutive
+  client ticks (roughly 40 ms or longer).
+
+For a positional stall, the trace includes the configured multiplier, request
+multiplier, applied lead, consecutive endpoint samples, and `pacingCause`.
+`route-gap-clamp` means the bounded unfinished-yellow-route grace owns the
+animation after a completed segment; `active-segment-endpoint-clamp` means the
+ordinary segment clock still considers movement active. This keeps the
+diagnostic useful for both the default setting and values such as 1.1, 1.2,
+and 1.3 without logging every frame.
+
+The yellow-route fields also include the latest click revision, the revision
+owned by the displayed movement segment, and whether they match. This makes a
+future stale re-click handoff distinguishable from a delayed segment belonging
+to an unchanged long route.
+
+The option is diagnostic and should be turned off after evidence is collected;
+when disabled it performs no per-tick snapshot formatting or model inspection.
+When enabled, the rolling samples retain copied values and a lazy formatter;
+the relatively expensive human-readable log line is built only after an
+incident is confirmed, not on every client tick.
+
+Sampling is intentionally limited to `ClientTick` for thread safety. A visual
+frame that begins and ends entirely between two client ticks can therefore be
+missed. The numbered chat marker is the explicit confirmation that the
+detector captured a reported visual event; no marker means the log should not
+be assumed to contain that particular flicker.
 
 The first full capture set contained 72 unfinished-route idle transitions.
 They consistently occurred just after a 600 ms movement segment expired:

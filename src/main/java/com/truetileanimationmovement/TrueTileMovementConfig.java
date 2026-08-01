@@ -117,7 +117,7 @@ public interface TrueTileMovementConfig extends Config
 	@ConfigItem(
 			keyName = "MovementSpeedMultiplier",
 			name = "Movement Speed Multiplier",
-			description = "Movement speed multiplier (increase value from 1.0 to match the true tile more but increase jank)",
+			description = "Biases the visible player closer to the true tile while keeping continuous movement between authoritative route steps",
 			section = advancedSection
 	)
 	default double MovementSpeedMultiplier()
@@ -337,6 +337,17 @@ public interface TrueTileMovementConfig extends Config
 			section = advancedSection
 	)
 	default boolean PrintCurrentAnimationIDsToChat()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "AutoLogPlayerFlickers",
+			name = "(Debug) Auto-Log Player Flickers",
+			description = "Records bounded movement context and posts a numbered chat message when a possible player flicker is detected",
+			section = advancedSection
+	)
+	default boolean AutoLogPlayerFlickers()
 	{
 		return false;
 	}

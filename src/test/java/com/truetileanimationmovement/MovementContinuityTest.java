@@ -4,6 +4,7 @@ import net.runelite.api.GameState;
 import net.runelite.api.coords.LocalPoint;
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -130,18 +131,32 @@ public class MovementContinuityTest
 						true,
 						SegmentDestination,
 						RouteDestination));
-		assertTrue(CustomMovementHandler
-				.ShouldAwaitFreshWalkMovementSegment(
-						600,
-						600,
-						false,
-						false));
 		assertFalse(CustomMovementHandler
-				.ShouldAwaitFreshWalkMovementSegment(
+				.IsMovementSegmentFromLatestWalkClick(2, 1));
+		assertTrue(CustomMovementHandler
+				.IsMovementSegmentFromLatestWalkClick(2, 2));
+
+		assertTrue(CustomMovementHandler
+				.IsVisibleMovementSegmentInProgress(
+						true,
 						599,
 						600,
-						false,
-						false));
+						new LocalPoint(1280, 2560, 0),
+						new LocalPoint(1536, 2560, 0)));
+		assertFalse(CustomMovementHandler
+				.IsVisibleMovementSegmentInProgress(
+						true,
+						600,
+						600,
+						new LocalPoint(1280, 2560, 0),
+						new LocalPoint(1536, 2560, 0)));
+		assertFalse(CustomMovementHandler
+				.IsVisibleMovementSegmentInProgress(
+						true,
+						599,
+						600,
+						SegmentDestination,
+						SegmentDestination));
 	}
 
 	@Test
@@ -235,6 +250,138 @@ public class MovementContinuityTest
 				.IsGpuCallbackStillSupported(
 						GameState.LOADING,
 						500));
+	}
+
+	@Test
+	public void movementSpeedLeadNeverCreatesAnEndpointPlateau()
+	{
+		double[] Multipliers = {1.0, 1.1, 1.2, 1.3, 2.0, 3.0};
+		for (double Multiplier : Multipliers)
+		{
+			double PreviousProgress = -1.0;
+			for (int Milliseconds = 0;
+				 Milliseconds <= 600;
+				 ++Milliseconds)
+			{
+				double BaseProgress = Milliseconds / 600.0;
+				double Progress = CustomMovementHandler
+						.ApplyContinuousMovementSpeedLead(
+								BaseProgress,
+								Multiplier);
+				assertTrue(Progress >= PreviousProgress);
+				if (Milliseconds > 0)
+				{
+					assertTrue(Progress > PreviousProgress);
+				}
+				assertTrue(Progress >= BaseProgress);
+				if (Milliseconds < 600)
+				{
+					assertTrue(Progress < 1.0);
+				}
+				PreviousProgress = Progress;
+			}
+			assertEquals(1.0, PreviousProgress, 0.0);
+		}
+	}
+
+	@Test
+	public void movementSpeedLeadJoinsSegmentsAtNativeVelocity()
+	{
+		double SmallPhase = 0.000001;
+		double Multiplier = 1.75;
+		double StartSlope = CustomMovementHandler
+				.ApplyContinuousMovementSpeedLead(
+						SmallPhase,
+						Multiplier) / SmallPhase;
+		double EndSlope =
+				(1.0 - CustomMovementHandler
+						.ApplyContinuousMovementSpeedLead(
+								1.0 - SmallPhase,
+								Multiplier)) /
+						SmallPhase;
+
+		assertEquals(1.0, StartSlope, 0.00001);
+		assertEquals(1.0, EndSlope, 0.00001);
+		assertTrue(CustomMovementHandler
+				.ApplyContinuousMovementSpeedLead(
+						0.5,
+						1.3) > 0.5);
+	}
+
+	@Test
+	public void movementSpeedLeadIsBoundedWithoutChangingRequestChoreography()
+	{
+		assertEquals(1.3, CustomMovementHandler
+				.GetConfiguredMovementLeadMultiplier(1.3), 0.0);
+		assertEquals(1.75, CustomMovementHandler
+				.GetConfiguredMovementLeadMultiplier(3.0), 0.0);
+		assertEquals(1.0, CustomMovementHandler
+				.GetConfiguredMovementLeadMultiplier(0.5), 0.0);
+		assertEquals(1.0, CustomMovementHandler
+				.GetConfiguredMovementLeadMultiplier(Double.NaN), 0.0);
+
+		assertEquals(600, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(1.0));
+		assertEquals(400, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(1.5));
+		assertEquals(300, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(2.0));
+		assertEquals(200, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(3.0));
+		assertEquals(600, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(Double.NaN));
+		assertEquals(600, CustomMovementHandler
+				.GetRequestMovementTweenDurationMilliseconds(
+						Double.POSITIVE_INFINITY));
+
+		double ProgressAt599 = CustomMovementHandler
+				.ApplyContinuousMovementSpeedLead(
+						599.0 / 600.0,
+						3.0);
+		int From = 1280;
+		int To = 1536;
+		int Draw = (int) (From + (To - From) * ProgressAt599);
+		assertTrue(Draw >= From);
+		assertTrue(Draw < To);
+		assertEquals(0.0, CustomMovementHandler
+				.ApplyContinuousMovementSpeedLead(Double.NaN, 1.3), 0.0);
+	}
+
+	@Test
+	public void movementSpeedLeadBypassesSpecialSceneTiming()
+	{
+		assertTrue(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, false, 0,
+						false, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						true, false, false, 0,
+						false, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, true, false, 0,
+						false, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, true, 0,
+						false, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, false, 450,
+						false, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, false, 0,
+						true, false, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, false, 0,
+						false, true, false));
+		assertFalse(CustomMovementHandler
+				.ShouldApplyContinuousMovementSpeedLead(
+						false, false, false, 0,
+						false, false, true));
 	}
 
 }
