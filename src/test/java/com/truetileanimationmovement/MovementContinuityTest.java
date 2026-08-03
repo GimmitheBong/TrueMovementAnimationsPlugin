@@ -160,6 +160,46 @@ public class MovementContinuityTest
 	}
 
 	@Test
+	public void activeMovementReclickPreservesOnlyThePublicationSeam()
+	{
+		LocalPoint SegmentStart =
+				new LocalPoint(1280, 2560, 0);
+		LocalPoint SegmentEnd =
+				new LocalPoint(1536, 2560, 0);
+
+		// The captured failure reached 609 ms on the old segment while the new
+		// yellow click was still waiting for its first published segment.
+		assertTrue(CustomMovementHandler
+				.ShouldPreservePendingReclickMovementPose(
+						609,
+						600,
+						true,
+						true,
+						true,
+						true,
+						4,
+						3,
+						SegmentStart,
+						SegmentEnd));
+		// A click made after visible movement stopped still uses stable idle,
+		// which preserves the earlier running-on-the-spot correction.
+		assertFalse(CustomMovementHandler
+				.ShouldPreservePendingReclickMovementPose(
+						609, 600, true, false, true, true,
+						4, 3, SegmentStart, SegmentEnd));
+		// The handoff is bounded and cannot sustain locomotion at an endpoint.
+		assertFalse(CustomMovementHandler
+				.ShouldPreservePendingReclickMovementPose(
+						650, 600, true, true, true, true,
+						4, 3, SegmentStart, SegmentEnd));
+		// Once a segment for the newest click exists, ordinary movement owns it.
+		assertFalse(CustomMovementHandler
+				.ShouldPreservePendingReclickMovementPose(
+						609, 600, true, true, true, true,
+						4, 4, SegmentStart, SegmentEnd));
+	}
+
+	@Test
 	public void proximityHandoffOccursOnlyAtStableIdle()
 	{
 		assertTrue(CustomMovementHandler
@@ -233,6 +273,46 @@ public class MovementContinuityTest
 						808,
 						808,
 						true));
+	}
+
+	@Test
+	public void invalidPoseFrameReusesOnlyTheSameAnimationsLastValidFrame()
+	{
+		assertEquals(5, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, -1, 1661, 1661, 5, 8, 0, false, false));
+		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, -1, 1661, 1660, 5, 8, 0, false, false));
+		assertEquals(5, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, -2, 1661, 1661, 5, 8, 0, false, false));
+		assertEquals(3, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 3, 1661, 1661, 5, 8, 0, false, false));
+		// Directional locomotion variants deliberately keep phase when their
+		// animation IDs change, preventing route-segment frame-zero resets.
+		assertEquals(3, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 3, 1660, 1661, 3, 8, 0, false, false));
+		// The same valid locomotion frame is not reused as idle specifically
+		// during the stationary yellow-stop catch-up handoff.
+		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 3, 808, 1661, 3, 12, 0, false, true));
+		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 3, 1661, 1661, 5, 8, 0, true, false));
+		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 8, 1661, 1661, 5, 8, 0, false, false));
+	}
+
+	@Test
+	public void stationaryIdleRestartIsLimitedToTheNativeLocomotionMismatch()
+	{
+		assertTrue(CustomMovementHandler.ShouldRestartStationaryIdlePose(
+				false, -1, 1661, 808, 808));
+		assertFalse(CustomMovementHandler.ShouldRestartStationaryIdlePose(
+				true, -1, 1661, 808, 808));
+		assertFalse(CustomMovementHandler.ShouldRestartStationaryIdlePose(
+				false, 422, 1661, 808, 808));
+		assertFalse(CustomMovementHandler.ShouldRestartStationaryIdlePose(
+				false, -1, 1661, 1660, 808));
+		assertFalse(CustomMovementHandler.ShouldRestartStationaryIdlePose(
+				false, -1, 808, 808, 808));
 	}
 
 	@Test

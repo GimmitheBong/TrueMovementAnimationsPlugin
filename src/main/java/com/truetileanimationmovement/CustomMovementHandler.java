@@ -1,14 +1,17 @@
 package com.truetileanimationmovement;
 
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 
 import javax.inject.Inject;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashSet;
-import java.util.Locale;
 import java.util.Set;
 
+@Slf4j
 public class CustomMovementHandler
 {
     private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
@@ -49,20 +52,38 @@ public class CustomMovementHandler
     // completed segment, so this cannot extrapolate through scenery or move
     // the model onto an interaction object.
     private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 300;
+    // [TMA-PENDING-RECLICK-POSE-HANDOFF] A yellow click made during an
+    // already-visible segment can be acknowledged one ClientTick before the
+    // replacement segment is published. Preserve locomotion for only that
+    // tiny publication seam. This is intentionally much shorter than route
+    // grace so an unavailable destination cannot revive running in place.
+    private static final int PENDING_RECLICK_POSE_GRACE_MILLIS = 50;
     // [TMA-STOP-FACING-SETTLE] Reaching the final tile and settling the
     // native actor's facing are separate client events. Give the hidden
     // actor one game tick with no orientation changes before a later target
     // orientation is treated as a genuinely new facing command.
     private static final int WALK_STOP_NATIVE_FACING_SETTLE_MILLIS =
             Constants.GAME_TICK_LENGTH;
+    private static final int STOP_IDLE_TRACE_PRE_SAMPLES = 8;
+    private static final int STOP_IDLE_TRACE_POST_SAMPLES = 10;
+    private static final int STOP_IDLE_TRACE_MODEL_VERTEX_SAMPLES = 96;
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
     private final TrueTileMovementConfig config;
-    // Created only for the local player while the opt-in diagnostic is on;
-    // NPC handlers and normal plugin use carry no recorder allocation.
-    private PlayerFlickerDiagnostics PlayerFlickerRecorder = null;
-    private int ConsecutiveDiagnosticEndpointSamples = 0;
+    // [TMA-VALID-POSE-FRAME-PUBLICATION] RuneLite can briefly publish pose
+    // frame -1 at a locomotion handoff while leaving the animation ID intact.
+    // Remember the last drawable frame for that same pose so Owner.getModel()
+    // is never asked to build the visible character from an invalid frame.
+    private int LastValidOwnerPoseAnimation = NO_ANIMATION;
+    private int LastValidOwnerPoseFrame = 0;
+    // [TMA-STOP-IDLE-DIAGNOSTICS] Opt-in, client-thread-only snapshots. The
+    // render callback never reads a RuneLiteObject for diagnostics.
+    private final Deque<String> StopIdleTraceHistory = new ArrayDeque<>();
+    private boolean bStopIdleTraceInitialized = false;
+    private boolean bStopIdleTraceLastMoving = false;
+    private int StopIdleTracePostSamplesRemaining = 0;
+    private int StopIdleTraceEvent = 0;
     TrueMovementOverlay overlay;
 
     // Time management
@@ -74,12 +95,6 @@ public class CustomMovementHandler
     // Runelite object management
     public Actor Owner = null;
     public AnimationController AnimController = null; // Used to blend additional animations
-    // [TMA-IDLE-CATCH-UP] The hidden player is still using a locomotion clock
-    // after the visible model stops. A separate idle controller prevents that
-    // faster clock from driving the visible breathing/head-turn pose.
-    private AnimationController WalkStopIdleController = null;
-    private int LastWalkStopIdleGameCycle = -1;
-    private boolean bUsingWalkStopIdleController = false;
     public RuneLiteObject Model = null;
 
     // Targeting
@@ -175,6 +190,7 @@ public class CustomMovementHandler
     private boolean bWalkMovementObserved = false;
     private boolean bWalkStartPendingDuringCatchUp = false;
     private boolean bWalkSegmentAwaitingMovement = false;
+    private boolean bWalkReclickOccurredDuringVisibleMovement = false;
     private boolean bPreserveReleasedWalkFacing = false;
     private boolean bHoldWalkStopFacingThisFrame = false;
     private boolean bNativeWalkFacingSettled = false;
@@ -868,8 +884,13 @@ public class CustomMovementHandler
             AnimController = new AnimationController(client, NO_ANIMATION);
             AnimController.setOnFinished((AnimationController InController) ->
             {
-                // Reset animation (loop)
-                InController.setFrame(0);
+                // [TMA-NATIVE-ANIMATION-LOOPS] Animation frame 0 may be a
+                // one-time lead-in. RuneLite's loop() honours frameStep and
+                // returns to the sequence's authored loop point. Forcing 0
+                // can replay that lead-in and seam controller-driven action or
+                // locomotion cycles. (Native idle 808 has no authored loop
+                // point and is documented separately.)
+                InController.loop();
                 bTargetWasKilled = false;
             });
         }
@@ -878,6 +899,8 @@ public class CustomMovementHandler
         {
             RuneLiteObject OldModel = Model;
             Model = client.createRuneLiteObject();
+            LastValidOwnerPoseAnimation = NO_ANIMATION;
+            LastValidOwnerPoseFrame = 0;
 
             if (OldModel != null)
             {
@@ -897,8 +920,9 @@ public class CustomMovementHandler
                     cameraModelAnimController = new AnimationController(client, NO_ANIMATION);
                     cameraModelAnimController.setOnFinished((AnimationController InController) ->
                     {
-                        // Reset animation (loop)
-                        InController.setFrame(0);
+                        // Keep auxiliary model loops consistent with the
+                        // animation's authored frameStep as well.
+                        InController.loop();
                     });
                 }
 
@@ -948,8 +972,6 @@ public class CustomMovementHandler
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
         CancelWalkStopFacingHold();
-        ReleaseWalkStopIdleController(false);
-        WalkStopIdleController = null;
         bSceneRebasePending = false;
         bSceneRecoveryRetargetPending = false;
         bSceneBoundaryBridgeActive = false;
@@ -960,6 +982,8 @@ public class CustomMovementHandler
         SceneRecoveryTweenDurationOverride = 0;
         bNativeSceneLoadHandoffPresented = false;
         bLastSceneRebaseUsedNativeHandoffAnchor = false;
+        LastValidOwnerPoseAnimation = NO_ANIMATION;
+        LastValidOwnerPoseFrame = 0;
         if (AnimController != null)
         {
             AnimController = null;
@@ -1049,6 +1073,8 @@ public class CustomMovementHandler
         bWalkStartPendingDuringCatchUp =
                 bContinueActiveCatchUp ||
                         bVisibleMovementSegmentInProgress;
+        bWalkReclickOccurredDuringVisibleMovement =
+                bVisibleMovementSegmentInProgress;
         // If the previous route is already preserving its released facing,
         // keep that stable during the short click-to-movement delay. A click
         // during a genuinely moving segment also retains its observed state
@@ -1063,6 +1089,7 @@ public class CustomMovementHandler
         bWalkMovementObserved = false;
         bWalkStartPendingDuringCatchUp = false;
         bWalkSegmentAwaitingMovement = false;
+        bWalkReclickOccurredDuringVisibleMovement = false;
         bPreserveReleasedWalkFacing = false;
         bHoldWalkStopFacingThisFrame = false;
         bNativeWalkFacingSettled = false;
@@ -1159,7 +1186,7 @@ public class CustomMovementHandler
         // destination before the client publishes its authoritative movement
         // segment. During that delay, IsAtFinalWalkDestination() is false even
         // though the visible model is stopped. Keep the existing facing and
-        // idle controller until movement genuinely begins.
+        // native pose presentation until movement genuinely begins.
         if (ShouldHoldPendingWalkStart(
                 bWalkStartPendingDuringCatchUp,
                 bWalkStopFacingHoldArmed,
@@ -1201,6 +1228,7 @@ public class CustomMovementHandler
         bWalkStopFacingHoldArmed = RetainPendingWalkArm;
         bWalkMovementObserved = false;
         bWalkStartPendingDuringCatchUp = false;
+        bWalkReclickOccurredDuringVisibleMovement = false;
         bPreserveReleasedWalkFacing = true;
         bNativeWalkFacingSettled = false;
         NativeTargetOrientationAtWalkFacingRelease =
@@ -1289,38 +1317,120 @@ public class CustomMovementHandler
                 !SegmentStart.equals(SegmentEnd);
     }
 
-    static boolean ShouldUseWalkStopIdleController(
-            boolean AlreadyUsingIdleController,
-            boolean HoldFacingThisFrame,
-            boolean CatchUpStillActive,
-            boolean MovementWasObserved,
-            int OwnerActionAnimation,
-            int IdlePoseAnimation)
+    static boolean ShouldPreservePendingReclickMovementPose(
+            int MillisecondsSinceTileChange,
+            long MovementTweenDurationMilliseconds,
+            boolean PreviousFrameSelectedMovement,
+            boolean ReclickOccurredDuringVisibleMovement,
+            boolean WalkStartPending,
+            boolean WalkSegmentAwaitingMovement,
+            long LatestWalkClickRevision,
+            long MovementSegmentWalkClickRevision,
+            LocalPoint SegmentStart,
+            LocalPoint SegmentEnd)
     {
-        // [TMA-IDLE-HANDOFF-CONTINUITY] Once the controller owns the visible
-        // idle pose, retain it for the full facing hold. Positional catch-up
-        // can finish before the native orientation/pose state settles; handing
-        // back at that intermediate point exposes the hidden locomotion phase
-        // and makes idle frames race forward. AlreadyUsing prevents a new
-        // click from constructing a stale controller after it was released.
-        return HoldFacingThisFrame &&
-                (AlreadyUsingIdleController ||
-                        (CatchUpStillActive &&
-                                MovementWasObserved)) &&
-                OwnerActionAnimation == -1 &&
-                IdlePoseAnimation != -1;
+        return PreviousFrameSelectedMovement &&
+                IsPendingReclickMovementHandoff(
+                        MillisecondsSinceTileChange,
+                        MovementTweenDurationMilliseconds,
+                        ReclickOccurredDuringVisibleMovement,
+                        WalkStartPending,
+                        WalkSegmentAwaitingMovement,
+                        LatestWalkClickRevision,
+                        MovementSegmentWalkClickRevision,
+                        SegmentStart,
+                        SegmentEnd) &&
+                MillisecondsSinceTileChange <
+                        MovementTweenDurationMilliseconds +
+                                PENDING_RECLICK_POSE_GRACE_MILLIS;
     }
 
-    private boolean TrySetModel(
-            net.runelite.api.Model SourceModel)
+    private static boolean IsPendingReclickMovementHandoff(
+            int MillisecondsSinceTileChange,
+            long MovementTweenDurationMilliseconds,
+            boolean ReclickOccurredDuringVisibleMovement,
+            boolean WalkStartPending,
+            boolean WalkSegmentAwaitingMovement,
+            long LatestWalkClickRevision,
+            long MovementSegmentWalkClickRevision,
+            LocalPoint SegmentStart,
+            LocalPoint SegmentEnd)
+    {
+        return ReclickOccurredDuringVisibleMovement &&
+                WalkStartPending &&
+                WalkSegmentAwaitingMovement &&
+                !IsMovementSegmentFromLatestWalkClick(
+                        LatestWalkClickRevision,
+                        MovementSegmentWalkClickRevision) &&
+                MillisecondsSinceTileChange >=
+                        MovementTweenDurationMilliseconds &&
+                IsSameWorldView(SegmentStart, SegmentEnd) &&
+                !SegmentStart.equals(SegmentEnd);
+    }
+
+    static int SelectPoseFrameForPublication(
+            int CurrentPoseAnimation,
+            int CurrentPoseFrame,
+            int RequestedPoseAnimation,
+            int LastValidPoseAnimation,
+            int LastValidPoseFrame,
+            int AnimationFrameCount,
+            int StartingFrame,
+            boolean ResetRequested,
+            boolean ForceRequestedEntryFrame)
+    {
+        if (!ResetRequested &&
+                !ForceRequestedEntryFrame &&
+                CurrentPoseFrame >= 0 &&
+                CurrentPoseFrame < AnimationFrameCount)
+        {
+            return CurrentPoseFrame;
+        }
+
+        if (!ResetRequested &&
+                !ForceRequestedEntryFrame &&
+                CurrentPoseFrame < 0 &&
+                CurrentPoseAnimation == RequestedPoseAnimation &&
+                LastValidPoseAnimation == RequestedPoseAnimation &&
+                LastValidPoseFrame >= 0 &&
+                LastValidPoseFrame < AnimationFrameCount)
+        {
+            return LastValidPoseFrame;
+        }
+
+        return StartingFrame >= 0 &&
+                StartingFrame < AnimationFrameCount
+                ? StartingFrame
+                : 0;
+    }
+
+    static boolean ShouldRestartStationaryIdlePose(
+            boolean Moving,
+            int OwnerActionAnimation,
+            int CurrentPoseAnimation,
+            int RequestedPoseAnimation,
+            int IdlePoseAnimation)
+    {
+        // [TMA-STATIONARY-IDLE-ENTRY] The hidden actor can still publish a
+        // locomotion pose after the responsive custom model has stopped. This
+        // happens after both yellow movement and red-click approaches, so the
+        // correction is keyed to the actual stationary run-to-idle mismatch,
+        // not to click colour. Directional walk/run changes remain untouched
+        // because cross-animation phase is rejected only after movement ends.
+        return !Moving &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                IdlePoseAnimation != NO_ANIMATION &&
+                RequestedPoseAnimation == IdlePoseAnimation &&
+                CurrentPoseAnimation != RequestedPoseAnimation;
+    }
+
+    private boolean TrySetModel(net.runelite.api.Model SourceModel)
     {
         if (SourceModel == null)
         {
             return false;
         }
-
-        net.runelite.api.Model MergedModel =
-                client.mergeModels(SourceModel);
+        net.runelite.api.Model MergedModel = client.mergeModels(SourceModel);
         if (MergedModel == null)
         {
             return false;
@@ -1328,124 +1438,6 @@ public class CustomMovementHandler
 
         Model.setModel(MergedModel);
         return true;
-    }
-
-    private boolean RenderWalkStopIdleAnimation()
-    {
-        int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
-        boolean bShouldUseWalkStopIdleController =
-                ShouldUseWalkStopIdleController(
-                bUsingWalkStopIdleController,
-                bHoldWalkStopFacingThisFrame,
-                bWalkStopFacingHoldArmed,
-                bWalkMovementObserved,
-                Owner.getAnimation(),
-                IdlePoseAnimation);
-        if (!bShouldUseWalkStopIdleController)
-        {
-            ReleaseWalkStopIdleController(true);
-            return false;
-        }
-
-        Animation IdleAnimation = client.loadAnimation(IdlePoseAnimation);
-        if (IdleAnimation == null)
-        {
-            ReleaseWalkStopIdleController(false);
-            return false;
-        }
-
-        int CurrentGameCycle = client.getGameCycle();
-        int NativePoseAnimation = Owner.getPoseAnimation();
-        int NativePoseFrame = Owner.getPoseAnimationFrame();
-        if (!bUsingWalkStopIdleController ||
-                WalkStopIdleController == null ||
-                WalkStopIdleController.getAnimation() == null ||
-                WalkStopIdleController.getAnimation().getId() != IdlePoseAnimation)
-        {
-            // [TMA-IDLE-CATCH-UP] Each genuine stop gets its own idle clock.
-            // Reusing the previous stop's controller made the model snap back
-            // to an unrelated old frame when catch-up began again.
-            WalkStopIdleController =
-                    new AnimationController(client, IdleAnimation);
-            int NativeIdleFrame =
-                    NativePoseAnimation == IdlePoseAnimation
-                            ? NativePoseFrame
-                            : 0;
-            if (NativeIdleFrame >= 0 &&
-                    NativeIdleFrame < IdleAnimation.getNumFrames())
-            {
-                WalkStopIdleController.setFrame(NativeIdleFrame);
-            }
-            LastWalkStopIdleGameCycle = CurrentGameCycle;
-        }
-        else if (LastWalkStopIdleGameCycle >= 0 &&
-                CurrentGameCycle >= LastWalkStopIdleGameCycle)
-        {
-            WalkStopIdleController.tick(
-                    CurrentGameCycle - LastWalkStopIdleGameCycle);
-            LastWalkStopIdleGameCycle = CurrentGameCycle;
-        }
-        else
-        {
-            LastWalkStopIdleGameCycle = CurrentGameCycle;
-        }
-
-        // Build an unposed equipment model, then apply the independent idle
-        // controller. AnimationController supplies RuneLite's packed
-        // interpolation frame whenever Animation Smoothing is enabled. The
-        // hidden actor can continue advancing its locomotion animation while
-        // it catches up, so its pose is deliberately not used as the source.
-        SetAllIdlePosesNoAnimation();
-        Owner.setPoseAnimation(NO_ANIMATION);
-        Owner.setPoseAnimationFrame(0);
-        net.runelite.api.Model OwnerModel = Owner.getModel();
-        if (OwnerModel == null ||
-                !TrySetModel(
-                        WalkStopIdleController.animate(
-                                OwnerModel)))
-        {
-            // [TMA-STEADY-PRESENTATION] A transient native model miss must
-            // not replace the last valid custom frame with null. Restore the
-            // ordinary animation fields and let the fallback branch below
-            // retry on the next rendered frame.
-            SetAllIdlePosesDefault();
-            ReleaseWalkStopIdleController(false);
-            return false;
-        }
-
-        bUsingWalkStopIdleController = true;
-        bResetCurrentAnimation = false;
-        CurrentPoseAnimation = NO_ANIMATION;
-        return true;
-    }
-
-    private void ReleaseWalkStopIdleController(
-            boolean PreserveIdlePhase)
-    {
-        if (!bUsingWalkStopIdleController)
-        {
-            return;
-        }
-
-        // [TMA-IDLE-CATCH-UP] Hand the final idle frame back to RuneLite once
-        // the hidden actor reaches the rendered tile. This preserves breathing
-        // and head-turn phase without leaving the custom controller active.
-        if (PreserveIdlePhase &&
-                WalkStopIdleController != null &&
-                WalkStopIdleController.getAnimation() != null &&
-                !bMovingThisAction &&
-                CurrentAnimationRequest != null &&
-                CurrentAnimationRequest.PoseAnimationToPlay ==
-                        OldAnimationSet.IdlePoseAnimation)
-        {
-            Owner.setPoseAnimation(
-                    WalkStopIdleController.getAnimation().getId());
-            Owner.setPoseAnimationFrame(
-                    WalkStopIdleController.getFrame());
-        }
-
-        bUsingWalkStopIdleController = false;
-        LastWalkStopIdleGameCycle = -1;
     }
 
     private void UpdateOldIdleAnimations()
@@ -1931,6 +1923,9 @@ public class CustomMovementHandler
             // as soon as UpdateLerpDestinations sees a real segment.
             bWalkStartPendingDuringCatchUp = true;
             bWalkSegmentAwaitingMovement = true;
+            // A scene rebuild is not a user re-click during an actively
+            // displayed segment; leave its existing continuity path intact.
+            bWalkReclickOccurredDuringVisibleMovement = false;
         }
         double RecoveryDistance = bHasRecoveryDistance
                 ? RenderedLocation.distanceTo(CurrentTrueLocation)
@@ -2019,391 +2014,6 @@ public class CustomMovementHandler
                 !bRenderOriginalOwnerDueToProximity &&
                 IsSceneLoadVisualReady() &&
                 Model.isActive();
-    }
-
-    /**
-     * [TMA-PLAYER-FLICKER-DIAGNOSTICS]
-     *
-     * Collect the local player's diagnostic snapshot on the client thread.
-     * This is intentionally called only by TrueTileMovementPlugin.onClientTick.
-     * No overlay/render callback may inspect a RuneLiteObject for diagnostics:
-     * scene replacement can invalidate that object between render callbacks.
-     */
-    void CapturePlayerFlickerSampleOnClientThread(
-            int SceneGeneration,
-            boolean SceneLoadVisualHandoffPending,
-            boolean RuneliteObjectsStale)
-    {
-        if (!config.AutoLogPlayerFlickers())
-        {
-            if (PlayerFlickerRecorder != null)
-            {
-                PlayerFlickerRecorder.resetContext("diagnostic-disabled");
-                PlayerFlickerRecorder = null;
-            }
-            ConsecutiveDiagnosticEndpointSamples = 0;
-            return;
-        }
-
-        if (PlayerFlickerRecorder == null)
-        {
-            PlayerFlickerRecorder = new PlayerFlickerDiagnostics();
-        }
-
-        boolean StableScene =
-                IsPlayerOwner() &&
-                        client.getGameState() == GameState.LOGGED_IN &&
-                        !plugin.bForceEarlyOut &&
-                        plugin.bIsPluginSupportedCurrently &&
-                        !SceneLoadVisualHandoffPending &&
-                        !RuneliteObjectsStale &&
-                        !bSceneRebasePending &&
-                        !bSceneRecoveryRetargetPending &&
-                        !bSceneBoundaryBridgeActive &&
-                        !bScenePresentationClockActive &&
-                        !bSceneLoadFramePresentationPending &&
-                        (LastInitializedSceneGeneration < 0 ||
-                                LastInitializedSceneGeneration ==
-                                        SceneGeneration) &&
-                        Owner != null &&
-                        Owner.getLocalLocation() != null &&
-                        TrueTileMovementPlugin.IsSameWorldView(
-                                Owner.getWorldView(),
-                                client.getWorldView(-1));
-        if (!StableScene)
-        {
-            // Most importantly, do not dereference Model while scene-owned
-            // RuneLiteObjects are stale or being replaced.
-            PlayerFlickerRecorder.resetContext("scene-or-client-state-changed");
-            ConsecutiveDiagnosticEndpointSamples = 0;
-            return;
-        }
-
-        long SampleTime = System.currentTimeMillis();
-        long SampleMonotonicNanos = System.nanoTime();
-        LocalPoint OwnerLocation = Owner.getLocalLocation();
-        LocalPoint RouteDestination =
-                client.getLocalDestinationLocation();
-        long TweenDuration =
-                GetMovementTweenDurationMilliseconds();
-        long MovementAnimationDuration =
-                GetSceneMovementAnimationDuration(
-                        SceneRecoveryTweenDurationOverride);
-        boolean ActiveSegment =
-                IsSameWorldView(LastLerpPosition, NextLerpPosition) &&
-                        !LastLerpPosition.equals(NextLerpPosition) &&
-                        MillisecondsSinceTileChange <
-                                MovementAnimationDuration;
-        boolean UnfinishedYellowRoute =
-                !bWalkStartPendingDuringCatchUp &&
-                        ShouldKeepMovementAnimationDuringRouteGap(
-                                MillisecondsSinceTileChange,
-                                true,
-                                bWalkStopFacingHoldArmed &&
-                                        bWalkMovementObserved &&
-                                        IsMovementSegmentFromLatestWalkClick(
-                                                WalkClickRevision,
-                                                WalkClickRevisionAtMovementSegment),
-                                bWalkSegmentAwaitingMovement,
-                                bHoldWalkStopFacingThisFrame,
-                                NextLerpPosition,
-                                RouteDestination);
-        boolean MovementExpected =
-                ActiveSegment || UnfinishedYellowRoute;
-
-        int OwnerActionAnimation = Owner.getAnimation();
-        int OwnerActionFrame = Owner.getAnimationFrame();
-        int OwnerPoseAnimation = Owner.getPoseAnimation();
-        int OwnerPoseFrame = Owner.getPoseAnimationFrame();
-        int RequestedActionAnimation =
-                CurrentAnimationRequest == null
-                        ? NO_ANIMATION
-                        : CurrentAnimationRequest.AnimationToPlay;
-        int RequestedPoseAnimation =
-                CurrentAnimationRequest == null
-                        ? NO_ANIMATION
-                        : CurrentAnimationRequest.PoseAnimationToPlay;
-        boolean ActionAnimationActive =
-                OwnerActionAnimation != NO_ANIMATION ||
-                        RequestedActionAnimation != NO_ANIMATION;
-        boolean MovementDiscontinuity =
-                HasSceneMovementDiscontinuity();
-        boolean DetectionEligible =
-                !MovementDiscontinuity &&
-                        !bTransitioningToBattleMode &&
-                        !bWalkSegmentAwaitingMovement &&
-                        !bWalkStartPendingDuringCatchUp &&
-                        !bHoldWalkStopFacingThisFrame;
-        boolean IdleDetectionEligible =
-                DetectionEligible &&
-                        !ActionAnimationActive;
-        boolean IdleSelected =
-                !bMovingThisAction ||
-                        bUsingWalkStopIdleController ||
-                        IsExclusiveIdlePoseAnimation(
-                                RequestedPoseAnimation);
-
-        // All RuneLiteObject reads are confined to this client-thread block.
-        RuneLiteObject DiagnosticModel = Model;
-        LocalPoint ModelLocation =
-                DiagnosticModel == null
-                        ? null
-                        : DiagnosticModel.getLocation();
-        boolean ModelExists = DiagnosticModel != null;
-        boolean ModelActive =
-                ModelExists && DiagnosticModel.isActive();
-        boolean ModelHasGeometry =
-                ModelExists && DiagnosticModel.getModel() != null;
-        boolean ModelInOwnerWorldView =
-                ModelExists &&
-                        IsSameWorldView(ModelLocation, OwnerLocation);
-        boolean CustomPresentationRequired =
-                MovementExpected &&
-                        !bAttemptToRenderOwner &&
-                        !bTransitioningToBattleMode;
-        boolean CustomPresentationReady =
-                !bShouldRenderOwner &&
-                        !bRenderOriginalOwnerDueToProximity &&
-                        ModelActive &&
-                        ModelHasGeometry &&
-                        ModelInOwnerWorldView;
-        boolean ModelAtSegmentEndpoint =
-                IsSameWorldView(ModelLocation, NextLerpPosition) &&
-                        ModelLocation.equals(NextLerpPosition);
-        boolean EndpointStallSample =
-                DetectionEligible &&
-                        MovementExpected &&
-                        bMovingThisAction &&
-                        CustomPresentationReady &&
-                        ModelAtSegmentEndpoint &&
-                        !bNewTileMovementStarted;
-        if (EndpointStallSample)
-        {
-            ++ConsecutiveDiagnosticEndpointSamples;
-        }
-        else
-        {
-            ConsecutiveDiagnosticEndpointSamples = 0;
-        }
-        // Two consecutive ClientTicks at the authoritative endpoint filters
-        // the ordinary one-sample handoff while still capturing a visible
-        // 40ms+ run-in-place/position pause.
-        boolean PositionStalled =
-                ConsecutiveDiagnosticEndpointSamples >= 2;
-        String PacingCause = !PositionStalled
-                ? "none"
-                : UnfinishedYellowRoute
-                        ? "route-gap-clamp"
-                        : "active-segment-endpoint-clamp";
-
-        int ControllerAnimation =
-                AnimController == null ||
-                        AnimController.getAnimation() == null
-                        ? NO_ANIMATION
-                        : AnimController.getAnimation().getId();
-        int ControllerFrame =
-                AnimController == null
-                        ? -1
-                        : AnimController.getFrame();
-        int StopIdleAnimation =
-                WalkStopIdleController == null ||
-                        WalkStopIdleController.getAnimation() == null
-                        ? NO_ANIMATION
-                        : WalkStopIdleController.getAnimation().getId();
-        int StopIdleFrame =
-                WalkStopIdleController == null
-                        ? -1
-                        : WalkStopIdleController.getFrame();
-
-        // Snapshot every value now, but defer the expensive formatting until
-        // this sample is actually emitted as part of a confirmed incident.
-        // The lambda captures no handler, actor, client, or RuneLiteObject.
-        int GameCycle = client.getGameCycle();
-        int FrameDelta = CurrentFrameDelta;
-        int ElapsedMilliseconds = MillisecondsSinceTileChange;
-        boolean MovementSelected = bMovingThisAction;
-        boolean ResetAnimation = bResetCurrentAnimation;
-        boolean NewMovementSegment = bNewTileMovementStarted;
-        int MovementDirectionX = RotatedDirectionX;
-        int MovementDirectionY = RotatedDirectionY;
-        int VisibleOrientation = CurrentOrientation;
-        int VisibleTargetOrientation = TargetOrientation;
-        boolean StopIdleControllerActive =
-                bUsingWalkStopIdleController;
-        WorldPoint WorldLocation = CurrentWorldPoint;
-        LocalPoint SegmentStart = LastLerpPosition;
-        LocalPoint SegmentEnd = NextLerpPosition;
-        LocalPoint DrawLocation = NewLocalPointToDraw;
-        WorldPoint RenderedWorldLocation = LastRenderedWorldPoint;
-        int RenderedWorldOffsetX = LastRenderedWorldOffsetX;
-        int RenderedWorldOffsetY = LastRenderedWorldOffsetY;
-        boolean WalkArmed = bWalkStopFacingHoldArmed;
-        boolean WalkObserved = bWalkMovementObserved;
-        boolean WalkStartPending = bWalkStartPendingDuringCatchUp;
-        boolean WalkSegmentAwaiting = bWalkSegmentAwaitingMovement;
-        boolean WalkFacingHeld = bHoldWalkStopFacingThisFrame;
-        boolean ReleasedWalkFacingPreserved =
-                bPreserveReleasedWalkFacing;
-        long LatestWalkClickRevision = WalkClickRevision;
-        long SegmentWalkClickRevision =
-                WalkClickRevisionAtMovementSegment;
-        boolean SegmentFromLatestWalkClick =
-                IsMovementSegmentFromLatestWalkClick(
-                        LatestWalkClickRevision,
-                        SegmentWalkClickRevision);
-        boolean SceneRebasePending = bSceneRebasePending;
-        boolean SceneRecoveryPending = bSceneRecoveryRetargetPending;
-        boolean SceneBridgeActive = bSceneBoundaryBridgeActive;
-        boolean SceneClockActive = bScenePresentationClockActive;
-        boolean SceneFramePending = bSceneLoadFramePresentationPending;
-        int InitializedSceneGeneration =
-                LastInitializedSceneGeneration;
-        boolean ShouldRenderOwner = bShouldRenderOwner;
-        boolean AttemptToRenderOwner = bAttemptToRenderOwner;
-        boolean ProximityOwner =
-                bRenderOriginalOwnerDueToProximity;
-        double ConfiguredMovementMultiplier =
-                config.MovementSpeedMultiplier();
-        double RequestMovementMultiplier =
-                CurrentAnimationRequest == null
-                        ? 1.0
-                        : CurrentAnimationRequest.MovementSpeedMultiplier;
-        double AppliedMovementLeadMultiplier =
-                GetConfiguredMovementLeadMultiplier(
-                        ConfiguredMovementMultiplier);
-        int EndpointSampleCount =
-                ConsecutiveDiagnosticEndpointSamples;
-
-        PlayerFlickerDiagnostics.StateFormatter StateFormatter = () ->
-                String.format(
-                        Locale.ROOT,
-                        "time=%d cycle=%d scene=%d frameDelta=%d elapsed=%d tween=%d animationTween=%d " +
-                                "expected=%s activeSegment=%s unfinishedYellowRoute=%s " +
-                                "movingSelected=%s idleSelected=%s idleEligible=%s positionStalled=%s pacingCause=%s endpointSamples=%d " +
-                                "speed[configured=%.3f request=%.3f appliedLead=%.3f] actionActive=%s discontinuity=%s " +
-                                "request[action=%d pose=%d reset=%s newSegment=%s direction=%d,%d] " +
-                                "native[action=%d frame=%d pose=%d poseFrame=%d orientation=%d targetOrientation=%d] " +
-                                "controller[action=%d frame=%d stopIdle=%d stopIdleFrame=%d stopIdleActive=%s] " +
-                                "position[world=%s owner=%s last=%s next=%s draw=%s route=%s renderedWorld=%s offset=%d,%d model=%s] " +
-                                "yellow[armed=%s observed=%s startPending=%s segmentAwaiting=%s hold=%s preserve=%s clickRevision=%d segmentRevision=%d segmentIsCurrent=%s] " +
-                                "sceneState[rebase=%s recovery=%s bridge=%s clock=%s framePending=%s generation=%d] " +
-                                "presentation[required=%s ready=%s shouldOwner=%s attemptOwner=%s proximityOwner=%s modelExists=%s modelActive=%s modelGeometry=%s modelWorldView=%s]",
-                        SampleTime,
-                        GameCycle,
-                        SceneGeneration,
-                        FrameDelta,
-                        ElapsedMilliseconds,
-                        TweenDuration,
-                        MovementAnimationDuration,
-                        MovementExpected,
-                        ActiveSegment,
-                        UnfinishedYellowRoute,
-                        MovementSelected,
-                        IdleSelected,
-                        IdleDetectionEligible,
-                        PositionStalled,
-                        PacingCause,
-                        EndpointSampleCount,
-                        ConfiguredMovementMultiplier,
-                        RequestMovementMultiplier,
-                        AppliedMovementLeadMultiplier,
-                        ActionAnimationActive,
-                        MovementDiscontinuity,
-                        RequestedActionAnimation,
-                        RequestedPoseAnimation,
-                        ResetAnimation,
-                        NewMovementSegment,
-                        MovementDirectionX,
-                        MovementDirectionY,
-                        OwnerActionAnimation,
-                        OwnerActionFrame,
-                        OwnerPoseAnimation,
-                        OwnerPoseFrame,
-                        VisibleOrientation,
-                        VisibleTargetOrientation,
-                        ControllerAnimation,
-                        ControllerFrame,
-                        StopIdleAnimation,
-                        StopIdleFrame,
-                        StopIdleControllerActive,
-                        WorldLocation,
-                        OwnerLocation,
-                        SegmentStart,
-                        SegmentEnd,
-                        DrawLocation,
-                        RouteDestination,
-                        RenderedWorldLocation,
-                        RenderedWorldOffsetX,
-                        RenderedWorldOffsetY,
-                        ModelLocation,
-                        WalkArmed,
-                        WalkObserved,
-                        WalkStartPending,
-                        WalkSegmentAwaiting,
-                        WalkFacingHeld,
-                        ReleasedWalkFacingPreserved,
-                        LatestWalkClickRevision,
-                        SegmentWalkClickRevision,
-                        SegmentFromLatestWalkClick,
-                        SceneRebasePending,
-                        SceneRecoveryPending,
-                        SceneBridgeActive,
-                        SceneClockActive,
-                        SceneFramePending,
-                        InitializedSceneGeneration,
-                        CustomPresentationRequired,
-                        CustomPresentationReady,
-                        ShouldRenderOwner,
-                        AttemptToRenderOwner,
-                        ProximityOwner,
-                        ModelExists,
-                        ModelActive,
-                        ModelHasGeometry,
-                        ModelInOwnerWorldView);
-
-        PlayerFlickerDiagnostics.Detection Detection =
-                PlayerFlickerRecorder.accept(
-                        new PlayerFlickerDiagnostics.Sample(
-                                SampleMonotonicNanos,
-                                true,
-                                DetectionEligible,
-                                IdleDetectionEligible,
-                                MovementExpected,
-                                MovementSelected,
-                                IdleSelected,
-                                PositionStalled,
-                                CustomPresentationRequired,
-                                CustomPresentationReady,
-                                StateFormatter));
-        if (Detection.openedIncident())
-        {
-            client.addChatMessage(
-                    ChatMessageType.GAMEMESSAGE,
-                    "",
-                    "True Movement: possible flicker #" +
-                            Detection.incidentId +
-                            " recorded (" + Detection.reason + ")",
-                    null);
-        }
-    }
-
-    private boolean IsExclusiveIdlePoseAnimation(int AnimationId)
-    {
-        boolean IdleAnimation =
-                AnimationId != NO_ANIMATION &&
-                        (AnimationId ==
-                                OldAnimationSet.IdlePoseAnimation ||
-                                AnimationId ==
-                                        OldAnimationSet.IdleRotateLeft ||
-                                AnimationId ==
-                                        OldAnimationSet.IdleRotateRight);
-        boolean MovementAlias =
-                AnimationId == OldAnimationSet.WalkAnimation ||
-                        AnimationId == OldAnimationSet.WalkRotateLeft ||
-                        AnimationId == OldAnimationSet.WalkRotateRight ||
-                        AnimationId == OldAnimationSet.WalkRotate180 ||
-                        AnimationId == OldAnimationSet.RunAnimation;
-        return IdleAnimation && !MovementAlias;
     }
 
     private void RecordLastRenderedLocation(LocalPoint RenderLocation)
@@ -2864,6 +2474,18 @@ public class CustomMovementHandler
                         bHoldWalkStopFacingThisFrame,
                         NextLerpPosition,
                         client.getLocalDestinationLocation());
+        boolean bPreservePendingReclickMovementPose =
+                ShouldPreservePendingReclickMovementPose(
+                        MillisecondsSinceTileChange,
+                        GetMovementTweenDurationMilliseconds(),
+                        bMovingThisAction,
+                        bWalkReclickOccurredDuringVisibleMovement,
+                        bWalkStartPendingDuringCatchUp,
+                        bWalkSegmentAwaitingMovement,
+                        WalkClickRevision,
+                        WalkClickRevisionAtMovementSegment,
+                        LastLerpPosition,
+                        NextLerpPosition);
 
         // Override all animations
         //if (devConfig.DebugAnimation() != 0)
@@ -2878,7 +2500,8 @@ public class CustomMovementHandler
                         GetSceneMovementAnimationDuration(
                                 SceneRecoveryTweenDurationOverride) ||
                 bSceneBoundaryBridgeActive ||
-                bKeepMovementAnimationDuringRouteGap)
+                bKeepMovementAnimationDuringRouteGap ||
+                bPreservePendingReclickMovementPose)
         {
             bMovingThisAction = true;
 
@@ -3523,18 +3146,19 @@ public class CustomMovementHandler
                 }
             }
 
-            // [TMA-IDLE-CATCH-UP] This branch is evaluated before the general
-            // animation controller so the catch-up idle pose cannot be
-            // overwritten by the hidden actor's faster locomotion clock.
-            boolean bUsedCustomAnimation =
-                    RenderWalkStopIdleAnimation();
+            // [TMA-STOP-POSE-SEPARATION] Yellow-click stop handling owns only
+            // orientation. Body geometry deliberately uses the same ordinary
+            // animation publication path as a red-click stop. A separate idle
+            // controller produced a malformed transition pose, while copying
+            // the hidden player exposed its remaining locomotion as running on
+            // the spot. Keeping both out of this branch avoids either seam.
+            boolean bUsedCustomAnimation = false;
             boolean bControllerAnimationRequested =
-                    !bUsedCustomAnimation &&
-                            ((UniqueAnimationExceptionList.contains(
-                                    Owner.getAnimation()) &&
+                    (UniqueAnimationExceptionList.contains(
+                                     Owner.getAnimation()) &&
                                     bMovingThisAction) ||
                                     CurrentAnimationRequest.AnimationToPlay !=
-                                            -1);
+                                            -1;
             if (bControllerAnimationRequested)
             {
                 // Anim controller takes control over the pose animation or custom anim
@@ -3566,6 +3190,7 @@ public class CustomMovementHandler
                         AnimController.setAnimation(CustomAnim);
 
                         if (bUsingPoseAnim &&
+                                Owner.getPoseAnimationFrame() >= 0 &&
                                 Owner.getPoseAnimationFrame() <
                                         CustomAnim.getNumFrames() &&
                                 !bResetCurrentAnimation)
@@ -3630,22 +3255,42 @@ public class CustomMovementHandler
                 }
 
                 if (CurrentAnimationRequest.PoseAnimationToPlay != -1 &&
-                        (Owner.getPoseAnimation() != CurrentAnimationRequest.PoseAnimationToPlay || bResetCurrentAnimation))
+                        (Owner.getPoseAnimation() !=
+                                CurrentAnimationRequest.PoseAnimationToPlay ||
+                                Owner.getPoseAnimationFrame() < 0 ||
+                                bResetCurrentAnimation))
                 {
-                    Animation CustomAnim = client.loadAnimation(CurrentAnimationRequest.PoseAnimationToPlay);
-
-                    if (CustomAnim != null &&
-                            (Owner.getPoseAnimationFrame() >=
-                                    CustomAnim.getNumFrames() ||
-                                    bResetCurrentAnimation))
-                    {
-                        Owner.setPoseAnimationFrame(CurrentAnimationRequest.StartingFrame);
-                    }
+                    int RequestedPoseAnimation =
+                            CurrentAnimationRequest.PoseAnimationToPlay;
+                    Animation CustomAnim =
+                            client.loadAnimation(RequestedPoseAnimation);
 
                     if (CustomAnim != null)
                     {
-                        Owner.setPoseAnimation(
-                                CurrentAnimationRequest.PoseAnimationToPlay);
+                        int SafePoseFrame = SelectPoseFrameForPublication(
+                                Owner.getPoseAnimation(),
+                                Owner.getPoseAnimationFrame(),
+                                RequestedPoseAnimation,
+                                LastValidOwnerPoseAnimation,
+                                LastValidOwnerPoseFrame,
+                                CustomAnim.getNumFrames(),
+                                CurrentAnimationRequest.StartingFrame,
+                                bResetCurrentAnimation,
+                                ShouldRestartStationaryIdlePose(
+                                        bMovingThisAction,
+                                        Owner.getAnimation(),
+                                        Owner.getPoseAnimation(),
+                                        RequestedPoseAnimation,
+                                        OldAnimationSet.IdlePoseAnimation));
+                        if (Owner.getPoseAnimationFrame() != SafePoseFrame)
+                        {
+                            Owner.setPoseAnimationFrame(SafePoseFrame);
+                        }
+
+                        if (Owner.getPoseAnimation() != RequestedPoseAnimation)
+                        {
+                            Owner.setPoseAnimation(RequestedPoseAnimation);
+                        }
                         CurrentPoseAnimation = NO_ANIMATION;
                         bResetCurrentAnimation = false;
                     }
@@ -3654,7 +3299,17 @@ public class CustomMovementHandler
                 // momentarily unavailable while RuneLite rebuilds equipment
                 // or animation state. Keep the last complete model for that
                 // frame instead of assigning null and making the player pop.
-                TrySetModel(Owner.getModel());
+                if (TrySetModel(Owner.getModel()))
+                {
+                    int PublishedPoseAnimation = Owner.getPoseAnimation();
+                    int PublishedPoseFrame = Owner.getPoseAnimationFrame();
+                    if (PublishedPoseAnimation != NO_ANIMATION &&
+                            PublishedPoseFrame >= 0)
+                    {
+                        LastValidOwnerPoseAnimation = PublishedPoseAnimation;
+                        LastValidOwnerPoseFrame = PublishedPoseFrame;
+                    }
+                }
             }
 
             net.runelite.api.Model RenderedModel = Model.getModel();
@@ -3748,6 +3403,254 @@ public class CustomMovementHandler
 
     }
 
+    /**
+     * Capture a bounded stop/idle trace. This method must be called only from
+     * RuneLite's client thread; it is the sole diagnostic path which inspects
+     * the scene-owned RuneLiteObject or its prepared model.
+     */
+    void CaptureStopIdleDiagnosticsOnClientThread(
+            boolean Enabled)
+    {
+        if (!Enabled || !IsPlayerOwner() ||
+                client.getGameState() != GameState.LOGGED_IN)
+        {
+            ResetStopIdleDiagnostics();
+            return;
+        }
+
+        boolean bYellowStopContext =
+                bWalkStopFacingHoldArmed ||
+                        bWalkMovementObserved ||
+                        bPreserveReleasedWalkFacing ||
+                        bHoldWalkStopFacingThisFrame;
+        String Snapshot;
+        try
+        {
+            Snapshot = BuildStopIdleDiagnosticSnapshot(
+                    bYellowStopContext);
+        }
+        catch (RuntimeException SnapshotFailure)
+        {
+            // Diagnostics are observational and must never be able to disable
+            // rendering or crash the client. Keep the transition marker and
+            // record the failed read without retrying live scene state.
+            Snapshot = "time=" + System.currentTimeMillis() +
+                    " cycle=" + client.getGameCycle() +
+                    " snapshotFailure=" +
+                    SnapshotFailure.getClass().getSimpleName() +
+                    " moving=" + bMovingThisAction +
+                    " yellowContext=" + bYellowStopContext;
+        }
+        boolean bStoppedThisSample = ShouldOpenStopIdleTrace(
+                bStopIdleTraceInitialized,
+                bStopIdleTraceLastMoving,
+                bMovingThisAction,
+                bYellowStopContext);
+
+        if (bStoppedThisSample)
+        {
+            if (StopIdleTracePostSamplesRemaining > 0)
+            {
+                log.debug(
+                        "[StopIdleTrace] event={} phase=end cause=next-stop",
+                        StopIdleTraceEvent);
+            }
+
+            ++StopIdleTraceEvent;
+            log.debug(
+                    "[StopIdleTrace] event={} phase=begin preSamples={} note=client-thread-only",
+                    StopIdleTraceEvent,
+                    StopIdleTraceHistory.size());
+            for (String PreviousSnapshot : StopIdleTraceHistory)
+            {
+                log.debug(
+                        "[StopIdleTrace] event={} phase=pre {}",
+                        StopIdleTraceEvent,
+                        PreviousSnapshot);
+            }
+            log.debug(
+                    "[StopIdleTrace] event={} phase=stop {}",
+                    StopIdleTraceEvent,
+                    Snapshot);
+            client.addChatMessage(
+                    ChatMessageType.GAMEMESSAGE,
+                    "",
+                    "True Movement: stop-idle trace #" +
+                            StopIdleTraceEvent +
+                            " recorded",
+                    null);
+            StopIdleTracePostSamplesRemaining =
+                    STOP_IDLE_TRACE_POST_SAMPLES;
+        }
+        else if (StopIdleTracePostSamplesRemaining > 0)
+        {
+            log.debug(
+                    "[StopIdleTrace] event={} phase=post remaining={} {}",
+                    StopIdleTraceEvent,
+                    StopIdleTracePostSamplesRemaining,
+                    Snapshot);
+            --StopIdleTracePostSamplesRemaining;
+            if (StopIdleTracePostSamplesRemaining == 0)
+            {
+                log.debug(
+                        "[StopIdleTrace] event={} phase=end cause=window-complete",
+                        StopIdleTraceEvent);
+            }
+        }
+
+        StopIdleTraceHistory.addLast(Snapshot);
+        while (StopIdleTraceHistory.size() >
+                STOP_IDLE_TRACE_PRE_SAMPLES)
+        {
+            StopIdleTraceHistory.removeFirst();
+        }
+        bStopIdleTraceInitialized = true;
+        bStopIdleTraceLastMoving = bMovingThisAction;
+    }
+
+    static boolean ShouldOpenStopIdleTrace(
+            boolean Initialized,
+            boolean WasMoving,
+            boolean MovingNow,
+            boolean YellowStopContext)
+    {
+        return Initialized &&
+                WasMoving &&
+                !MovingNow &&
+                YellowStopContext;
+    }
+
+    private void ResetStopIdleDiagnostics()
+    {
+        StopIdleTraceHistory.clear();
+        bStopIdleTraceInitialized = false;
+        bStopIdleTraceLastMoving = false;
+        StopIdleTracePostSamplesRemaining = 0;
+        StopIdleTraceEvent = 0;
+    }
+
+    private String BuildStopIdleDiagnosticSnapshot(
+            boolean YellowStopContext)
+    {
+        int RequestedAction = CurrentAnimationRequest == null
+                ? NO_ANIMATION
+                : CurrentAnimationRequest.AnimationToPlay;
+        int RequestedPose = CurrentAnimationRequest == null
+                ? NO_ANIMATION
+                : CurrentAnimationRequest.PoseAnimationToPlay;
+        int MainControllerAnimation =
+                AnimController == null ||
+                        AnimController.getAnimation() == null
+                        ? NO_ANIMATION
+                        : AnimController.getAnimation().getId();
+        int MainControllerFrame = AnimController == null
+                ? NO_ANIMATION
+                : AnimController.getFrame();
+        RuneLiteObject VisibleObject = Model;
+        boolean VisibleObjectActive =
+                VisibleObject != null && VisibleObject.isActive();
+        LocalPoint VisibleLocation = VisibleObject == null
+                ? null
+                : VisibleObject.getLocation();
+        net.runelite.api.Model VisibleModel = VisibleObject == null
+                ? null
+                : VisibleObject.getModel();
+        net.runelite.api.Model OwnerModel = Owner.getModel();
+
+        return "time=" + System.currentTimeMillis() +
+                " cycle=" + client.getGameCycle() +
+                " movement[moving=" + bMovingThisAction +
+                " elapsed=" + MillisecondsSinceTileChange +
+                " duration=" + GetMovementTweenDurationMilliseconds() +
+                " from=" + DescribeLocalPoint(LastLerpPosition) +
+                " to=" + DescribeLocalPoint(NextLerpPosition) +
+                " drawn=" + DescribeLocalPoint(NewLocalPointToDraw) +
+                "] request[action=" + RequestedAction +
+                " pose=" + RequestedPose +
+                "] owner[action=" + Owner.getAnimation() +
+                " actionFrame=" + Owner.getAnimationFrame() +
+                " pose=" + Owner.getPoseAnimation() +
+                " poseFrame=" + Owner.getPoseAnimationFrame() +
+                " idle=" + Owner.getIdlePoseAnimation() +
+                " walk=" + Owner.getWalkAnimation() +
+                " run=" + Owner.getRunAnimation() +
+                " orientation=" + Owner.getOrientation() +
+                " currentOrientation=" + Owner.getCurrentOrientation() +
+                " location=" + DescribeLocalPoint(Owner.getLocalLocation()) +
+                "] controller[main=" + MainControllerAnimation +
+                ":" + MainControllerFrame +
+                "] yellow[context=" + YellowStopContext +
+                " armed=" + bWalkStopFacingHoldArmed +
+                " observed=" + bWalkMovementObserved +
+                " hold=" + bHoldWalkStopFacingThisFrame +
+                " preserve=" + bPreserveReleasedWalkFacing +
+                " nativeSettled=" + bNativeWalkFacingSettled +
+                " awaiting=" + bWalkSegmentAwaitingMovement +
+                "] presentation[owner=" + bShouldRenderOwner +
+                " proximity=" + bRenderOriginalOwnerDueToProximity +
+                " customActive=" + VisibleObjectActive +
+                " customLocation=" + DescribeLocalPoint(VisibleLocation) +
+                "] geometry[custom=" + DescribeModel(VisibleModel) +
+                " owner=" + DescribeModel(OwnerModel) + "]";
+    }
+
+    private static String DescribeLocalPoint(LocalPoint Point)
+    {
+        return Point == null
+                ? "null"
+                : Point.getX() + "," + Point.getY() +
+                        ",wv=" + Point.getWorldView();
+    }
+
+    private static String DescribeModel(net.runelite.api.Model SourceModel)
+    {
+        if (SourceModel == null)
+        {
+            return "null";
+        }
+
+        float[] VerticesX = SourceModel.getVerticesX();
+        float[] VerticesY = SourceModel.getVerticesY();
+        float[] VerticesZ = SourceModel.getVerticesZ();
+        int VertexCount = Math.min(
+                SourceModel.getVerticesCount(),
+                Math.min(
+                        VerticesX == null ? 0 : VerticesX.length,
+                        Math.min(
+                                VerticesY == null ? 0 : VerticesY.length,
+                                VerticesZ == null ? 0 : VerticesZ.length)));
+        if (VertexCount <= 0)
+        {
+            return "vertices=0 faces=" + SourceModel.getFaceCount();
+        }
+
+        int Step = Math.max(
+                1,
+                VertexCount /
+                        STOP_IDLE_TRACE_MODEL_VERTEX_SAMPLES);
+        long Hash = 0xcbf29ce484222325L;
+        int Samples = 0;
+        for (int Index = 0;
+             Index < VertexCount;
+             Index += Step)
+        {
+            Hash ^= Float.floatToIntBits(VerticesX[Index]);
+            Hash *= 0x100000001b3L;
+            Hash ^= Float.floatToIntBits(VerticesY[Index]);
+            Hash *= 0x100000001b3L;
+            Hash ^= Float.floatToIntBits(VerticesZ[Index]);
+            Hash *= 0x100000001b3L;
+            ++Samples;
+        }
+
+        return "vertices=" + VertexCount +
+                " faces=" + SourceModel.getFaceCount() +
+                " samples=" + Samples +
+                " hash=" + Long.toUnsignedString(Hash, 16) +
+                " scene=" + SourceModel.getSceneId() +
+                " buffer=" + SourceModel.getBufferOffset();
+    }
+
     public void Update()
     {
         if (client.getGameState() == GameState.LOADING)
@@ -3790,6 +3693,7 @@ public class CustomMovementHandler
             WalkClickRevisionAtMovementSegment = WalkClickRevision;
             bWalkSegmentAwaitingMovement = false;
             bWalkStartPendingDuringCatchUp = false;
+            bWalkReclickOccurredDuringVisibleMovement = false;
         }
 
         UpdateWalkStopFacingHold();

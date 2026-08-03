@@ -132,42 +132,62 @@ displayed. Comparing the custom orientation with the native *target*
 orientation could approve a handoff while the native model was still turning,
 which made the visible player turn or pop at the end of a yellow-click route.
 
-## `[TMA-IDLE-CATCH-UP]`: smooth idle while the native player catches up
+## `[TMA-STOP-POSE-SEPARATION]`: keep facing ownership separate from animation
 
 ### Cause
 
-The custom model could enter idle while its animation clock was still tied to
-the hidden player's locomotion/catch-up state. Breathing and head movement then
-looked accelerated or choppy, with a visible phase change when ordinary
-animation smoothing resumed.
+Yellow-click stop handling must keep the custom object active briefly so the
+hidden player's route-end orientation cannot spin the visible character. An
+independent stopped-idle controller was added to give that object a separate
+breathing clock. In-game captures later proved that this coupled two unrelated
+jobs: the orientation hold worked, but the synthetic animation path published a
+legs-out/arms-raised transition pose immediately before proper idle.
 
 ### Fix
 
-The catch-up interval has an idle animation controller seeded from the native
-idle frame. It advances on the visual frame clock, then hands its phase back
-without resetting. A new click does not reuse the old catch-up controller, so
-movement starts from the current displayed pose rather than producing a
-one-frame jump.
+The synthetic stopped-idle controller and all of its phase, first-frame, raw
+transform, and priming paths have been removed. A later attempt copied the
+hidden player's complete model during the hold. That avoided the malformed
+synthetic frame, but it also copied the hidden player's unfinished locomotion
+after the custom model had reached its responsive endpoint, visibly producing
+walking or running on the spot. Slowing the final custom segment to wait for the
+hidden player only disguised that mismatch and undermined true-tile response;
+that positional synchronization path was removed as well.
 
-`[TMA-IDLE-HANDOFF-CONTINUITY]` keeps that same controller through the short
-native-facing settle period after positional catch-up. Diagnostics showed the
-controller itself advancing animation 808 correctly (one frame after its
-21-client-tick frame length), but the native pose could jump several frames
-within a few client cycles when ownership was returned. The hidden locomotion
-pose had retained elapsed phase which cannot be transferred through RuneLite's
-public actor API. Keeping one controller for the complete stop-facing hold
-avoids exposing that intermediate clock. It is released when real movement, a
-red interaction, or a later native facing command ends the hold.
+There is now no yellow-stop-specific body-model path. Yellow and red stops both
+use the ordinary idle animation publication and model-building code. The yellow
+state owns only the custom object's orientation while the hidden actor settles.
+Position still completes on the original custom movement clock, so stopping is
+not delayed and no hidden locomotion pose is exposed at the endpoint.
+
+The ordinary publication path deliberately retains a valid frame index across
+compatible pose-animation changes. Directional run and walk variants can
+change animation IDs between route segments; resetting each such change to
+frame zero made the last tiles and occasional mid-route transitions visibly
+jolt. The one exception is `[TMA-STATIONARY-IDLE-ENTRY]`: after visible movement
+has ended and no action is playing, a still-published native locomotion frame is
+not reused as the requested idle frame. This is based on the actual pose state,
+not click colour, because both a yellow destination and a red-click approach can
+leave the hidden actor catching up. That exact mismatch restarts from idle's
+authored entry frame, preventing the hidden player's faster locomotion clock
+from making the stationary breathing pose race or glitch. Once the native actor
+publishes idle, its same-animation phase is retained normally. Invalid-frame
+recovery remains stricter and reuses a remembered frame only when it belongs to
+that same animation.
+
+Actions still use their existing custom animation handling. The stop-facing
+state continues to own orientation only, so the proven no-spin behaviour
+remains independent from animation timing and body geometry.
 
 A second yellow click received during active catch-up retains the current
-Observed/idle state until movement actually starts. `[TMA-YELLOW-RECLICK-HANDOFF]`
+observed stop-facing state until movement actually starts. `[TMA-YELLOW-RECLICK-HANDOFF]`
 also records that this new route is pending: RuneLite can publish its
 destination before the first visible movement frame, and that publication must
 not make the old route fail its "final destination" check and release the model
 early. If the hidden player finishes catching up during this delay, the code
 moves directly into the normal preserved-facing state while keeping the new
 route armed. A click during an already released state still cannot resurrect an
-old controller.
+old route.
 
 `[TMA-YELLOW-RECLICK-ROUTE-GRACE]` covers the same publication ordering while
 an ordinary movement segment is still active. The focused recorder captured a
@@ -238,9 +258,8 @@ Teleport snaps, scene-boundary bridging, scene rebase/recovery, and the scene
 presentation clock retain their specialised timing and bypass this curve. The
 unfinished-route animation grace is also retained because captures proved it
 prevents real `run -> idle -> run` seams when the next route segment is
-published late. The opt-in recorder distinguishes that separate
-`route-gap-clamp` case from an ordinary active-segment endpoint clamp, so it
-can be changed from evidence rather than by reopening the earlier flicker bug.
+published late. It remains a separate, bounded route-publication correction;
+it must not be widened to compensate for ordinary active-segment pacing.
 
 ### Maintenance invariant
 
@@ -297,6 +316,70 @@ boundary bridge may preserve forward momentum until the next route point is
 available. It is excluded from red-click interactions and is capped so it
 cannot become route prediction or recreate the “run onto the object” bug.
 
+## `[TMA-PLAYER-ONLY-RENDER-FILTER]`: never filter native scene objects
+
+### Cause
+
+RuneLite's `RenderCallback.drawObject` is not a player-only callback. It runs
+for native walls, decorations, ground/game objects, dynamic transforms, and
+temporary actors. It also runs during GPU scene upload on the map-loader
+thread. The old callback queried `MovementHandlerCache` with every
+`TileObject.getId()`. A native object definition ID and the local player's
+index are unrelated values but can contain the same integer.
+
+An accidental collision therefore treated a tree, stump, herb patch, large
+room component, or another native object as the hidden local player and
+returned `false`. For dynamic objects this could leave the wrong transform
+visible; during scene upload it could omit enough geometry to expose only the
+skybox. The same path could also inspect the scene-owned custom
+`RuneLiteObject` from the map-loader thread.
+
+### Fix
+
+The client thread now decides whether the current custom model is ready to
+replace the native local player and publishes only a tiny render snapshot:
+the local player reference, player index, world-view ID, and scene/UI hide
+flags. Scene invalidation, native handoff, logout, renderer fallback, startup,
+and shutdown clear the snapshot before any stale custom object can be used.
+
+`drawObject` reads only that published snapshot plus the tile
+object's ID and packed hash. It returns `false` only when all three identity
+parts match: the hash says the entity is a player, its ID equals the published
+local-player index, and its world-view ID equals the published view. A tree or
+herb patch can share the same integer ID and still cannot pass the player-type
+check. A player from another view cannot pass the world-view check. With the
+snapshot disabled, the predicate fails open and draws everything.
+
+The separate UI callback compares the renderable with the published local
+player by object identity. It no longer compares `toString()` output or reads
+the movement-handler cache while rendering. A player entry in the GPU-only
+`drawObject` callback updates the renderer-support heartbeat using two volatile
+scalar writes. Static map-loader entries do not even update that heartbeat,
+and the callback performs no live client, handler, model, or `RuneLiteObject`
+reads. The more general `addEntity` callback cannot be used as the heartbeat
+because RuneLite invokes it even without the GPU plugin.
+
+This leaves RuneScape and the GPU plugin fully authoritative for object
+spawn/despawn, tree/stump and farming-patch transforms, world entities, and
+scene upload. It changes no movement, camera, interpolation, or scene-recovery
+timing.
+
+No object spawn/despawn listener, scene scan, or replacement-object cache was
+added. The plugin does not own those native lifecycles and does not override
+`drawTile`; attempting to refresh or recreate objects here would duplicate the
+game/GPU renderer and introduce a second source of truth. The correct repair is
+to stop vetoing native content and let each authoritative transform be uploaded
+and drawn normally.
+
+### Maintenance invariant
+
+Never infer actor identity from a bare `TileObject` ID. Any render callback
+which can execute during scene upload must use the published primitive/value
+snapshot only. It must never touch `MovementHandlerCache`, a
+`CustomMovementHandler`, live client/player state, or a scene-owned
+`RuneLiteObject`. The predicate must remain fail-open for every object which
+is not the exact local player in the exact current world view.
+
 ## `[TMA-POST-SCENE-YELLOW-HANDOFF]`: wait for the first replacement-scene segment
 
 ### Cause
@@ -319,8 +402,8 @@ authoritative post-scene segment. This deliberately reuses the existing
 pending-yellow handoff:
 
 - scene-recovery movement may continue, but cannot clear the pending state;
-- once the displayed recovery reaches its endpoint, facing and the independent
-  idle controller remain stable;
+- once the displayed recovery reaches its endpoint, facing and the native pose
+  presentation remain stable;
 - route-gap locomotion cannot run at the same time as that stop-facing hold;
 - the first real tile segment clears the wait immediately and resumes ordinary
   locomotion; and
@@ -490,175 +573,195 @@ half-life. Native-camera presentations refresh that retained source value, so
 the easing begins from the camera the user actually saw rather than a stale
 custom value.
 
-## Diagnostics and tests
+## Investigation evidence and production boundary
 
-The earlier diagnostic loggers were temporary and were removed after their
-original investigations:
+The movement and area-load work used several temporary, narrowly scoped
+recorders. They compared scene generation, local/world coordinates, route
+publication, model ownership, camera state, animation requests, prepared-model
+outcomes, and timing around the reported frame. They established four important
+facts:
 
-- `[SceneLoadTrace]` compared scene generation, route/local/world coordinates,
-  model presentation, camera presentation, and frame timing.
-- `[VisibilityTrace]` exposed native/custom presentation changes and showed
-  that a newly published yellow-click destination could arrive before its
-  first visible movement segment.
-- `[IdleCatchUpTrace]` separated the custom idle controller clock from the
-  hidden native pose clock. It confirmed the custom clock was advancing
-  normally and the visible speed-up came from handing back to the native
-  actor's accumulated locomotion phase.
-- `[LocomotionTrace]` recorded only movement transitions, animation request
-  changes, and unexpected frame regressions. Final testing contained no
-  unexpected regressions: changes between walk and run poses matched genuine
-  one-tile and two-tile movement segments. No additional locomotion controller
-  was added.
-- `[MovementContinuityTrace]` isolated unfinished-route idle/turn requests from
-  real model loss. It established the bounded route-gap grace and the delayed
-  first-segment condition after scene replacement.
-- `[SceneMotionTrace]` correlated scene generation, rebase/recovery ownership,
-  movement speed, and retained camera state. It established which scene-load
-  corrections were plugin-side and which pauses contained no drawable client
-  frame at all.
+- scene rebuilds can contain a real 16-75 ms interval in which the client
+  presents no frame. The plugin cannot render through that pause, but it can
+  avoid adding a second jump when rendering resumes;
+- some uninterrupted routes publish their next segment 8-258 ms after the
+  previous 600 ms segment ends. Selecting idle during that feed gap creates a
+  visible `run -> idle -> run` seam even though the model never disappeared;
+- the five-second idle bump after a yellow click came from retaining the former
+  synthetic idle controller after positional and facing settlement, not from
+  the native idle loop itself; and
+- the repeated-yellow-click defect that was finally isolated was malformed
+  custom geometry. The requested, native, and prepared pose IDs all remained
+  run 1661 while one frame showed legs spread and arms raised. Animation IDs
+  therefore could not classify that frame correctly.
 
-Those investigation-specific instruments and their temporary area-load chat
-marker were removed. They are not part of normal production execution. The
-conclusions below are retained because they explain the otherwise non-obvious
-timing bounds in production code.
+The earlier broad investigation recorders, chat markers, queues, background
+logging, preparation counters, and log-formatting paths were removed after
+their investigations. A later opt-in `[TMA-STOP-IDLE-DIAGNOSTICS]` trace is
+temporarily retained to verify the replacement native-pose handoff at a
+yellow-click stop. It is disabled by default, opens only on a genuine
+`moving -> idle` edge, and logs a bounded eight-sample history plus ten samples
+afterward rather than logging every frame permanently.
 
-### Opt-in player flicker recorder
+If diagnostics are needed again, live RuneLite state must be sampled only on
+the client thread. In particular, never inspect a scene-owned
+`RuneLiteObject` from an overlay or render callback: scene replacement can
+invalidate it between callbacks and this previously caused client crashes.
+Copy scalar/value state on the client thread and format it elsewhere only if
+the captured evidence actually needs to be emitted.
 
-`[TMA-PLAYER-FLICKER-DIAGNOSTICS]` is a separate, disabled-by-default tool for
-the remaining rare one-frame player interruption. It exists because recording
-at 60 fps showed a visual `run -> idle -> run` seam which is too brief to
-identify reliably from a report made after the route has finished.
+The stop-idle trace follows that boundary: `onClientTick` performs every live
+actor, custom-object, and prepared-model read. Overlay rendering does not read a
+`RuneLiteObject` for diagnostics. Each sample includes animation requests and
+frames, native-stop mirroring state, yellow-route state, presentation
+authority, local positions/orientations, and a bounded vertex signature for the
+custom and owner models. A numbered chat message identifies the matching
+`[StopIdleTrace]` event in `client.log`. The geometry signature is sampled only
+while the explicit debug option is enabled and any failed model read is caught;
+diagnostics cannot interrupt rendering.
 
-The recorder does not alter movement or rendering. Its safety boundary is
-deliberate:
+## `[TMA-UNFINISHED-ROUTE-ANIMATION-CONTINUITY]`: bridge late route publication
 
-- `TrueTileMovementPlugin.onClientTick` is its only live sampling point;
-- `CustomMovementHandler` reads the native actor and custom `RuneLiteObject`
-  only there, while the scene is stable;
-- the recorder itself receives immutable copied/value snapshots and has no
-  access to live actors, the client, or `RuneLiteObject`; and
-- render callbacks and overlays never inspect a `RuneLiteObject` for this
-  diagnostic. This avoids the crash previously caused by reading a scene-owned
-  object while RuneLite was replacing it.
+Captures showed valid next route segments arriving after the ordinary 600 ms
+segment clock, most commonly at 608-619 ms and in area-transition cases as late
+as 852-858 ms. The custom object remained active, drawable, and authoritative;
+the interruption was an idle or turn request between two valid locomotion
+requests.
 
-The detector derives expected movement independently from the selected
-animation. A same-scene interpolation segment is expected to move until its
-tween ends; an observed yellow-click route with a different published
-destination is also expected to continue while it is not waiting for its first
-authoritative segment. This independence matters: using
-`bMovingThisAction` as both the expected value and the value under test would
-hide the exact idle-selection bug being investigated.
+Locomotion is therefore retained for a bounded 300 ms feed gap only when the
+previous frame was moving, a previously observed yellow-click route still owns
+continuity, the known segment has ended, and RuneScape still publishes a
+different same-world-view destination. Position remains clamped to the
+collision-valid endpoint. The code does not predict a tile, cross scenery, or
+move onto an interaction object. A fresh click that has not produced its first
+segment does not receive this general grace, and a red interaction cancels it
+immediately.
 
-A single suspicious sample is not reported immediately. It becomes an
-incident only when movement/custom presentation recovers within the next few
-client ticks (`moving -> suspicious -> moving`), or when the bad state persists
-for three samples. Genuine route completion, stop-facing handoffs, new-click
-first-segment waits, teleports/special movement, scene rebase/recovery, loading,
-hopping, renderer fallback, and logout cancel the candidate. During a real
-spell/attack/eat animation, native idle-pose fields are not considered proof of
-a flicker, but a missing custom presentation is still reportable. This keeps
-combat visibility failures observable without misclassifying the action itself
-as idle. A three-second monotonic cooldown and a single active post-window
-prevent one visual interruption from producing repeated messages.
+## `[TMA-NATIVE-ANIMATION-LOOPS]`: honour authored loop points
 
-When `(Debug) Auto-Log Player Flickers` is enabled, a confirmed incident:
+The plugin formerly forced controller-driven animations back to frame zero on
+completion. RuneLite's `AnimationController.loop()` honours the sequence's
+authored `frameStep`, which may separate a one-time lead-in from the part that
+is intended to repeat. The main and camera-model controllers now use
+`loop()`; target-killed cleanup and all animation selection/timing remain
+unchanged.
 
-- writes up to 12 pre-trigger samples, the candidate/confirmation, and 20
-  post-trigger samples under `[PlayerFlickerTrace]`;
-- records animation requests and frames, interpolation timing and endpoints,
-  route state, orientations, scene-continuity state, and native/custom render
-  authority; and
-- posts `True Movement: possible flicker #N recorded` locally. The same
-  `incident=N` appears in the debug log, so the player can identify and export
-  the exact event they saw.
+This was a valid general correction but not the human idle-808 fix. Idle 808
+has `frameStep=-1` and naturally wraps from frame 11 to frame 0, while the main
+controller is inactive during established idle. Keeping that distinction in
+the notes prevents the loop correction from being mistaken for the later
+yellow-click ownership fix.
 
-The recorder recognises three independent incident reasons:
+## `[TMA-PENDING-RECLICK-POSE-HANDOFF]`: retain locomotion across the click-to-route seam
 
-- `idle-selected-during-movement` for a locomotion-to-idle/turn selection seam;
-- `custom-presentation-missing` when the custom model should own the frame but
-  is not ready; and
-- `position-stalled-during-movement` when locomotion remains selected while
-  the model stays at the current segment endpoint for at least two consecutive
-  client ticks (roughly 40 ms or longer).
+A captured failure showed this exact sequence:
 
-For a positional stall, the trace includes the configured multiplier, request
-multiplier, applied lead, consecutive endpoint samples, and `pacingCause`.
-`route-gap-clamp` means the bounded unfinished-yellow-route grace owns the
-animation after a completed segment; `active-segment-endpoint-clamp` means the
-ordinary segment clock still considers movement active. This keeps the
-diagnostic useful for both the default setting and values such as 1.1, 1.2,
-and 1.3 without logging every frame.
+1. a new yellow click arrived while the old movement segment was visibly active;
+2. the old segment ended at 609 ms;
+3. the new click revision was still waiting for its first authoritative route
+   segment, so the normal fresh-click guard correctly rejected the broader
+   300 ms route grace;
+4. the former synthetic walk-stop idle controller was selected for one client
+   tick; and
+5. the replacement route segment arrived and locomotion resumed.
 
-The yellow-route fields also include the latest click revision, the revision
-owned by the displayed movement segment, and whether they match. This makes a
-future stale re-click handoff distinguishable from a delayed segment belonging
-to an unchanged long route.
+The handler now records whether the click occurred during a genuinely visible,
+non-zero movement segment. Only that case may retain the existing locomotion
+pose for up to 50 ms while the newer click revision awaits its first segment.
+Position stays at the last valid endpoint and orientation remains held. The
+state clears on the first new segment, a red interaction, scene recovery, a
+click made after stopping, or expiry. This is intentionally separate from the
+native stop-pose path: it prevents an evidenced
+`movement -> idle -> movement` selection seam, whereas a genuinely completed
+route now follows RuneLite's continuously advancing body pose.
 
-The option is diagnostic and should be turned off after evidence is collected;
-when disabled it performs no per-tick snapshot formatting or model inspection.
-When enabled, the rolling samples retain copied values and a lazy formatter;
-the relatively expensive human-readable log line is built only after an
-incident is confirmed, not on every client tick.
+## `[TMA-VALID-POSE-FRAME-PUBLICATION]`: never build visible geometry from frame -1
 
-Sampling is intentionally limited to `ClientTick` for thread safety. A visual
-frame that begins and ends entirely between two client ticks can therefore be
-missed. The numbered chat marker is the explicit confirmation that the
-detector captured a reported visual event; no marker means the log should not
-be assumed to contain that particular flicker.
+The remaining video-confirmed frame was neither a proper idle pose nor a
+native/custom overlap. It was unposed or bind-like custom geometry: legs spread
+and arms slightly raised. The surrounding state continued to report run 1661,
+the custom object stayed active, and source/merge preparation reported success.
+A generic animation-ID transition rule cannot protect a bad frame when the ID
+is identical before, during, and after it.
 
-The first full capture set contained 72 unfinished-route idle transitions.
-They consistently occurred just after a 600 ms movement segment expired:
-most at 608-619 ms and five at 751-758 ms. A later current-build capture found
-five more at 810-816 ms around area transitions. The cleanest example resumed
-an authoritative movement segment roughly 22 ms after requesting idle. The
-next validation run found five additional publications at 852-858 ms.
-Sample spacing remained normal, the custom model remained
-ready/active/authoritative, controller state did not reset, and there was no
-native/custom presentation swap. The visible "flicker" in these captured
-events was therefore a one- or multi-frame request for idle animation 808 or
-turn animation 823 between two valid locomotion requests, not a missing model.
+The crash produced by the later controller experiment supplied the missing
+scalar evidence. At the affected route handoff, the pose animation still
+reported run 1661 but `Owner.getPoseAnimationFrame()` was `-1`. Passing that
+value to `AnimationController.tick()` caused an `ArrayIndexOutOfBoundsException`.
+The interrupted controller render then left the actor's pose fields invalid;
+subsequent `Owner.getModel()` calls attempted frame 65535 and the game client
+crashed. That advancing controller bridge was removed completely.
 
-`[TMA-UNFINISHED-ROUTE-ANIMATION-CONTINUITY]` fixes that underlying selection
-seam. Locomotion remains selected for at most 300 ms when:
+The ordinary owner-pose path now fixes the invalid state directly. After a
+model is successfully prepared, the handler remembers its non-negative pose
+frame together with its animation ID. Before the next `Owner.getModel()` call:
 
-- the previous frame was moving;
-- an observed yellow-click route still owns continuity;
-- the current segment has reached its 600 ms endpoint;
-- the client still publishes a different, same-world-view route destination;
-  and
-- this is not the pre-movement delay after a fresh yellow click.
+- a valid in-range current frame remains authoritative;
+- a negative frame reuses the last valid frame only when it belongs to the
+  same requested pose animation; and
+- a reset, out-of-range frame, different animation, or unavailable cache uses
+  the request's validated starting frame.
 
-Only animation selection is preserved. Position tweening remains clamped to
-the completed segment, so the fix cannot cut corners, overshoot, enter an
-object, or invent a route. Red-click interactions synchronously cancel the
-yellow-walk arm, so object/NPC routes cannot inherit this grace and run in
-place. Equal/null/different-world-view destinations still stop normally. The
-300 ms limit covers the supplied 852-858 ms traces with 42 ms of scheduling
-margin while preventing an indefinitely stale destination from causing
-running in place.
+The existing animation-controller path also refuses to seed a controller from
+a negative owner frame. This prevents the same array-index failure in action
+or exception animations.
 
-The latest capture set also verified what was *not* failing. During stable
-frames there were no model-readiness losses, custom-authority drops,
-native/custom presentation swaps, controller resets, recovery rewinds, or
-large retained-camera rebases. Moving scene recoveries remained monotonic and
-the native handoff was used when it had already been presented. Consequently
-the post-scene yellow fix changes only the pose/facing choice while awaiting a
-real segment; it does not replace the already-valid position, scene-anchor,
-recovery, or camera paths.
+The invalid-frame correction is retained as crash hardening, but later in-game
+testing established that the visible bind-like pose was not specifically a
+re-click/start-of-route problem. It occurred at the genuine movement-to-idle
+edge, often on every yellow-click stop. That distinction matters: rebuilding a
+locomotion frame when a replacement route starts cannot repair a model exposed
+when the previous route finishes.
 
-The focused tests cover:
+## Removed experiments
+
+The cleanup deliberately removed approaches that did not solve the
+reported frame:
+
+- making the hidden native walk/run pose authoritative produced a walk-to-run
+  change halfway through a two-tile segment when the native actor caught up;
+- deferring every changed locomotion pose ID for one client tick still allowed
+  the defect because the malformed frame retained the same run ID;
+- wall-clock and update-scoped static model holds hid the bad pose by repeating
+  visible geometry, producing the reported mid-run/deceleration freeze; and
+- forcing normal locomotion through an advancing `AnimationController` accepted
+  frame `-1` and crashed the client. That ticking path was removed completely.
+- creating a separate stopped-idle controller remained the common failure path
+  after first-stop ownership, raw frame zero, retained non-zero frames, and a
+  primed interpolation sample were each tested in game. The bad pose survived
+  every variant, so the entire controller—not merely the latest attempted
+  workaround—was removed.
+
+Those removed rules do not remain in production. Removing them avoids animation
+latency and keeps the working fix tied to the actual movement-to-idle handoff.
+The earlier 50 ms pending-reclick pose handoff remains because it addresses a
+different, directly captured idle-selection seam.
+
+The one-update no-tick pose rebuild originally aimed at the first replacement
+segment was also removed after repeated stopping showed that it targeted the
+wrong lifecycle edge. Keeping it would add a second geometry path without
+protecting the frame that was actually visible.
+
+An experiment that restored the hidden actor's pose fields immediately after
+model construction was also removed after it broke arm and leg positioning.
+Those fields remain part of the current model-rendering contract and must not be
+treated as disposable scratch state.
+
+## Focused tests and validation boundary
+
+The retained tests cover:
 
 - world/local rebasing and scene identity;
-- atomic scene generation acknowledgement;
-- bounded scene-edge bridging;
-- scene presentation time deferral and repayment;
-- recovery tween duration/velocity preservation;
+- atomic scene generation acknowledgement and bounded scene-edge bridging;
+- presentation-time deferral, debt repayment, recovery duration, and velocity;
 - adaptive camera handoff, delta limiting, and vertical easing;
-- route-gap grace versus a fresh post-stop yellow click;
-- delayed first-segment handoff after a same-view yellow-click scene rebase;
-- native-facing settlement and second-click handoff; and
-- idle-controller ownership across positional catch-up.
+- late-route animation grace versus a genuinely fresh click;
+- post-scene and repeated-yellow-click segment ownership;
+- native-facing settlement and native-pose selection during a held stop;
+- hash-qualified local-player suppression versus same-ID game objects, other
+  players, and other world views; and
+- valid, invalid, stale, and reset pose-frame publication boundaries.
 
-These tests validate the rendering math and state transitions. In-game
-validation is still required for visual behavior because a JVM test cannot
-reproduce RuneLite's complete scene-render scheduling.
+These tests validate rendering math and state transitions. Only the user can
+confirm the final visual behaviour in game because a JVM test cannot reproduce
+RuneLite's complete client/render scheduling.

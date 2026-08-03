@@ -100,67 +100,113 @@ public class TrueTileMovementPlugin extends Plugin
 			WORLD_ENTITY_FIFTH_OPTION);
 
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
-	public boolean bIsPluginSupportedCurrently = true;
-	public int TicksSincePluginWasSupport = 0;
+	public volatile boolean bIsPluginSupportedCurrently = true;
+	public volatile int TicksSincePluginWasSupport = 0;
 	// [TMA-STEADY-PRESENTATION] Render callbacks can pause briefly during an
 	// ordinary long frame. The old six-client-tick threshold treated a
 	// roughly 100 ms hitch as GPU removal and tore down the model/controller.
 	// One second still detects an unsupported renderer promptly without
 	// converting a recoverable frame hitch into a visible animation restart.
 	private static final int GPU_CALLBACK_GRACE_CLIENT_TICKS = 50;
+	// [TMA-PLAYER-ONLY-RENDER-FILTER] drawObject can run on RuneLite's
+	// map-loader thread while the client thread owns all CustomMovementHandler
+	// and RuneLiteObject state. Publish the small decision the callback needs
+	// instead of reading live client/custom-object state from that callback.
+	private static final int TILE_OBJECT_TYPE_PLAYER = 0;
+	private volatile Player hiddenLocalPlayer = null;
+	private volatile int hiddenLocalPlayerId = -1;
+	private volatile int hiddenLocalPlayerWorldViewId = -1;
+	private volatile boolean hideLocalPlayerScene = false;
+	private volatile boolean hideLocalPlayerUi = false;
 	private final RenderCallback renderCallback = new RenderCallback()
 	{
 		@Override
 		public boolean addEntity(Renderable renderable, boolean ui)
 		{
-			if (bForceEarlyOut || !bIsPluginSupportedCurrently || !config.CustomOverheadRendering() || client.getLocalPlayer() == null)
-			{
-				return true;
-			}
-
-			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(client.getLocalPlayer().getId());
-			if (FoundHandler != null &&
-					ShouldSuppressNativeOwner(
-							bSceneLoadVisualHandoffPending,
-							OverlayRenderer.bRuneliteObjectsStale,
-							FoundHandler.CanSuppressOwnerInCurrentScene()))
-			{
-
-				if (ui && Objects.equals(renderable.toString(), client.getLocalPlayer().toString()))
-				{
-					return !(renderable instanceof Player);
-				}
-			}
-
-			return true;
+			return !hideLocalPlayerUi ||
+					!ui ||
+					renderable != hiddenLocalPlayer;
 		}
 
 		@Override
 		public boolean drawObject(Scene scene, TileObject object)
 		{
-			if (bForceEarlyOut)
+			long ObjectHash = object.getHash();
+			// Unlike addEntity, drawObject is supplied by the GPU renderer. A
+			// player entry occurs every rendered player frame, so use only that
+			// entry for the heartbeat and keep even scalar writes off the static
+			// map-loader upload path.
+			if (GetTileObjectType(ObjectHash) == TILE_OBJECT_TYPE_PLAYER)
 			{
-				return true;
+				MarkGpuRenderCallbackObserved();
 			}
-
-			// Only supported with GPU plugin
-			TicksSincePluginWasSupport = 0;
-			bIsPluginSupportedCurrently = true;
-
-			// hide player
-			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(object.getId());
-			if (FoundHandler != null &&
-					ShouldSuppressNativeOwner(
-							bSceneLoadVisualHandoffPending,
-							OverlayRenderer.bRuneliteObjectsStale,
-							FoundHandler.CanSuppressOwnerInCurrentScene()))
-			{
-				return false;
-			}
-
-			return true;
+			// TileObject IDs are object/player IDs from different namespaces.
+			// A hash-qualified published snapshot ensures an ordinary object can
+			// never collide with the local player's index and be suppressed.
+			return ShouldDrawTileObject(
+					hideLocalPlayerScene,
+					hiddenLocalPlayerId,
+					hiddenLocalPlayerWorldViewId,
+					ObjectHash,
+					object.getId());
         }
 	};
+
+	private void MarkGpuRenderCallbackObserved()
+	{
+		TicksSincePluginWasSupport = 0;
+		bIsPluginSupportedCurrently = true;
+	}
+
+	static boolean ShouldDrawTileObject(
+			boolean HideLocalPlayer,
+			int HiddenLocalPlayerId,
+			int HiddenLocalPlayerWorldViewId,
+			long ObjectHash,
+			int ObjectId)
+	{
+		int ObjectType = GetTileObjectType(ObjectHash);
+		int ObjectWorldViewId = (int) ((ObjectHash >>> 52) & 4095L);
+		return !HideLocalPlayer ||
+				ObjectType != TILE_OBJECT_TYPE_PLAYER ||
+				ObjectId != HiddenLocalPlayerId ||
+				ObjectWorldViewId != HiddenLocalPlayerWorldViewId;
+	}
+
+	private static int GetTileObjectType(long ObjectHash)
+	{
+		return (int) ((ObjectHash >>> 16) & 7L);
+	}
+
+	private void PublishLocalPlayerRenderState(
+			Player Player,
+			boolean HideLocalPlayer)
+	{
+		WorldView PlayerWorldView = Player == null
+				? null
+				: Player.getWorldView();
+		if (!HideLocalPlayer || PlayerWorldView == null)
+		{
+			// Disable both consumers before clearing the associated identity.
+			// A callback racing this client-thread publication therefore fails
+			// open and lets RuneLite draw its native content.
+			hideLocalPlayerScene = false;
+			hideLocalPlayerUi = false;
+			hiddenLocalPlayer = null;
+			hiddenLocalPlayerId = -1;
+			hiddenLocalPlayerWorldViewId = -1;
+			return;
+		}
+
+		// Publish identity first and the enable flags last. Volatile ordering
+		// guarantees callbacks which observe a true flag also observe the
+		// matching player/world-view snapshot.
+		hiddenLocalPlayer = Player;
+		hiddenLocalPlayerId = Player.getId();
+		hiddenLocalPlayerWorldViewId = PlayerWorldView.getId();
+		hideLocalPlayerUi = config.CustomOverheadRendering();
+		hideLocalPlayerScene = true;
+	}
 
 	public boolean bForceEarlyOut = false;
 
@@ -209,6 +255,10 @@ public class TrueTileMovementPlugin extends Plugin
 
 	private void InvalidateScenePresentation()
 	{
+		// Scene upload may begin on the map-loader thread immediately after
+		// this event. Fail open until a replacement model has been prepared in
+		// the destination scene and a new client-thread snapshot is published.
+		PublishLocalPlayerRenderState(null, false);
 		++SceneGeneration;
 		SceneLoadPreRenderedHandler = null;
 		OverlayRenderer.bRuneliteObjectsStale = true;
@@ -326,18 +376,23 @@ public class TrueTileMovementPlugin extends Plugin
 					GPU_CALLBACK_GRACE_CLIENT_TICKS + 1,
 					TicksSincePluginWasSupport + 1);
 		}
+		if (!bIsPluginSupportedCurrently ||
+				client.getGameState() != GameState.LOGGED_IN ||
+				client.getLocalPlayer() == null)
+		{
+			PublishLocalPlayerRenderState(null, false);
+		}
 
-		// [TMA-PLAYER-FLICKER-DIAGNOSTICS] This is the sole live-state
-		// sampling point. It runs on RuneLite's client thread; render and
-		// overlay callbacks never inspect a RuneLiteObject for diagnostics.
+		// [TMA-STOP-IDLE-DIAGNOSTICS] Live actor/RuneLiteObject state is
+		// inspected only here on RuneLite's client thread. Never move this into
+		// the overlay/render callback; a previous diagnostic did so and could
+		// race scene-owned object replacement strongly enough to crash the game.
 		CustomMovementHandler LocalPlayerHandler =
 				GetLocalPlayerMovementHandler();
 		if (LocalPlayerHandler != null)
 		{
-			LocalPlayerHandler.CapturePlayerFlickerSampleOnClientThread(
-					SceneGeneration,
-					bSceneLoadVisualHandoffPending,
-					OverlayRenderer.bRuneliteObjectsStale);
+			LocalPlayerHandler.CaptureStopIdleDiagnosticsOnClientThread(
+					config.DebugStopIdleTransitions());
 		}
 
 	}
@@ -674,13 +729,21 @@ public class TrueTileMovementPlugin extends Plugin
 	public void onBeforeRender(BeforeRender beforeRender)
 	{
 		bAdaptiveCameraRenderedThisFrame = false;
-		if (bForceEarlyOut || !bIsPluginSupportedCurrently || client.getLocalPlayer() == null)
+		Player player = client.getLocalPlayer();
+		if (bForceEarlyOut ||
+				!bIsPluginSupportedCurrently ||
+				player == null ||
+				client.getGameState() != GameState.LOGGED_IN)
 		{
+			PublishLocalPlayerRenderState(null, false);
 			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
 
-		Player player = client.getLocalPlayer();
+		// Start every prepared frame in fail-open mode. Suppression is enabled
+		// below only after the current-scene replacement has passed every
+		// readiness/handoff check.
+		PublishLocalPlayerRenderState(player, false);
 		CustomMovementHandler PlayerMovementHandler = OverlayRenderer.MovementHandlerCache.get(player.getId());
 		if (PlayerMovementHandler == null)
 		{
@@ -720,6 +783,14 @@ public class TrueTileMovementPlugin extends Plugin
 			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
+
+		PublishLocalPlayerRenderState(
+				player,
+				ShouldSuppressNativeOwner(
+						bSceneLoadVisualHandoffPending,
+						OverlayRenderer.bRuneliteObjectsStale,
+						PlayerMovementHandler
+								.CanSuppressOwnerInCurrentScene()));
 
 		float FootprintHeight = GetCameraFootprintTileHeight(
 				player.getWorldView(),
@@ -806,6 +877,7 @@ public class TrueTileMovementPlugin extends Plugin
 	{
 		if (bForceEarlyOut || !bIsPluginSupportedCurrently)
 		{
+			PublishLocalPlayerRenderState(null, false);
 			CurrentCameraPositionX = -1;
 			CurrentCameraPositionY = Float.NaN;
 			CurrentCameraPositionZ = -1;
@@ -837,6 +909,7 @@ public class TrueTileMovementPlugin extends Plugin
 		Player player = client.getLocalPlayer();
 		if (player == null)
 		{
+			PublishLocalPlayerRenderState(null, false);
 			return;
 		}
 
@@ -961,6 +1034,7 @@ public class TrueTileMovementPlugin extends Plugin
 		bAdaptiveCameraRenderedThisFrame = false;
 		bSceneLoadVisualHandoffPending = false;
 		SceneLoadPreRenderedHandler = null;
+		PublishLocalPlayerRenderState(null, false);
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -976,6 +1050,9 @@ public class TrueTileMovementPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		// Clear the callback snapshot synchronously before unregistering is
+		// queued, so an in-flight upload can only draw the native player.
+		PublishLocalPlayerRenderState(null, false);
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionY = Float.NaN;
 		CurrentCameraPositionZ = -1;

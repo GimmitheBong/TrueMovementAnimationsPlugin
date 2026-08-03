@@ -342,12 +342,12 @@ public interface TrueTileMovementConfig extends Config
 	}
 
 	@ConfigItem(
-			keyName = "AutoLogPlayerFlickers",
-			name = "(Debug) Auto-Log Player Flickers",
-			description = "Records bounded movement context and posts a numbered chat message when a possible player flicker is detected",
+			keyName = "DebugStopIdleTransitions",
+			name = "(Debug) Trace Stop-Idle Transitions",
+			description = "Records a bounded client-thread-only trace and chat marker when yellow-click movement enters idle",
 			section = advancedSection
 	)
-	default boolean AutoLogPlayerFlickers()
+	default boolean DebugStopIdleTransitions()
 	{
 		return false;
 	}
