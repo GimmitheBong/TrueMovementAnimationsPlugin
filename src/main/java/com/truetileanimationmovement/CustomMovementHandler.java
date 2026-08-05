@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.AnimationID;
 
 import javax.inject.Inject;
 import java.util.ArrayDeque;
@@ -67,6 +68,19 @@ public class CustomMovementHandler
     private static final int STOP_IDLE_TRACE_PRE_SAMPLES = 8;
     private static final int STOP_IDLE_TRACE_POST_SAMPLES = 10;
     private static final int STOP_IDLE_TRACE_MODEL_VERTEX_SAMPLES = 96;
+    // [TMA-TELEPORT] Restored original teleport presentation state. A genuine
+    // teleport is identified by the teleport animation the client publishes in
+    // onGameTick. Timestamps are compared in System.nanoTime() domain like the
+    // original so the millisecond-based frame timer never scales the windows.
+    private static final long TELEPORT_ANIMATION_WINDOW_NANOS =
+            1_800_000_000L; // 1.8s: full teleport-in presentation window
+    private static final long TELEPORT_ANIMATION_FIRST_TICK_NANOS =
+            600_000_000L; // 0.6s: blend with the true-tile movement first tick
+
+    private long GetTeleportElapsedNanoseconds()
+    {
+        return System.nanoTime() - overlay.LastTimeTeleport;
+    }
     // General
     private final Client client;
     private final TrueTileMovementPlugin plugin;
@@ -240,16 +254,21 @@ public class CustomMovementHandler
         UniqueAnimationExceptionList.add(2588); // Agility
         UniqueAnimationExceptionList.add(2586); // Agility
         UniqueAnimationExceptionList.add(2583); // Agility
+        // [TMA-TELEPORT-CORRECT] Only genuine teleport animations are treated
+        // as unique lerped animations. The original list also contained
+        // ZAROS_VERTICAL_CASTING (1979, Ancient Magick cast) and
+        // ARCEUUS_NECROMANCY_ANIM (3865, Arceuus spell cast), which are
+        // ordinary spell casts and falsely armed the teleport-in snap during
+        // PvP combat. Combat spells (entangle, fire surge, Flames of Zamorak,
+        // Claws of Guthix, etc.) were never in this list and are unaffected.
         UniqueAnimationExceptionList.add(714); // Teleport
         UniqueAnimationExceptionList.add(878); // Teleport
         UniqueAnimationExceptionList.add(1816); // Teleport
-        UniqueAnimationExceptionList.add(1979); // Teleport
         UniqueAnimationExceptionList.add(3872); // Teleport
         UniqueAnimationExceptionList.add(13811); // Teleport
         UniqueAnimationExceptionList.add(4069); // Teleport
         UniqueAnimationExceptionList.add(4071); // Teleport
         UniqueAnimationExceptionList.add(3869); // Teleport
-        UniqueAnimationExceptionList.add(3865); // Teleport
         UniqueAnimationExceptionList.add(2881); // Teleport
 
         UniqueAnimationLocationAndOrientationExceptionList.add(749); // crawl pipe
@@ -2258,6 +2277,18 @@ public class CustomMovementHandler
                 }
                 ++FramesSinceIdle;
 
+                // [TMA-TELEPORT] Restored original teleport interrupt. If a
+                // route change arrives while the visible model is still
+                // performing the teleport-in presentation, cancel that
+                // presentation so the newer movement takes over. Only a
+                // genuine teleport can have armed it.
+                if (IsPlayerOwner() &&
+                        overlay.bShouldPlayTeleportAnimation &&
+                        FramesSinceIdle > 1)
+                {
+                    overlay.bTeleportInterrupted = true;
+                }
+
                 // Fallback to quick and dirty move
 
                 int DistanceInTilesToLast = 0;
@@ -2312,36 +2343,53 @@ public class CustomMovementHandler
                                 NewLocalPointToDraw != null);
                 if (bReanchorRecovery)
                 {
-                    // [TMA-SCENE-LOAD-CONTINUITY] The next route step arrived
-                    // before a recovery/scene-edge bridge finished. Continue
-                    // from the displayed point; snapping to the authoritative
-                    // endpoint is the skip visible in the scene-load traces.
+                    // Recovery/scene-edge bridge: continue from the displayed
+                    // point. The flag was set by a prior catch-up frame.
+                    bSceneRecoveryRetargetPending = false;
+                }
+
+                // [TMA-VISUAL-CONTINUITY] Every re-route must seed the
+                // interpolation origin from the last rendered position, not
+                // from the previous segment's authoritative destination tile.
+                // The old path computed distance heuristics (normal / far
+                // / teleport) and used them only to decide where LastLerp-
+                // Position should point. Those heuristics still determine
+                // recovery velocity and the catch-up flag, but the anchor
+                // itself is always the visible member.
+                if (NewLocalPointToDraw != null)
+                {
                     LastLerpPosition = NewLocalPointToDraw;
                     LastLerpPositionWorldPoint =
-                            WorldPoint.fromLocal(
-                                    client,
-                                    LastLerpPosition);
+                            WorldPoint.fromLocal(client, LastLerpPosition);
+                    LastTrueTilePosition = NewLocalPointToDraw;
                 }
-                else if (NextLerpPoint != null &&
-                        DistanceInTilesToNextLerp <= config.PlayerModelSnapDistance() &&
-                        DistanceInTilesToLast <= config.PlayerModelSnapDistance())
+                else if (NextLerpPoint != null)
                 {
-                    LastLerpPosition = NextLerpPosition;
-                    LastLerpPositionWorldPoint = WorldPoint.fromLocal(client, LastLerpPosition);
+                    LastLerpPosition = NextLerpPoint;
+                    LastLerpPositionWorldPoint =
+                            WorldPoint.fromLocal(client, LastLerpPosition);
                 }
-                // Lerp point does not exist! Teleport or something like that
                 else
                 {
-                    if (NextLerpPoint == null)
-                    {
-                        NextLerpPoint = RequestedLerpPoint;
-                    }
-                    LastLerpPosition = NextLerpPoint;
-                    LastLerpPositionWorldPoint = WorldPoint.fromLocal(client, LastLerpPosition);
+                    LastLerpPosition = NextLerpPosition;
+                    LastLerpPositionWorldPoint =
+                            WorldPoint.fromLocal(client, LastLerpPosition);
                     LastTrueTilePosition = CurrentTrueTilePosition;
-
                 }
-                bSceneRecoveryRetargetPending = false;
+
+                // [TMA-CATCH-UP-FLAG] The far-branch is the only one that
+                // needs extended tween recovery. Mark it so the next frame
+                // uses recovery velocity and does not restart the clock.
+                if (!bReanchorRecovery &&
+                        !(NextLerpPoint != null &&
+                                DistanceInTilesToNextLerp <=
+                                        config.PlayerModelSnapDistance() &&
+                                DistanceInTilesToLast <=
+                                        config.PlayerModelSnapDistance()) &&
+                        NewLocalPointToDraw != null)
+                {
+                    bSceneRecoveryRetargetPending = true;
+                }
 
                 NextLerpPosition = RequestedLerpPoint;
 
@@ -2518,21 +2566,88 @@ public class CustomMovementHandler
                 FramesSinceIdle = 0;
             }
 
-            // [TMA-CAST-MOVEMENT-ORDERING] Owner.getAnimation() is the single
-            // authority for an active cast. The old implementation also
-            // remembered selected cast/teleport animation IDs and later
-            // synthesized HUMAN_CASTTELEPORT_REVERSE (animation 715). If the
-            // player clicked to move first, locomotion could begin and that
-            // delayed animation would then replay the cast and request a
-            // false positional snap. Keep locomotion advancing underneath
-            // the real action animation instead. Genuine teleports and other
-            // authoritative discontinuities still use the normal movement
-            // request path; only the delayed duplicate authority was removed.
-            if (config.AllowLeaping() &&
+        // [TMA-TELEPORT] Restored original teleport animation selection.
+        // A genuine teleport plays the teleport-in presentation within the
+        // nanoTime window set by onGameTick/UpdateLerpDestinations. This
+        // branch is gated on bShouldPlayTeleportAnimation being explicitly
+        // set by a genuine teleport detection in onGameTick. Spell casting
+        // animations are no longer in the teleport detection list, so this
+        // branch can never be armed by ordinary PvP combat casting.
+        if (IsPlayerOwner() &&
+                overlay.bShouldPlayTeleportAnimation &&
+                GetTeleportElapsedNanoseconds() <
+                        TELEPORT_ANIMATION_WINDOW_NANOS &&
+                !overlay.bTeleportInterrupted)
+            {
+                if (overlay.bShouldPlayTeleportAnimation &&
+                        bIsDefaultHumanAnimationSet)
+                {
+                    if (GetTeleportElapsedNanoseconds() <
+                            TELEPORT_ANIMATION_FIRST_TICK_NANOS)
+                    {
+                        // Blend with the first tick
+                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                        CurrentAnimationRequest.bShouldTeleportToLocation = false;
+                    }
+                    else
+                    {
+                        CurrentAnimationRequest.bShouldTeleportToLocation = true;
+                        CurrentAnimationRequest.AnimationToPlay = AnimationID.HUMAN_CASTTELEPORT_REVERSE; // Teleport in. 715
+
+                        ChangeLastLerpPointForRotation();
+                    }
+                }
+                else
+                {
+                    // Get true animation and rotation
+                    // Use orientation to identify which of the tile we are moving to
+                    double radians = Owner.getOrientation() * Math.PI / 1024.0;
+                    double cos = Math.cos(radians);
+                    double sin = Math.sin(radians);
+
+                    // Get vector between true tile last and next;
+                    // Rotate vector by orientation
+                    int DirectionX = Owner.getLocalLocation().getX() - LastTrueTilePosition.getX();
+                    int DirectionY = Owner.getLocalLocation().getY() - LastTrueTilePosition.getY();
+
+                    if (Owner.getLocalLocation().getX() == CurrentTrueTilePosition.getX() &&
+                            Owner.getLocalLocation().getY() == CurrentTrueTilePosition.getY())
+                    {
+                        CurrentAnimationRequest.PoseAnimationToPlay = OldAnimationSet.IdlePoseAnimation;
+                    }
+                    else
+                    {
+                        int TempRotatedDirectionX = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * cos - DirectionY * sin) / 128.0))));
+                        int TempRotatedDirectionY = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * sin + DirectionY * cos) / 128.0))));
+
+                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + TempRotatedDirectionX][2 + TempRotatedDirectionY]);
+                    }
+                    bShouldUseTrueLocationOrientation = true;
+                    CurrentAnimationRequest.bShouldTeleportToLocation = true;
+
+                    ChangeLastLerpPointForRotation();
+                }
+                CurrentAnimationRequest.bUseLinearTween = true;
+                CurrentAnimationRequest.MovementSpeedMultiplier = 1.0;
+                CurrentAnimationRequest.StartingFrame = 0;
+                CurrentAnimationRequest.AnimationSpeed = 1;
+            }
+            else if (config.AllowLeaping() &&
                     bCurrentlyWooxWalking &&
                     config.AllowWooxWalkDetection() &&
                     bIsDefaultHumanAnimationSet)
             {
+                // [TMA-CAST-MOVEMENT-ORDERING] Owner.getAnimation() is the
+                // single authority for an active cast. The old implementation
+                // also remembered selected cast/teleport animation IDs and
+                // later synthesized HUMAN_CASTTELEPORT_REVERSE (animation
+                // 715). If the player clicked to move first, locomotion could
+                // begin and that delayed animation would then replay the cast
+                // and request a false positional snap. Keep locomotion
+                // advancing underneath the real action animation instead.
+                // Genuine teleports and other authoritative discontinuities
+                // still use the normal movement request path; only the
+                // delayed duplicate authority was removed.
                 // Handle woox walking
                 CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"WooxWalk", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
 
@@ -3114,7 +3229,8 @@ public class CustomMovementHandler
             {
                 if (Model.getLocation() != NewLocalPointToDraw)
                 {
-                    Model.setLocation(NewLocalPointToDraw, Owner.getWorldView().getPlane());
+                    Model.setLocation(NewLocalPointToDraw,
+                            Owner.getWorldView().getPlane());
                 }
                 // Find best direction to go, offset by 10000 for comparison to avoid negatives
                 int ShortestAngle = ShortestAngleDifference(CurrentOrientation, TargetOrientation);
@@ -3365,15 +3481,23 @@ public class CustomMovementHandler
                 Model.setZ(FootprintHeight);
             }
 
-            // The native presentation is still useful while genuinely idle,
-            // but never switch authorities at a movement tile boundary.
+            // [TMA-NO-SPAWN-IN] The native presentation is still useful
+            // while genuinely idle, but do NOT toggle the custom model
+            // inactive during proximity. setActive(false) → setActive(true)
+            // triggers RuneLite's entity spawn-in animation (small → normal
+            // scale), and the model may be reactivated at a stale segment
+            // destination rather than its last rendered location. Instead,
+            // keep the custom model active in the background and let the
+            // native player draw on top when within proximity thresholds.
+            // This prevents every stationary → moving transition from
+            // producing a visible shrink/grow at the wrong tile.
             if (RenderedModel != null &&
                     ShouldRenderOriginalOwner(
                             bUsedCustomAnimation))
             {
-                if (Model.isActive())
+                if (!Model.isActive())
                 {
-                    Model.setActive(false);
+                    Model.setActive(true);
                 }
                 bRenderOriginalOwnerDueToProximity = true;
             }

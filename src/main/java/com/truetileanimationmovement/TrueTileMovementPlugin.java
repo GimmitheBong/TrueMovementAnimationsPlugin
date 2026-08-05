@@ -7,6 +7,7 @@ import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
+import net.runelite.api.gameval.AnimationID;
 import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
@@ -897,6 +898,40 @@ public class TrueTileMovementPlugin extends Plugin
 		else
 		{
 			OverlayRenderer.bShowHPBar = false;
+		}
+
+		// [TMA-TELEPORT] Restored original teleport detection. A genuine
+		// teleport is identified only by the teleport animation the client
+		// publishes on the player. Ordinary fast running/walking never plays
+		// these animations, so the movement-continuity path (which treats
+		// scene/region transitions as preserved interpolation) remains
+		// untouched for normal movement.
+		Player LocalPlayer = client.getLocalPlayer();
+		if (LocalPlayer != null)
+		{
+			// [TMA-TELEPORT-CORRECT] Only arm the teleport presentation for
+			// animations that are genuinely teleport cast/tablet/arrival
+			// sequences. Several original-list entries were spell-casting
+			// animations from non-teleport spellbooks (e.g. ZAROS_VERTICAL_
+			// CASTING is an Ancient Magick cast, ARCEUUS_NECROMANCY_ANIM
+			// is an Arceuus spell). These falsely armed the position-snap
+			// teleport-in path during PvP casting, making the model skip
+			// tiles on every spell cast while moving.
+			int CurrentAnimation = LocalPlayer.getAnimation();
+			if (CurrentAnimation == AnimationID.HUMAN_CASTTELEPORT || // 714
+					CurrentAnimation == AnimationID.AHOY_ECTO_TELEPORT || // 878
+					CurrentAnimation == AnimationID.HUMAN_TELEPORT_OTHER_IMPACT || // 1816
+					CurrentAnimation == AnimationID.TELEPORT_NARDAH_HUMAN || // 3872
+					CurrentAnimation == AnimationID.HUMAN_COWBOSS_TELEPORT || // 13811
+					CurrentAnimation == AnimationID.POH_SMASH_MAGIC_TABLET || // 4069
+					CurrentAnimation == AnimationID.POH_ABSORB_TABLET_TELEPORT || // 4071
+					CurrentAnimation == AnimationID.TELEPORT_CABBAGE_HUMAN || // 3869
+					CurrentAnimation == AnimationID.NTK_HUMAN_TELE) // 2881
+			{
+				OverlayRenderer.LastTimeTeleport = System.nanoTime();
+				OverlayRenderer.bShouldPlayTeleportAnimation = true;
+				OverlayRenderer.bTeleportInterrupted = false;
+			}
 		}
 
 		// Print recent animation for convenience

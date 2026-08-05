@@ -38,6 +38,13 @@ public class TrueMovementOverlay extends OverlayPanel
     public boolean bEverythingIsStale = false;
     public boolean bRuneliteObjectsStale = false;
     public boolean bRecentlyClickedEvent = false;
+    // [TMA-TELEPORT] Restored original teleport presentation state. A
+    // genuine teleport (the local player plays a teleport animation in
+    // onGameTick) arms the teleport-in presentation. Ordinary fast running
+    // never publishes those animations and never sets these fields.
+    public long LastTimeTeleport = 0;
+    public boolean bShouldPlayTeleportAnimation = false;
+    public boolean bTeleportInterrupted = false;
 
     // HP Bar
     public boolean bShowHPBar = true;

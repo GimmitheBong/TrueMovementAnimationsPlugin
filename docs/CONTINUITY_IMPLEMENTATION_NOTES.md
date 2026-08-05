@@ -765,3 +765,46 @@ The retained tests cover:
 These tests validate rendering math and state transitions. Only the user can
 confirm the final visual behaviour in game because a JVM test cannot reproduce
 RuneLite's complete client/render scheduling.
+
+## `[TMA-TELEPORT-CORRECT]`: do not treat PvP spell casts as teleports
+
+### Cause
+
+The restored teleport detection in `onGameTick` inherited a list of animation
+IDs from the original plugin. Two of those IDs were not teleports:
+
+- `ZAROS_VERTICAL_CASTING` (1979) is the Ancient Magick combat cast
+  animation (Ice Barrage, Blood Barrage, etc.).
+- `ARCEUUS_NECROMANCY_ANIM` (3865) is an Arceuus spellbook cast animation.
+
+Every time a player cast one of these spells during PvP, `onGameTick` armed
+`LastTimeTeleport` / `bShouldPlayTeleportAnimation`. The teleport-in branch in
+`UpdateAnimationSelection` then set `bShouldTeleportToLocation = true`, and
+`ApplyTweening` produced `TweenValue = 1.0` — an instant snap to the native
+position at the end of the segment. The visible model skipped 1–3 tiles on
+every spell cast while moving, and in some cases the reactivation produced the
+entity spawn-in scale effect.
+
+Frame-to-frame position diagnostics confirmed the pattern: all PvP-related
+jumps logged `teleport=true` with `moving=true` and a tiny elapsed time, while
+the death-scene rebuild logged `teleport=false` with a large frame delta.
+
+### Fix
+
+- `onGameTick` now detects only genuine teleport animations:
+  714, 878, 1816, 3872, 13811, 4069, 4071, 3869 and 2881.
+- `UpdateAnimationSelection` gates the teleport-in branch on
+  `overlay.bShouldPlayTeleportAnimation` so a stale time window can never
+  arm the position snap unless a genuine teleport animation was observed.
+- `CustomMovementHandler`'s unique-animation exception list was also pruned
+  of the two spell-cast IDs so no other lerp path treats them as teleports.
+- Combat spells (entangle, fire surge, Flames of Zamorak, Claws of Guthix,
+  etc.) were never in the teleport list and remain unaffected.
+
+### Maintenance invariant
+
+Do not add spell-cast animations to `onGameTick`'s teleport detection. A
+teleport-in presentation may only be armed by an animation that actually
+moves the player to another location. If a new spell's animation ID is ever
+needed for lerp treatment, it belongs in the movement-animation path, never
+in the teleport list.
