@@ -918,6 +918,9 @@ public class CustomMovementHandler
         {
             RuneLiteObject OldModel = Model;
             Model = client.createRuneLiteObject();
+            // [TMA-TRANSPARENCY-DEPTH] Force depth-sorted rendering
+            // so transparent faces draw after body faces.
+            Model.setRenderMode(Renderable.RENDERMODE_SORTED);
             LastValidOwnerPoseAnimation = NO_ANIMATION;
             LastValidOwnerPoseFrame = 0;
 
