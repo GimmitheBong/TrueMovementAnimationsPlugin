@@ -3373,10 +3373,17 @@ public class CustomMovementHandler
                     AnimController.setFrame(0);
                 }
 
+                // [TMA-INTERPOLATION-CONTINUITY] A transient -1 pose
+                // frame (which the game publishes at route handoffs)
+                // must NOT trigger an explicit setPoseAnimationFrame
+                // call — that resets the client's internal interpolation
+                // timer and causes visible stutter in smoothed
+                // locomotion.  The TrySetModel fallback below already
+                // preserves the last valid model when the Owner cannot
+                // supply one for a single frame.
                 if (CurrentAnimationRequest.PoseAnimationToPlay != -1 &&
                         (Owner.getPoseAnimation() !=
                                 CurrentAnimationRequest.PoseAnimationToPlay ||
-                                Owner.getPoseAnimationFrame() < 0 ||
                                 bResetCurrentAnimation))
                 {
                     int RequestedPoseAnimation =

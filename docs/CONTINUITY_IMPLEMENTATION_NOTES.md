@@ -808,3 +808,44 @@ teleport-in presentation may only be armed by an animation that actually
 moves the player to another location. If a new spell's animation ID is ever
 needed for lerp treatment, it belongs in the movement-animation path, never
 in the teleport list.
+
+## `[TMA-INTERPOLATION-CONTINUITY]`: do not reset the client interpolation timer on transient -1 pose frames
+
+### Cause
+
+RuneLite's built-in animation interpolation (enabled by the Animation Smoothing
+plugin via `client.setAnimationInterpolationFilter()`) tracks the time since
+the last `setPoseAnimationFrame()` call to calculate sub-frame vertex blending.
+Every explicit call resets that timer.
+
+The game engine occasionally publishes `Owner.getPoseAnimationFrame() == -1`
+at route handoffs, even during continuous straight-line running.  The old
+pose-publication block treated *any* invalid frame as a reason to call
+`SelectPoseFrameForPublication` → `Owner.setPoseAnimationFrame()`, which
+reset the interpolation clock mid-stride.  The result was a visible stutter
+every few frames during locomotion while the idle breathing cycle remained
+smooth (idle 808 is never touched after its initial set).
+
+### Fix
+
+The `Owner.getPoseAnimationFrame() < 0` guard was removed from the
+`if (!bUsedCustomAnimation)` pose-publication block.  The block now only
+enters when the pose animation ID changes or an explicit reset is requested.
+
+A transient -1 frame is harmless for one update: the `TrySetModel` fallback
+already preserves the last drawable model when `Owner.getModel()` cannot
+supply one.  On the next client tick the game engine publishes a valid frame
+again, the model updates, and the interpolation timer has never been
+interrupted.
+
+The `SelectPoseFrameForPublication` helper and the `LastValidOwnerPoseFrame`
+fallback are retained — they still protect the case where the animation ID
+*has* changed and the naive frame read would be stale or invalid.
+
+### Maintenance invariant
+
+Do not add `Owner.getPoseAnimationFrame() < 0` back as a pose-block trigger.
+If an invalid frame must be corrected, do it through the model-building path
+(`TrySetModel` / `Owner.getModel()` null-guard) rather than by explicitly
+calling `Owner.setPoseAnimationFrame()` outside of an animation-ID change.
+
