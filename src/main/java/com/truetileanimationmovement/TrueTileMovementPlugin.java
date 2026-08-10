@@ -635,11 +635,11 @@ public class TrueTileMovementPlugin extends Plugin
 	static boolean ShouldRenderAdaptiveCamera(
 			boolean AdaptiveCameraOn,
 			boolean ShouldRenderOwner,
-			boolean SceneLoadVisualHandoffPending)
+			boolean NativeCameraHandoffPending)
 	{
 		return AdaptiveCameraOn &&
 				!ShouldRenderOwner &&
-				!SceneLoadVisualHandoffPending;
+				!NativeCameraHandoffPending;
 	}
 
 	static boolean ShouldSuppressNativeOwner(
@@ -808,14 +808,21 @@ public class TrueTileMovementPlugin extends Plugin
 		}
 
 		int CameraFollowHeight = GetCameraFollowHeight();
+		boolean bPohArrivalNativeCamera =
+				PlayerMovementHandler
+						.ShouldUseNativeCameraForPohArrival();
 
 		// Input processing uses the normal camera outside the draw interval. Never
 		// expose that interaction camera during presentation: on uneven terrain its
 		// focal height belongs to the hidden owner rather than the visible model.
+		// POH arrival is the deliberate exception: Construction replaces its
+		// temporary spawn coordinate after the first drawable frame, so retain
+		// RuneScape's native camera until the arrival guard is released by the
+		// first user world interaction.
 		if (ShouldRenderAdaptiveCamera(
 				IsAdaptiveCameraOn(),
 				PlayerMovementHandler.bShouldRenderOwner,
-				false))
+				bPohArrivalNativeCamera))
 		{
 			UpdateAdaptiveCamera(PlayerMovementHandler, FootprintHeight, CameraFollowHeight);
 		}
@@ -1121,11 +1128,18 @@ public class TrueTileMovementPlugin extends Plugin
 		CustomMovementHandler LocalPlayerHandler = GetLocalPlayerMovementHandler();
 		if (LocalPlayerHandler != null)
 		{
-			if (event.getMenuAction() == WALK)
+			MenuAction Action = event.getMenuAction();
+			if (Action == WALK || IsRedWorldInteraction(Action))
+			{
+				LocalPlayerHandler
+						.DisarmPohArrivalCoordinateGuardForUserInteraction();
+			}
+
+			if (Action == WALK)
 			{
 				LocalPlayerHandler.ArmWalkStopFacingHold();
 			}
-			else if (IsRedWorldInteraction(event.getMenuAction()))
+			else if (IsRedWorldInteraction(Action))
 			{
 				LocalPlayerHandler.CancelWalkStopFacingHold();
 			}

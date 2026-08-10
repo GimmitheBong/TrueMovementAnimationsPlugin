@@ -34,6 +34,11 @@ public class CustomMovementHandler
     private static final int SCENE_BOUNDARY_BRIDGE_MAX_MILLIS = 180;
     private static final int SCENE_BOUNDARY_BRIDGE_MAX_DISTANCE =
             Perspective.LOCAL_TILE_SIZE / 2;
+    // The Player-Owned House instance is allocated from these two map
+    // regions. RuneLite does not currently expose gameval RegionID constants
+    // for them, so keep the raw values named and isolated here.
+    private static final int POH_INSTANCE_REGION_WEST = 8046;
+    private static final int POH_INSTANCE_REGION_EAST = 8047;
     private static final int SCENE_PRESENTATION_MAX_FRAME_DELTA_MILLIS = 34;
     private static final int SCENE_PRESENTATION_MAX_TIME_DEBT_MILLIS = 600;
     private static final int SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR = 5;
@@ -165,6 +170,16 @@ public class CustomMovementHandler
     // position becomes the authoritative visual anchor for the rebase.
     private boolean bNativeSceneLoadHandoffPresented = false;
     private boolean bLastSceneRebaseUsedNativeHandoffAnchor = false;
+    // A POH first publishes a temporary arrival coordinate and can replace it
+    // later with the constructed portal room's actual coordinate. Keep this
+    // armed for the whole destination scene: a short timeout or an ordinary
+    // one-tile update can occur before that replacement arrives.
+    private boolean bPohArrivalCoordinateGuardArmed = false;
+    private int PohArrivalCoordinateGuardSceneGeneration = -1;
+    // Cleanup can run transiently while a first-time POH instance is still
+    // being assembled. Remember only an explicit user release so that such a
+    // cleanup can safely re-arm the destination-scene guard.
+    private int PohArrivalGuardReleasedSceneGeneration = -1;
     // Animation Handling
     private static final int NO_ANIMATION = -1;
     private int CurrentAnimation = 0;
@@ -1004,6 +1019,8 @@ public class CustomMovementHandler
         SceneRecoveryTweenDurationOverride = 0;
         bNativeSceneLoadHandoffPresented = false;
         bLastSceneRebaseUsedNativeHandoffAnchor = false;
+        bPohArrivalCoordinateGuardArmed = false;
+        PohArrivalCoordinateGuardSceneGeneration = -1;
         LastValidOwnerPoseAnimation = NO_ANIMATION;
         LastValidOwnerPoseFrame = 0;
         if (AnimController != null)
@@ -1658,6 +1675,165 @@ public class CustomMovementHandler
                         Second.getWorldView();
     }
 
+    static boolean ContainsPlayerOwnedHouseRegions(int[] MapRegions)
+    {
+        if (MapRegions == null)
+        {
+            return false;
+        }
+
+        boolean bHasWestRegion = false;
+        boolean bHasEastRegion = false;
+        for (int Region : MapRegions)
+        {
+            bHasWestRegion |= Region == POH_INSTANCE_REGION_WEST;
+            bHasEastRegion |= Region == POH_INSTANCE_REGION_EAST;
+        }
+        return bHasWestRegion && bHasEastRegion;
+    }
+
+    private boolean IsInPlayerOwnedHouseInstance()
+    {
+        WorldView WorldView = Owner == null
+                ? null
+                : Owner.getWorldView();
+        return WorldView != null &&
+                WorldView.isInstance() &&
+                ContainsPlayerOwnedHouseRegions(
+                        WorldView.getMapRegions());
+    }
+
+    static boolean ShouldSynchronizePohArrivalPresentation(
+            boolean bGuardArmed,
+            int GuardSceneGeneration,
+            int CurrentSceneGeneration,
+            LocalPoint NativeLocation,
+            LocalPoint... PresentationLocations)
+    {
+        if (!bGuardArmed ||
+                GuardSceneGeneration != CurrentSceneGeneration ||
+                NativeLocation == null)
+        {
+            return false;
+        }
+
+        for (LocalPoint PresentationLocation : PresentationLocations)
+        {
+            if (PresentationLocation != null &&
+                    !NativeLocation.equals(PresentationLocation))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean ShouldArmPohArrivalCoordinateGuard(
+            boolean bInPlayerOwnedHouse,
+            boolean bGuardArmed,
+            int ReleasedSceneGeneration,
+            int CurrentSceneGeneration)
+    {
+        return bInPlayerOwnedHouse &&
+                !bGuardArmed &&
+                ReleasedSceneGeneration != CurrentSceneGeneration;
+    }
+
+    private void ArmPohArrivalCoordinateGuard()
+    {
+        int CurrentSceneGeneration = plugin.GetSceneGeneration();
+        if (!ShouldArmPohArrivalCoordinateGuard(
+                IsPlayerOwner() &&
+                        IsInPlayerOwnedHouseInstance(),
+                bPohArrivalCoordinateGuardArmed,
+                PohArrivalGuardReleasedSceneGeneration,
+                CurrentSceneGeneration))
+        {
+            return;
+        }
+
+        bPohArrivalCoordinateGuardArmed = true;
+        PohArrivalCoordinateGuardSceneGeneration =
+                CurrentSceneGeneration;
+    }
+
+    private void SynchronizePohArrivalCoordinateToNative()
+    {
+        if (!bPohArrivalCoordinateGuardArmed ||
+                PohArrivalCoordinateGuardSceneGeneration !=
+                        plugin.GetSceneGeneration())
+        {
+            return;
+        }
+
+        LocalPoint NativeLocation = Owner.getLocalLocation();
+        LocalPoint ModelLocation = Model == null
+                ? null
+                : Model.getLocation();
+        boolean bOutOfSync =
+                ShouldSynchronizePohArrivalPresentation(
+                        bPohArrivalCoordinateGuardArmed,
+                        PohArrivalCoordinateGuardSceneGeneration,
+                        plugin.GetSceneGeneration(),
+                        NativeLocation,
+                        LastLerpPosition,
+                        NextLerpPosition,
+                        NewLocalPointToDraw,
+                        ModelLocation);
+        if (!bOutOfSync)
+        {
+            return;
+        }
+
+        WorldPoint NativeWorldPoint = Owner.getWorldLocation();
+        LastLerpPosition = NativeLocation;
+        NextLerpPosition = NativeLocation;
+        NewLocalPointToDraw = NativeLocation;
+        LastLerpPositionWorldPoint = NativeWorldPoint;
+        NextLerpPositionWorldPoint = NativeWorldPoint;
+        LastTrueTilePosition = NativeLocation;
+        CurrentTrueTilePosition = NativeLocation;
+        CurrentWorldPoint = NativeWorldPoint;
+        MillisecondsSinceTileChange = BASE_MOVEMENT_TWEEN_MILLIS;
+        bSceneRecoveryRetargetPending = false;
+        bSceneBoundaryBridgeActive = false;
+        bScenePresentationClockActive = false;
+        bSceneLoadFramePresentationPending = false;
+        ScenePresentationTimeDebtMilliseconds = 0;
+        SceneRecoveryBaseVelocity = 0;
+        SceneRecoveryTweenDurationOverride = 0;
+        if (Model != null)
+        {
+            Model.setLocation(
+                    NativeLocation,
+                    Owner.getWorldView().getPlane());
+        }
+    }
+
+    void DisarmPohArrivalCoordinateGuardForUserInteraction()
+    {
+        // Record the interaction even if a transient handler cleanup cleared
+        // the live flag immediately beforehand. This prevents a later update
+        // from re-arming arrival behavior after the user has started moving.
+        PohArrivalGuardReleasedSceneGeneration =
+                plugin.GetSceneGeneration();
+        if (!bPohArrivalCoordinateGuardArmed)
+        {
+            return;
+        }
+
+        bPohArrivalCoordinateGuardArmed = false;
+        PohArrivalCoordinateGuardSceneGeneration = -1;
+    }
+
+    boolean ShouldUseNativeCameraForPohArrival()
+    {
+        ArmPohArrivalCoordinateGuard();
+        return bPohArrivalCoordinateGuardArmed &&
+                PohArrivalCoordinateGuardSceneGeneration ==
+                        plugin.GetSceneGeneration();
+    }
+
     private boolean HasSceneMovementDiscontinuity()
     {
         int OwnerAnimation = Owner == null
@@ -1902,6 +2078,9 @@ public class CustomMovementHandler
             LastRenderedWorldOffsetX = 0;
             LastRenderedWorldOffsetY = 0;
         }
+
+        bPohArrivalCoordinateGuardArmed = false;
+        PohArrivalCoordinateGuardSceneGeneration = -1;
 
         LastLerpPosition = RenderedLocation;
         NewLocalPointToDraw = RenderedLocation;
@@ -3373,17 +3552,15 @@ public class CustomMovementHandler
                     AnimController.setFrame(0);
                 }
 
-                // [TMA-INTERPOLATION-CONTINUITY] A transient -1 pose
-                // frame (which the game publishes at route handoffs)
-                // must NOT trigger an explicit setPoseAnimationFrame
-                // call — that resets the client's internal interpolation
-                // timer and causes visible stutter in smoothed
-                // locomotion.  The TrySetModel fallback below already
-                // preserves the last valid model when the Owner cannot
-                // supply one for a single frame.
+                // [TMA-POSE-FRAME-RECOVERY] RuneLite can publish pose frame
+                // -1 across a route or scene handoff. Leaving that invalid
+                // frame on the actor lets a stale animation state survive
+                // into the next scene. Re-publish the validated fallback
+                // frame below before asking the actor for its model.
                 if (CurrentAnimationRequest.PoseAnimationToPlay != -1 &&
                         (Owner.getPoseAnimation() !=
                                 CurrentAnimationRequest.PoseAnimationToPlay ||
+                                Owner.getPoseAnimationFrame() < 0 ||
                                 bResetCurrentAnimation))
                 {
                     int RequestedPoseAnimation =
@@ -3815,6 +3992,14 @@ public class CustomMovementHandler
             // world coordinates is available again.
             return;
         }
+
+        // First-time POH construction can publish the final portal-room
+        // coordinate through presentation paths which bypass normal route
+        // interpolation. Re-arm after a transient handler cleanup and mirror
+        // the native actor before any interpolation branch can consume the
+        // temporary centre-of-instance coordinate.
+        ArmPohArrivalCoordinateGuard();
+        SynchronizePohArrivalCoordinateToNative();
 
         UpdateLerpDestinations();
 

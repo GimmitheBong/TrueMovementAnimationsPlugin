@@ -33,7 +33,7 @@ public class AdaptiveCameraRenderingTest
 	}
 
 	@Test
-	public void sceneLoadHandoffUsesNativeCamera()
+	public void sceneOrPohArrivalHandoffUsesNativeCamera()
 	{
 		assertFalse(TrueTileMovementPlugin.ShouldRenderAdaptiveCamera(
 				true,

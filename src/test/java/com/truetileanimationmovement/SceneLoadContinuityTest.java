@@ -653,6 +653,84 @@ public class SceneLoadContinuityTest
 	}
 
 	@Test
+	public void playerOwnedHouseRegionsRequireTheCompleteInstancePair()
+	{
+		assertTrue(CustomMovementHandler
+				.ContainsPlayerOwnedHouseRegions(
+						new int[]{8046, 8047}));
+		assertTrue(CustomMovementHandler
+				.ContainsPlayerOwnedHouseRegions(
+						new int[]{9999, 8047, 8046}));
+		assertFalse(CustomMovementHandler
+				.ContainsPlayerOwnedHouseRegions(
+						new int[]{8046}));
+		assertFalse(CustomMovementHandler
+				.ContainsPlayerOwnedHouseRegions(null));
+	}
+
+	@Test
+	public void delayedPohArrivalMirrorsEveryPreInteractionUpdate()
+	{
+		LocalPoint TemporaryArrival = new LocalPoint(6208, 6208, 0);
+		LocalPoint PortalRoom = new LocalPoint(4544, 5824, 0);
+
+		assertTrue(CustomMovementHandler
+				.ShouldSynchronizePohArrivalPresentation(
+						true,
+						7,
+						7,
+						PortalRoom,
+						TemporaryArrival,
+						PortalRoom,
+						PortalRoom));
+		assertTrue(CustomMovementHandler
+				.ShouldSynchronizePohArrivalPresentation(
+						true,
+						7,
+						7,
+						PortalRoom,
+						TemporaryArrival));
+		assertFalse(CustomMovementHandler
+				.ShouldSynchronizePohArrivalPresentation(
+						true,
+						7,
+						7,
+						PortalRoom,
+						PortalRoom,
+						PortalRoom));
+		assertFalse(CustomMovementHandler
+				.ShouldSynchronizePohArrivalPresentation(
+						true,
+						7,
+						8,
+						PortalRoom,
+						TemporaryArrival));
+	}
+
+	@Test
+	public void pohArrivalGuardRecoversAfterCleanupButNotAfterInteraction()
+	{
+		assertTrue(CustomMovementHandler
+				.ShouldArmPohArrivalCoordinateGuard(
+						true,
+						false,
+						6,
+						7));
+		assertFalse(CustomMovementHandler
+				.ShouldArmPohArrivalCoordinateGuard(
+						true,
+						false,
+						7,
+						7));
+		assertFalse(CustomMovementHandler
+				.ShouldArmPohArrivalCoordinateGuard(
+						false,
+						false,
+						6,
+						7));
+	}
+
+	@Test
 	public void sceneSnapDistanceUsesRuneScapeTileSteps()
 	{
 		LocalPoint Origin = new LocalPoint(1280, 2560, 0);
