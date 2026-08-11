@@ -113,33 +113,4 @@ public class WalkStopFacingTest
                 false));
     }
 
-    @Test
-    public void stopIdleTraceOpensOnlyForAYellowMovementToIdleEdge()
-    {
-        assertTrue(CustomMovementHandler.ShouldOpenStopIdleTrace(
-                true,
-                true,
-                false,
-                true));
-        assertFalse(CustomMovementHandler.ShouldOpenStopIdleTrace(
-                false,
-                true,
-                false,
-                true));
-        assertFalse(CustomMovementHandler.ShouldOpenStopIdleTrace(
-                true,
-                false,
-                false,
-                true));
-        assertFalse(CustomMovementHandler.ShouldOpenStopIdleTrace(
-                true,
-                true,
-                true,
-                true));
-        assertFalse(CustomMovementHandler.ShouldOpenStopIdleTrace(
-                true,
-                true,
-                false,
-                false));
-    }
 }

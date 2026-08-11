@@ -276,7 +276,7 @@ public class MovementContinuityTest
 	}
 
 	@Test
-	public void invalidPoseFrameReusesOnlyTheSameAnimationsLastValidFrame()
+	public void poseFramePublicationCarriesOnlyCompatibleValidPhases()
 	{
 		assertEquals(5, CustomMovementHandler.SelectPoseFrameForPublication(
 				1661, -1, 1661, 1661, 5, 8, 0, false, false));
@@ -284,20 +284,25 @@ public class MovementContinuityTest
 				1661, -1, 1661, 1660, 5, 8, 0, false, false));
 		assertEquals(5, CustomMovementHandler.SelectPoseFrameForPublication(
 				1661, -2, 1661, 1661, 5, 8, 0, false, false));
+		// An invalid frame cannot borrow a remembered phase from a different
+		// animation; it uses the requested animation's authored entry frame.
+		assertEquals(2, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, -1, 808, 1661, 5, 12, 2, false, false));
 		assertEquals(3, CustomMovementHandler.SelectPoseFrameForPublication(
 				1661, 3, 1661, 1661, 5, 8, 0, false, false));
 		// Directional locomotion variants deliberately keep phase when their
 		// animation IDs change, preventing route-segment frame-zero resets.
 		assertEquals(3, CustomMovementHandler.SelectPoseFrameForPublication(
 				1661, 3, 1660, 1661, 3, 8, 0, false, false));
-		// The same valid locomotion frame is not reused as idle specifically
-		// during the stationary yellow-stop catch-up handoff.
+		// A stationary locomotion-to-idle mismatch deliberately starts from
+		// idle's authored entry frame instead of racing the idle pose on the
+		// hidden actor's still-active locomotion clock.
 		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
-				1661, 3, 808, 1661, 3, 12, 0, false, true));
-		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
-				1661, 3, 1661, 1661, 5, 8, 0, true, false));
-		assertEquals(0, CustomMovementHandler.SelectPoseFrameForPublication(
-				1661, 8, 1661, 1661, 5, 8, 0, false, false));
+				1661, 6, 808, 1661, 6, 12, 0, false, true));
+		assertEquals(2, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 3, 1661, 1661, 5, 8, 2, true, false));
+		assertEquals(2, CustomMovementHandler.SelectPoseFrameForPublication(
+				1661, 8, 1661, 1661, 5, 8, 2, false, false));
 	}
 
 	@Test

@@ -384,18 +384,6 @@ public class TrueTileMovementPlugin extends Plugin
 			PublishLocalPlayerRenderState(null, false);
 		}
 
-		// [TMA-STOP-IDLE-DIAGNOSTICS] Live actor/RuneLiteObject state is
-		// inspected only here on RuneLite's client thread. Never move this into
-		// the overlay/render callback; a previous diagnostic did so and could
-		// race scene-owned object replacement strongly enough to crash the game.
-		CustomMovementHandler LocalPlayerHandler =
-				GetLocalPlayerMovementHandler();
-		if (LocalPlayerHandler != null)
-		{
-			LocalPlayerHandler.CaptureStopIdleDiagnosticsOnClientThread(
-					config.DebugStopIdleTransitions());
-		}
-
 	}
 
 	private void UpdateAdaptiveCamera(
@@ -792,7 +780,6 @@ public class TrueTileMovementPlugin extends Plugin
 						OverlayRenderer.bRuneliteObjectsStale,
 						PlayerMovementHandler
 								.CanSuppressOwnerInCurrentScene()));
-
 		float FootprintHeight = GetCameraFootprintTileHeight(
 				player.getWorldView(),
 				CameraHeightLocation,

@@ -1,18 +1,14 @@
 package com.truetileanimationmovement;
 
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.AnimationID;
 
 import javax.inject.Inject;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.HashSet;
 import java.util.Set;
 
-@Slf4j
 public class CustomMovementHandler
 {
     private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
@@ -70,9 +66,6 @@ public class CustomMovementHandler
     // orientation is treated as a genuinely new facing command.
     private static final int WALK_STOP_NATIVE_FACING_SETTLE_MILLIS =
             Constants.GAME_TICK_LENGTH;
-    private static final int STOP_IDLE_TRACE_PRE_SAMPLES = 8;
-    private static final int STOP_IDLE_TRACE_POST_SAMPLES = 10;
-    private static final int STOP_IDLE_TRACE_MODEL_VERTEX_SAMPLES = 96;
     // [TMA-TELEPORT] Restored original teleport presentation state. A genuine
     // teleport is identified by the teleport animation the client publishes in
     // onGameTick. Timestamps are compared in System.nanoTime() domain like the
@@ -96,13 +89,6 @@ public class CustomMovementHandler
     // is never asked to build the visible character from an invalid frame.
     private int LastValidOwnerPoseAnimation = NO_ANIMATION;
     private int LastValidOwnerPoseFrame = 0;
-    // [TMA-STOP-IDLE-DIAGNOSTICS] Opt-in, client-thread-only snapshots. The
-    // render callback never reads a RuneLiteObject for diagnostics.
-    private final Deque<String> StopIdleTraceHistory = new ArrayDeque<>();
-    private boolean bStopIdleTraceInitialized = false;
-    private boolean bStopIdleTraceLastMoving = false;
-    private int StopIdleTracePostSamplesRemaining = 0;
-    private int StopIdleTraceEvent = 0;
     TrueMovementOverlay overlay;
 
     // Time management
@@ -1970,6 +1956,36 @@ public class CustomMovementHandler
                 ElapsedMilliseconds < TweenDurationMilliseconds;
     }
 
+    static LocalPoint SelectRouteUpdateOrigin(
+            boolean ReanchorSceneRecovery,
+            boolean PreviousEndpointWithinSnapDistance,
+            LocalPoint DisplayedPoint,
+            LocalPoint PreviousAuthoritativeEndpoint,
+            LocalPoint ConvertedPreviousEndpoint,
+            LocalPoint RequestedEndpoint)
+    {
+        if (ReanchorSceneRecovery && DisplayedPoint != null)
+        {
+            return DisplayedPoint;
+        }
+        if (PreviousEndpointWithinSnapDistance &&
+                ConvertedPreviousEndpoint != null)
+        {
+            return PreviousAuthoritativeEndpoint;
+        }
+        return ConvertedPreviousEndpoint == null
+                ? RequestedEndpoint
+                : ConvertedPreviousEndpoint;
+    }
+
+    static boolean ShouldResetRouteDirectionBaseline(
+            boolean ReanchorSceneRecovery,
+            boolean PreviousEndpointWithinSnapDistance)
+    {
+        return !ReanchorSceneRecovery &&
+                !PreviousEndpointWithinSnapDistance;
+    }
+
     static LocalPoint SelectSceneRebaseAnchor(
             boolean bNativeHandoffPresented,
             LocalPoint OwnerLocation,
@@ -2523,55 +2539,39 @@ public class CustomMovementHandler
                                 MillisecondsSinceTileChange,
                                 CurrentTweenDuration,
                                 NewLocalPointToDraw != null);
-                if (bReanchorRecovery)
+                boolean bPreviousEndpointWithinSnapDistance =
+                        NextLerpPoint != null &&
+                        DistanceInTilesToNextLerp <=
+                                config.PlayerModelSnapDistance() &&
+                        DistanceInTilesToLast <=
+                                config.PlayerModelSnapDistance();
+                // [TMA-AUTHORITATIVE-ROUTE-ORIGIN] Only a real scene-recovery
+                // bridge continues from the fractional displayed point.
+                // Ordinary route segments begin at the previous authoritative
+                // endpoint; otherwise the rendered fraction contaminates the
+                // direction baseline and can reclassify a two-tile run as a
+                // one-tile walk on the next segment.
+                LastLerpPosition = SelectRouteUpdateOrigin(
+                        bReanchorRecovery,
+                        bPreviousEndpointWithinSnapDistance,
+                        NewLocalPointToDraw,
+                        NextLerpPosition,
+                        NextLerpPoint,
+                        RequestedLerpPoint);
+                LastLerpPositionWorldPoint = WorldPoint.fromLocal(
+                        client,
+                        LastLerpPosition);
+                if (ShouldResetRouteDirectionBaseline(
+                        bReanchorRecovery,
+                        bPreviousEndpointWithinSnapDistance))
                 {
-                    // Recovery/scene-edge bridge: continue from the displayed
-                    // point. The flag was set by a prior catch-up frame.
-                    bSceneRecoveryRetargetPending = false;
-                }
-
-                // [TMA-VISUAL-CONTINUITY] Every re-route must seed the
-                // interpolation origin from the last rendered position, not
-                // from the previous segment's authoritative destination tile.
-                // The old path computed distance heuristics (normal / far
-                // / teleport) and used them only to decide where LastLerp-
-                // Position should point. Those heuristics still determine
-                // recovery velocity and the catch-up flag, but the anchor
-                // itself is always the visible member.
-                if (NewLocalPointToDraw != null)
-                {
-                    LastLerpPosition = NewLocalPointToDraw;
-                    LastLerpPositionWorldPoint =
-                            WorldPoint.fromLocal(client, LastLerpPosition);
-                    LastTrueTilePosition = NewLocalPointToDraw;
-                }
-                else if (NextLerpPoint != null)
-                {
-                    LastLerpPosition = NextLerpPoint;
-                    LastLerpPositionWorldPoint =
-                            WorldPoint.fromLocal(client, LastLerpPosition);
-                }
-                else
-                {
-                    LastLerpPosition = NextLerpPosition;
-                    LastLerpPositionWorldPoint =
-                            WorldPoint.fromLocal(client, LastLerpPosition);
+                    // Missing/far converted endpoints represent a true
+                    // discontinuity, so snap the authoritative baseline once.
                     LastTrueTilePosition = CurrentTrueTilePosition;
                 }
-
-                // [TMA-CATCH-UP-FLAG] The far-branch is the only one that
-                // needs extended tween recovery. Mark it so the next frame
-                // uses recovery velocity and does not restart the clock.
-                if (!bReanchorRecovery &&
-                        !(NextLerpPoint != null &&
-                                DistanceInTilesToNextLerp <=
-                                        config.PlayerModelSnapDistance() &&
-                                DistanceInTilesToLast <=
-                                        config.PlayerModelSnapDistance()) &&
-                        NewLocalPointToDraw != null)
-                {
-                    bSceneRecoveryRetargetPending = true;
-                }
+                // A generic route change is not scene recovery. Recovery is
+                // armed only by the scene/rebase paths that own that state.
+                bSceneRecoveryRetargetPending = false;
 
                 NextLerpPosition = RequestedLerpPoint;
 
@@ -3552,15 +3552,17 @@ public class CustomMovementHandler
                     AnimController.setFrame(0);
                 }
 
-                // [TMA-POSE-FRAME-RECOVERY] RuneLite can publish pose frame
-                // -1 across a route or scene handoff. Leaving that invalid
-                // frame on the actor lets a stale animation state survive
-                // into the next scene. Re-publish the validated fallback
-                // frame below before asking the actor for its model.
+                // [TMA-INTERPOLATION-CONTINUITY] A transient -1 pose
+                // frame (which the game publishes at route handoffs)
+                // must NOT trigger an explicit setPoseAnimationFrame
+                // call — that resets the client's internal interpolation
+                // timer and causes visible stutter in smoothed
+                // locomotion.  The TrySetModel fallback below already
+                // preserves the last valid model when the Owner cannot
+                // supply one for a single frame.
                 if (CurrentAnimationRequest.PoseAnimationToPlay != -1 &&
                         (Owner.getPoseAnimation() !=
                                 CurrentAnimationRequest.PoseAnimationToPlay ||
-                                Owner.getPoseAnimationFrame() < 0 ||
                                 bResetCurrentAnimation))
                 {
                     int RequestedPoseAnimation =
@@ -3670,13 +3672,13 @@ public class CustomMovementHandler
 
             // [TMA-NO-SPAWN-IN] The native presentation is still useful
             // while genuinely idle, but do NOT toggle the custom model
-            // inactive during proximity. setActive(false) → setActive(true)
-            // triggers RuneLite's entity spawn-in animation (small → normal
+            // inactive during proximity. setActive(false) -> setActive(true)
+            // triggers RuneLite's entity spawn-in animation (small -> normal
             // scale), and the model may be reactivated at a stale segment
             // destination rather than its last rendered location. Instead,
             // keep the custom model active in the background and let the
             // native player draw on top when within proximity thresholds.
-            // This prevents every stationary → moving transition from
+            // This prevents every stationary -> moving transition from
             // producing a visible shrink/grow at the wrong tile.
             if (RenderedModel != null &&
                     ShouldRenderOriginalOwner(
@@ -3712,254 +3714,6 @@ public class CustomMovementHandler
             }
         }
 
-    }
-
-    /**
-     * Capture a bounded stop/idle trace. This method must be called only from
-     * RuneLite's client thread; it is the sole diagnostic path which inspects
-     * the scene-owned RuneLiteObject or its prepared model.
-     */
-    void CaptureStopIdleDiagnosticsOnClientThread(
-            boolean Enabled)
-    {
-        if (!Enabled || !IsPlayerOwner() ||
-                client.getGameState() != GameState.LOGGED_IN)
-        {
-            ResetStopIdleDiagnostics();
-            return;
-        }
-
-        boolean bYellowStopContext =
-                bWalkStopFacingHoldArmed ||
-                        bWalkMovementObserved ||
-                        bPreserveReleasedWalkFacing ||
-                        bHoldWalkStopFacingThisFrame;
-        String Snapshot;
-        try
-        {
-            Snapshot = BuildStopIdleDiagnosticSnapshot(
-                    bYellowStopContext);
-        }
-        catch (RuntimeException SnapshotFailure)
-        {
-            // Diagnostics are observational and must never be able to disable
-            // rendering or crash the client. Keep the transition marker and
-            // record the failed read without retrying live scene state.
-            Snapshot = "time=" + System.currentTimeMillis() +
-                    " cycle=" + client.getGameCycle() +
-                    " snapshotFailure=" +
-                    SnapshotFailure.getClass().getSimpleName() +
-                    " moving=" + bMovingThisAction +
-                    " yellowContext=" + bYellowStopContext;
-        }
-        boolean bStoppedThisSample = ShouldOpenStopIdleTrace(
-                bStopIdleTraceInitialized,
-                bStopIdleTraceLastMoving,
-                bMovingThisAction,
-                bYellowStopContext);
-
-        if (bStoppedThisSample)
-        {
-            if (StopIdleTracePostSamplesRemaining > 0)
-            {
-                log.debug(
-                        "[StopIdleTrace] event={} phase=end cause=next-stop",
-                        StopIdleTraceEvent);
-            }
-
-            ++StopIdleTraceEvent;
-            log.debug(
-                    "[StopIdleTrace] event={} phase=begin preSamples={} note=client-thread-only",
-                    StopIdleTraceEvent,
-                    StopIdleTraceHistory.size());
-            for (String PreviousSnapshot : StopIdleTraceHistory)
-            {
-                log.debug(
-                        "[StopIdleTrace] event={} phase=pre {}",
-                        StopIdleTraceEvent,
-                        PreviousSnapshot);
-            }
-            log.debug(
-                    "[StopIdleTrace] event={} phase=stop {}",
-                    StopIdleTraceEvent,
-                    Snapshot);
-            client.addChatMessage(
-                    ChatMessageType.GAMEMESSAGE,
-                    "",
-                    "True Movement: stop-idle trace #" +
-                            StopIdleTraceEvent +
-                            " recorded",
-                    null);
-            StopIdleTracePostSamplesRemaining =
-                    STOP_IDLE_TRACE_POST_SAMPLES;
-        }
-        else if (StopIdleTracePostSamplesRemaining > 0)
-        {
-            log.debug(
-                    "[StopIdleTrace] event={} phase=post remaining={} {}",
-                    StopIdleTraceEvent,
-                    StopIdleTracePostSamplesRemaining,
-                    Snapshot);
-            --StopIdleTracePostSamplesRemaining;
-            if (StopIdleTracePostSamplesRemaining == 0)
-            {
-                log.debug(
-                        "[StopIdleTrace] event={} phase=end cause=window-complete",
-                        StopIdleTraceEvent);
-            }
-        }
-
-        StopIdleTraceHistory.addLast(Snapshot);
-        while (StopIdleTraceHistory.size() >
-                STOP_IDLE_TRACE_PRE_SAMPLES)
-        {
-            StopIdleTraceHistory.removeFirst();
-        }
-        bStopIdleTraceInitialized = true;
-        bStopIdleTraceLastMoving = bMovingThisAction;
-    }
-
-    static boolean ShouldOpenStopIdleTrace(
-            boolean Initialized,
-            boolean WasMoving,
-            boolean MovingNow,
-            boolean YellowStopContext)
-    {
-        return Initialized &&
-                WasMoving &&
-                !MovingNow &&
-                YellowStopContext;
-    }
-
-    private void ResetStopIdleDiagnostics()
-    {
-        StopIdleTraceHistory.clear();
-        bStopIdleTraceInitialized = false;
-        bStopIdleTraceLastMoving = false;
-        StopIdleTracePostSamplesRemaining = 0;
-        StopIdleTraceEvent = 0;
-    }
-
-    private String BuildStopIdleDiagnosticSnapshot(
-            boolean YellowStopContext)
-    {
-        int RequestedAction = CurrentAnimationRequest == null
-                ? NO_ANIMATION
-                : CurrentAnimationRequest.AnimationToPlay;
-        int RequestedPose = CurrentAnimationRequest == null
-                ? NO_ANIMATION
-                : CurrentAnimationRequest.PoseAnimationToPlay;
-        int MainControllerAnimation =
-                AnimController == null ||
-                        AnimController.getAnimation() == null
-                        ? NO_ANIMATION
-                        : AnimController.getAnimation().getId();
-        int MainControllerFrame = AnimController == null
-                ? NO_ANIMATION
-                : AnimController.getFrame();
-        RuneLiteObject VisibleObject = Model;
-        boolean VisibleObjectActive =
-                VisibleObject != null && VisibleObject.isActive();
-        LocalPoint VisibleLocation = VisibleObject == null
-                ? null
-                : VisibleObject.getLocation();
-        net.runelite.api.Model VisibleModel = VisibleObject == null
-                ? null
-                : VisibleObject.getModel();
-        net.runelite.api.Model OwnerModel = Owner.getModel();
-
-        return "time=" + System.currentTimeMillis() +
-                " cycle=" + client.getGameCycle() +
-                " movement[moving=" + bMovingThisAction +
-                " elapsed=" + MillisecondsSinceTileChange +
-                " duration=" + GetMovementTweenDurationMilliseconds() +
-                " from=" + DescribeLocalPoint(LastLerpPosition) +
-                " to=" + DescribeLocalPoint(NextLerpPosition) +
-                " drawn=" + DescribeLocalPoint(NewLocalPointToDraw) +
-                "] request[action=" + RequestedAction +
-                " pose=" + RequestedPose +
-                "] owner[action=" + Owner.getAnimation() +
-                " actionFrame=" + Owner.getAnimationFrame() +
-                " pose=" + Owner.getPoseAnimation() +
-                " poseFrame=" + Owner.getPoseAnimationFrame() +
-                " idle=" + Owner.getIdlePoseAnimation() +
-                " walk=" + Owner.getWalkAnimation() +
-                " run=" + Owner.getRunAnimation() +
-                " orientation=" + Owner.getOrientation() +
-                " currentOrientation=" + Owner.getCurrentOrientation() +
-                " location=" + DescribeLocalPoint(Owner.getLocalLocation()) +
-                "] controller[main=" + MainControllerAnimation +
-                ":" + MainControllerFrame +
-                "] yellow[context=" + YellowStopContext +
-                " armed=" + bWalkStopFacingHoldArmed +
-                " observed=" + bWalkMovementObserved +
-                " hold=" + bHoldWalkStopFacingThisFrame +
-                " preserve=" + bPreserveReleasedWalkFacing +
-                " nativeSettled=" + bNativeWalkFacingSettled +
-                " awaiting=" + bWalkSegmentAwaitingMovement +
-                "] presentation[owner=" + bShouldRenderOwner +
-                " proximity=" + bRenderOriginalOwnerDueToProximity +
-                " customActive=" + VisibleObjectActive +
-                " customLocation=" + DescribeLocalPoint(VisibleLocation) +
-                "] geometry[custom=" + DescribeModel(VisibleModel) +
-                " owner=" + DescribeModel(OwnerModel) + "]";
-    }
-
-    private static String DescribeLocalPoint(LocalPoint Point)
-    {
-        return Point == null
-                ? "null"
-                : Point.getX() + "," + Point.getY() +
-                        ",wv=" + Point.getWorldView();
-    }
-
-    private static String DescribeModel(net.runelite.api.Model SourceModel)
-    {
-        if (SourceModel == null)
-        {
-            return "null";
-        }
-
-        float[] VerticesX = SourceModel.getVerticesX();
-        float[] VerticesY = SourceModel.getVerticesY();
-        float[] VerticesZ = SourceModel.getVerticesZ();
-        int VertexCount = Math.min(
-                SourceModel.getVerticesCount(),
-                Math.min(
-                        VerticesX == null ? 0 : VerticesX.length,
-                        Math.min(
-                                VerticesY == null ? 0 : VerticesY.length,
-                                VerticesZ == null ? 0 : VerticesZ.length)));
-        if (VertexCount <= 0)
-        {
-            return "vertices=0 faces=" + SourceModel.getFaceCount();
-        }
-
-        int Step = Math.max(
-                1,
-                VertexCount /
-                        STOP_IDLE_TRACE_MODEL_VERTEX_SAMPLES);
-        long Hash = 0xcbf29ce484222325L;
-        int Samples = 0;
-        for (int Index = 0;
-             Index < VertexCount;
-             Index += Step)
-        {
-            Hash ^= Float.floatToIntBits(VerticesX[Index]);
-            Hash *= 0x100000001b3L;
-            Hash ^= Float.floatToIntBits(VerticesY[Index]);
-            Hash *= 0x100000001b3L;
-            Hash ^= Float.floatToIntBits(VerticesZ[Index]);
-            Hash *= 0x100000001b3L;
-            ++Samples;
-        }
-
-        return "vertices=" + VertexCount +
-                " faces=" + SourceModel.getFaceCount() +
-                " samples=" + Samples +
-                " hash=" + Long.toUnsignedString(Hash, 16) +
-                " scene=" + SourceModel.getSceneId() +
-                " buffer=" + SourceModel.getBufferOffset();
     }
 
     public void Update()

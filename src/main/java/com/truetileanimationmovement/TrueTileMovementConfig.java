@@ -342,17 +342,6 @@ public interface TrueTileMovementConfig extends Config
 	}
 
 	@ConfigItem(
-			keyName = "DebugStopIdleTransitions",
-			name = "(Debug) Trace Stop-Idle Transitions",
-			description = "Records a bounded client-thread-only trace and chat marker when yellow-click movement enters idle",
-			section = advancedSection
-	)
-	default boolean DebugStopIdleTransitions()
-	{
-		return false;
-	}
-
-	@ConfigItem(
 			keyName = "CameraModelHeight",
 			name = "Camera Model Height",
 			description = "The height to render the camera model",

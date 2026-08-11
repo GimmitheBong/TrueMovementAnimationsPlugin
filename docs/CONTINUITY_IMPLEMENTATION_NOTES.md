@@ -595,30 +595,48 @@ facts:
   run 1661 while one frame showed legs spread and arms raised. Animation IDs
   therefore could not classify that frame correctly.
 
-The earlier broad investigation recorders, chat markers, queues, background
-logging, preparation counters, and log-formatting paths were removed after
-their investigations. A later opt-in `[TMA-STOP-IDLE-DIAGNOSTICS]` trace is
-temporarily retained to verify the replacement native-pose handoff at a
-yellow-click stop. It is disabled by default, opens only on a genuine
-`moving -> idle` edge, and logs a bounded eight-sample history plus ten samples
-afterward rather than logging every frame permanently.
+The investigation recorders, chat markers, queues, background logging,
+preparation counters, model hashing, and log-formatting paths were removed after
+their investigations. The final stop-idle trace established that position,
+presentation ownership, controller state, and model availability remained
+stable while the intentional `[TMA-STATIONARY-IDLE-ENTRY]` rule restarted idle
+from its authored entry frame. A follow-up trial which instead carried the
+locomotion frame into idle restored the previously documented sped-up/jumpy idle
+until the hidden actor caught up, so that separation must remain. Locomotion
+smoothness is handled independently by `[TMA-INTERPOLATION-CONTINUITY]`. The
+evidence is retained here rather than keeping diagnostic work in the production
+client path.
 
-If diagnostics are needed again, live RuneLite state must be sampled only on
-the client thread. In particular, never inspect a scene-owned
-`RuneLiteObject` from an overlay or render callback: scene replacement can
-invalidate it between callbacks and this previously caused client crashes.
-Copy scalar/value state on the client thread and format it elsewhere only if
-the captured evidence actually needs to be emitted.
+If diagnostics are needed again, never add an extra `Owner.getModel()` call or
+inspect scene-owned model geometry from an overlay/render callback: scene
+replacement can invalidate it between callbacks and this previously caused
+client crashes. A render-rate recorder may copy only primitive values already
+read by the normal path into a bounded queue; all formatting and log writes must
+remain on the client thread.
 
-The stop-idle trace follows that boundary: `onClientTick` performs every live
-actor, custom-object, and prepared-model read. Overlay rendering does not read a
-`RuneLiteObject` for diagnostics. Each sample includes animation requests and
-frames, native-stop mirroring state, yellow-route state, presentation
-authority, local positions/orientations, and a bounded vertex signature for the
-custom and owner models. A numbered chat message identifies the matching
-`[StopIdleTrace]` event in `client.log`. The geometry signature is sampled only
-while the explicit debug option is enabled and any failed model read is caught;
-diagnostics cannot interrupt rendering.
+## `[TMA-AUTHORITATIVE-ROUTE-ORIGIN]`: keep rendered and route coordinates separate
+
+A later teleport-preservation change accidentally applied its recovery anchor
+to every ordinary route update. It seeded both interpolation and
+`LastTrueTilePosition` from the fractional point last drawn on screen and could
+also mark a same-scene route as pending scene recovery. A bounded locomotion
+trace then showed that recovery state leaking into ordinary same-scene segments.
+The same capture also contained repeated run/walk pose publication and presented
+`run -> idle -> run` seams while the custom model remained the sole render
+authority. It showed no null model, controller takeover, invalid accepted frame,
+or native/custom presentation swap. The trace did not prove that every short
+route-publication gap or authored one-tile animation change came from the leaked
+recovery flag, so those visual cases still require in-game validation after the
+confirmed regression is removed.
+
+The confirmed pre-regression invariant is restored: an ordinary route update
+starts at the previous authoritative endpoint, and its exact true-tile baseline
+is not overwritten by the fractional rendered point. Only an explicitly armed
+scene-recovery or boundary bridge may continue from the displayed coordinate.
+Generic route updates clear recovery-pending state; the POH arrival guard keeps
+its own destination-scoped native-coordinate synchronization before this code.
+This does not invent movement, retain run through an authored one-tile segment,
+or broaden yellow-route grace to red interactions.
 
 ## `[TMA-UNFINISHED-ROUTE-ANIMATION-CONTINUITY]`: bridge late route publication
 
@@ -848,4 +866,3 @@ Do not add `Owner.getPoseAnimationFrame() < 0` back as a pose-block trigger.
 If an invalid frame must be corrected, do it through the model-building path
 (`TrySetModel` / `Owner.getModel()` null-guard) rather than by explicitly
 calling `Owner.setPoseAnimationFrame()` outside of an animation-ID change.
-

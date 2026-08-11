@@ -207,6 +207,89 @@ public class SceneLoadContinuityTest
 	}
 
 	@Test
+	public void ordinaryRouteUpdateKeepsItsAuthoritativeOrigin()
+	{
+		LocalPoint PreviousAuthoritativeEndpoint =
+				new LocalPoint(5056, 5696, 0);
+		LocalPoint FractionalDisplayedPoint =
+				new LocalPoint(4928, 5824, 0);
+		LocalPoint RequestedEndpoint =
+				new LocalPoint(4800, 5952, 0);
+
+		LocalPoint SelectedOrigin = CustomMovementHandler
+				.SelectRouteUpdateOrigin(
+						false,
+						true,
+						FractionalDisplayedPoint,
+						PreviousAuthoritativeEndpoint,
+						PreviousAuthoritativeEndpoint,
+						RequestedEndpoint);
+
+		assertSame(PreviousAuthoritativeEndpoint, SelectedOrigin);
+		assertEquals(2, Math.max(
+				Math.abs(RequestedEndpoint.getX() -
+						SelectedOrigin.getX()),
+				Math.abs(RequestedEndpoint.getY() -
+						SelectedOrigin.getY())) / 128);
+		assertEquals(1, Math.max(
+				Math.abs(RequestedEndpoint.getX() -
+						FractionalDisplayedPoint.getX()),
+				Math.abs(RequestedEndpoint.getY() -
+						FractionalDisplayedPoint.getY())) / 128);
+		assertFalse(CustomMovementHandler
+				.ShouldResetRouteDirectionBaseline(false, true));
+	}
+
+	@Test
+	public void recoveryAndFallbackSelectCorrectRouteOrigins()
+	{
+		LocalPoint PreviousAuthoritativeEndpoint =
+				new LocalPoint(5056, 5696, 0);
+		LocalPoint FractionalDisplayedPoint =
+				new LocalPoint(4928, 5824, 0);
+		LocalPoint ConvertedPreviousEndpoint =
+				new LocalPoint(4992, 5760, 0);
+		LocalPoint RequestedEndpoint =
+				new LocalPoint(4800, 5952, 0);
+
+		assertSame(
+				FractionalDisplayedPoint,
+				CustomMovementHandler.SelectRouteUpdateOrigin(
+						true,
+						false,
+						FractionalDisplayedPoint,
+						PreviousAuthoritativeEndpoint,
+						PreviousAuthoritativeEndpoint,
+						RequestedEndpoint));
+		assertFalse(CustomMovementHandler
+				.ShouldResetRouteDirectionBaseline(true, false));
+
+		assertSame(
+				RequestedEndpoint,
+				CustomMovementHandler.SelectRouteUpdateOrigin(
+						false,
+						false,
+						FractionalDisplayedPoint,
+						PreviousAuthoritativeEndpoint,
+						null,
+						RequestedEndpoint));
+		assertTrue(CustomMovementHandler
+				.ShouldResetRouteDirectionBaseline(false, false));
+
+		assertSame(
+				ConvertedPreviousEndpoint,
+				CustomMovementHandler.SelectRouteUpdateOrigin(
+						false,
+						false,
+						FractionalDisplayedPoint,
+						PreviousAuthoritativeEndpoint,
+						ConvertedPreviousEndpoint,
+						RequestedEndpoint));
+		assertTrue(CustomMovementHandler
+				.ShouldResetRouteDirectionBaseline(false, false));
+	}
+
+	@Test
 	public void nativeOwnerRemainsVisibleUntilReplacementIsReady()
 	{
 		assertFalse(TrueTileMovementPlugin.ShouldSuppressNativeOwner(
