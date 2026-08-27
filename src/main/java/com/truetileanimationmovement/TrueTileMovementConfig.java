@@ -342,6 +342,28 @@ public interface TrueTileMovementConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "DebugMovementIdleFlick",
+			name = "(Debug) Log Movement Idle Flick",
+			description = "Logs a debug line when movement unexpectedly drops to idle while still en route",
+			section = advancedSection
+	)
+	default boolean DebugMovementIdleFlick()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "DebugStallTrace",
+			name = "(Debug) Log Render Stalls",
+			description = "Measures long render gaps and writes diagnostic stall traces",
+			section = advancedSection
+	)
+	default boolean DebugStallTrace()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 			keyName = "CameraModelHeight",
 			name = "Camera Model Height",
 			description = "The height to render the camera model",

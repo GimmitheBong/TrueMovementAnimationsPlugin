@@ -71,6 +71,61 @@ public class SceneLoadContinuityTest
 	}
 
 	@Test
+	public void movingPostSceneRecoveryBridgesOnlyItsBoundedRouteGap()
+	{
+		LocalPoint CurrentSegmentDestination =
+				new LocalPoint(6208, 6208, 0);
+		LocalPoint RouteDestination =
+				new LocalPoint(6208, 6464, 0);
+
+		assertTrue(CustomMovementHandler
+				.ShouldArmPostSceneRecoveryRouteGap(true, true));
+		// A zero-distance rebase and an ordinary fresh-click wait retain the
+		// existing stable endpoint idle instead of running in place.
+		assertFalse(CustomMovementHandler
+				.ShouldArmPostSceneRecoveryRouteGap(true, false));
+		assertFalse(CustomMovementHandler
+				.ShouldArmPostSceneRecoveryRouteGap(false, true));
+
+		assertTrue(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 600, 600, true, true, true,
+						CurrentSegmentDestination, RouteDestination));
+		assertTrue(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 899, 600, true, true, true,
+						CurrentSegmentDestination, RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 900, 600, true, true, true,
+						CurrentSegmentDestination, RouteDestination));
+
+		// Eligibility cannot outlive its prior movement, yellow-route ownership,
+		// click revision, or unfinished same-view destination.
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						false, 600, 600, true, true, true,
+						CurrentSegmentDestination, RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 600, 600, false, true, true,
+						CurrentSegmentDestination, RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 600, 600, true, false, true,
+						CurrentSegmentDestination, RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 600, 600, true, true, false,
+						CurrentSegmentDestination, RouteDestination));
+		assertFalse(CustomMovementHandler
+				.ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+						true, 600, 600, true, true, true,
+						CurrentSegmentDestination,
+						CurrentSegmentDestination));
+	}
+
+	@Test
 	public void rebaseCarriesOnlyMissedFrameTime()
 	{
 		assertEquals(
@@ -392,17 +447,113 @@ public class SceneLoadContinuityTest
 				CustomMovementHandler
 						.GetScenePresentationImmediateFrameDelta(22));
 		assertEquals(
-				5,
+				4,
 				CustomMovementHandler
-						.GetScenePresentationDebtPayback(22, 190));
+						.GetScenePresentationDebtPayback(
+								22,
+								190,
+								0));
 		assertEquals(
 				2,
 				CustomMovementHandler
-						.GetScenePresentationDebtPayback(34, 2));
+						.GetScenePresentationDebtPayback(
+								34,
+								2,
+								0));
 		assertEquals(
 				0,
 				CustomMovementHandler
-						.GetScenePresentationDebtPayback(0, 190));
+						.GetScenePresentationDebtPayback(
+								0,
+								190,
+								3));
+		assertEquals(
+				3,
+				CustomMovementHandler
+						.GetScenePresentationDebtPaybackRemainder(
+								0,
+								190,
+								3));
+	}
+
+	@Test
+	public void scenePresentationDebtRepaysAtAStableFractionAcrossHighFpsFrames()
+	{
+		int[] FrameDeltas = {7, 7, 7, 7, 7};
+		int[] ExpectedPayback = {1, 1, 2, 1, 2};
+		int TimeDebt = 190;
+		int PaybackRemainder = 0;
+		int TotalPayback = 0;
+
+		for (int Index = 0; Index < FrameDeltas.length; ++Index)
+		{
+			int Payback =
+					CustomMovementHandler
+							.GetScenePresentationDebtPayback(
+									FrameDeltas[Index],
+									TimeDebt,
+									PaybackRemainder);
+			int NextRemainder =
+					CustomMovementHandler
+							.GetScenePresentationDebtPaybackRemainder(
+									FrameDeltas[Index],
+									TimeDebt,
+									PaybackRemainder);
+
+			assertEquals(ExpectedPayback[Index], Payback);
+			TimeDebt -= Payback;
+			TotalPayback += Payback;
+			PaybackRemainder = NextRemainder;
+		}
+
+		assertEquals(7, TotalPayback);
+		assertEquals(0, PaybackRemainder);
+
+		FrameDeltas = new int[]{5, 6, 5, 6};
+		TimeDebt = 190;
+		PaybackRemainder = 0;
+		TotalPayback = 0;
+		for (int FrameDelta : FrameDeltas)
+		{
+			int Payback =
+					CustomMovementHandler
+							.GetScenePresentationDebtPayback(
+									FrameDelta,
+									TimeDebt,
+									PaybackRemainder);
+			int NextRemainder =
+					CustomMovementHandler
+							.GetScenePresentationDebtPaybackRemainder(
+									FrameDelta,
+									TimeDebt,
+									PaybackRemainder);
+			assertEquals(1, Payback);
+			TimeDebt -= Payback;
+			TotalPayback += Payback;
+			PaybackRemainder = NextRemainder;
+		}
+
+		assertEquals(4, TotalPayback);
+		assertEquals(2, PaybackRemainder);
+	}
+
+	@Test
+	public void scenePresentationDebtDiscardsFractionWhenDebtIsExhausted()
+	{
+		assertEquals(
+				1,
+				CustomMovementHandler
+						.GetScenePresentationDebtPayback(
+								10,
+								1,
+								0));
+		assertEquals(
+				0,
+				CustomMovementHandler
+						.GetScenePresentationDebtPaybackRemainder(
+								10,
+								1,
+								0));
 	}
 
 	@Test
@@ -567,16 +718,28 @@ public class SceneLoadContinuityTest
 	}
 
 	@Test
-	public void onlyActiveYellowBoundaryBridgePreservesPreLoadVelocity()
+	public void onlyProvenYellowMovementPreservesPreLoadVelocity()
 	{
+		// Preserve the existing overdue boundary bridge path.
 		assertTrue(CustomMovementHandler
 				.CanPreserveSceneMovementVelocity(
 						true,
+						false,
+						true,
+						true,
+						false));
+		// A cached scene can load while a segment is still visibly moving,
+		// before the overdue boundary bridge has had a chance to arm.
+		assertTrue(CustomMovementHandler
+				.CanPreserveSceneMovementVelocity(
+						false,
+						true,
 						true,
 						true,
 						false));
 		assertFalse(CustomMovementHandler
 				.CanPreserveSceneMovementVelocity(
+						false,
 						false,
 						true,
 						true,
@@ -584,6 +747,7 @@ public class SceneLoadContinuityTest
 		assertFalse(CustomMovementHandler
 				.CanPreserveSceneMovementVelocity(
 						true,
+						true,
 						false,
 						true,
 						false));
@@ -591,14 +755,43 @@ public class SceneLoadContinuityTest
 				.CanPreserveSceneMovementVelocity(
 						true,
 						true,
+						true,
 						false,
 						false));
 		assertFalse(CustomMovementHandler
 				.CanPreserveSceneMovementVelocity(
+						true,
 						true,
 						true,
 						true,
 						true));
+
+		LocalPoint DiagonalRunStart = new LocalPoint(4096, 4096, 0);
+		LocalPoint DiagonalRunEnd = new LocalPoint(4352, 4352, 0);
+		boolean DiagonalRunStillVisible =
+				CustomMovementHandler.IsVisibleMovementSegmentInProgress(
+						true, 599, 600,
+						DiagonalRunStart, DiagonalRunEnd);
+		assertTrue(DiagonalRunStillVisible);
+		assertFalse(CustomMovementHandler
+				.IsVisibleMovementSegmentInProgress(
+						true, 600, 600,
+						DiagonalRunStart, DiagonalRunEnd));
+		assertFalse(CustomMovementHandler
+				.IsVisibleMovementSegmentInProgress(
+						true, 599, 600,
+						DiagonalRunStart, DiagonalRunStart));
+		assertEquals(
+				(int) Math.sqrt(256.0 * 256.0 + 256.0 * 256.0) /
+						600.0,
+				CustomMovementHandler.GetPreservedSceneMovementVelocity(
+						CustomMovementHandler.CanPreserveSceneMovementVelocity(
+								false, DiagonalRunStillVisible,
+								true, true, false),
+						DiagonalRunStart,
+						DiagonalRunEnd,
+						600),
+				0.000001);
 	}
 
 	@Test

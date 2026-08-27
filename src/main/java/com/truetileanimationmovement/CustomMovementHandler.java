@@ -6,11 +6,20 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.AnimationID;
 
 import javax.inject.Inject;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.IntPredicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class CustomMovementHandler
 {
+    private static final Logger log =
+            LoggerFactory.getLogger(CustomMovementHandler.class);
     private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
     // [TMA-CONTINUOUS-MOVEMENT-SPEED] A multiplier cannot make the visible
     // model move faster than RuneScape publishes collision-valid route steps
@@ -54,12 +63,6 @@ public class CustomMovementHandler
     // completed segment, so this cannot extrapolate through scenery or move
     // the model onto an interaction object.
     private static final int MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS = 300;
-    // [TMA-PENDING-RECLICK-POSE-HANDOFF] A yellow click made during an
-    // already-visible segment can be acknowledged one ClientTick before the
-    // replacement segment is published. Preserve locomotion for only that
-    // tiny publication seam. This is intentionally much shorter than route
-    // grace so an unavailable destination cannot revive running in place.
-    private static final int PENDING_RECLICK_POSE_GRACE_MILLIS = 50;
     // [TMA-STOP-FACING-SETTLE] Reaching the final tile and settling the
     // native actor's facing are separate client events. Give the hidden
     // actor one game tick with no orientation changes before a later target
@@ -89,6 +92,40 @@ public class CustomMovementHandler
     // is never asked to build the visible character from an invalid frame.
     private int LastValidOwnerPoseAnimation = NO_ANIMATION;
     private int LastValidOwnerPoseFrame = 0;
+    // [TMA-ENDPOINT-IDLE-PRESENTATION] The game's native player-model builder
+    // can compose a correct idle keyframe with the current appearance. Keep a
+    // detached copy while the visible player is spatially stopped and advance
+    // it from a controller used only as an authored-frame clock. The clock is
+    // never attached to, or used to transform, the detached mesh: every frame
+    // is built once by Owner.getModel(), so hidden locomotion cannot leak into
+    // the visible endpoint and the old synthetic-controller bind pose cannot
+    // reappear.
+    private net.runelite.api.Model HeldEndpointIdleModel = null;
+    private PlayerAppearanceKey HeldEndpointIdleAppearance = null;
+    private int HeldEndpointIdleAnimation = NO_ANIMATION;
+    private int HeldEndpointIdleFrame = -1;
+    private int EndpointIdlePresentationStartGameCycle = -1;
+    private AnimationController EndpointIdleFrameClock = null;
+    private int EndpointIdleFrameClockAnimation = NO_ANIMATION;
+    private int EndpointIdleFrameClockGameCycle = -1;
+    private int EndpointIdleDesiredFrame = 0;
+    private boolean bEndpointIdlePresentationActive = false;
+    private boolean bUsingHeldEndpointIdleModel = false;
+    private boolean bEndpointIdlePoseWasDisplayed = false;
+    private boolean bEndpointIdleFrameNeedsPublication = false;
+    // Animation Smoothing can only interpolate the native actor's private
+    // pose clock. While the hidden owner catches up, temporarily map every
+    // movement selector to the same idle sequence so that clock keeps running
+    // without exposing a locomotion pose. Restoring the selectors never
+    // touches the pose ID/frame, so the stationary handoff keeps its phase.
+    private boolean bEndpointNativeIdlePoseOverrideActive = false;
+    private boolean bEndpointNativeHandoffReadyThisFrame = false;
+    // A successful native-geometry handoff owns this completed segment until
+    // real movement or a scene reset. A one-frame readiness flag is insufficient:
+    // clearing the captured mesh also clears its frame identity, which would
+    // otherwise make endpoint presentation re-arm two renders later.
+    private boolean bEndpointNativeHandoffEstablished = false;
+    private boolean bLocomotionResetPendingAfterEndpointIdle = false;
     TrueMovementOverlay overlay;
 
     // Time management
@@ -96,11 +133,26 @@ public class CustomMovementHandler
     public int CurrentFrameDelta;
     private long LastTimeMilliseconds = 0;
     private long LastAnimationTickTime = 0;
+    private long LastGcCollectionTimeMillis = 0;
     private int MillisecondsSinceTileChange = 1000;
+    // Diagnostic provenance for the latest authoritative route segment. The
+    // wall-clock tween can expire a few render updates before the next player
+    // position is published; recording RuneLite's native clocks distinguishes
+    // that ordering seam from a genuinely missed/late route update.
+    private int MovementSegmentPublicationTick = -1;
+    private int MovementSegmentPublicationGameCycle = -1;
     // Runelite object management
     public Actor Owner = null;
     public AnimationController AnimController = null; // Used to blend additional animations
     public RuneLiteObject Model = null;
+    // Actor-attached spot animations are submitted separately from
+    // Player.getModel(). Preserve each native effect as its own renderable when
+    // the native player is suppressed, changing only its scene anchor to the
+    // custom player's transform. ActorSpotAnim.getModel() already includes the
+    // authored frame and height offset, so it must not be transformed again.
+    private final Map<Long, RuneLiteObject> MirroredActorSpotModels =
+            new HashMap<>();
+    private final Set<Long> PublishedActorSpotSlots = new HashSet<>();
 
     // Targeting
     public Actor currentTarget = null;
@@ -139,6 +191,19 @@ public class CustomMovementHandler
     // limited to an outward yellow-click route at the scene rebuild margin;
     // red-click interactions and ordinary movement can never extrapolate.
     private boolean bSceneBoundaryBridgeActive = false;
+    // Snapshot the last presentation which was genuinely progressing along a
+    // non-zero segment. LOADING suspends Update(), so this survives the gap
+    // without confusing route-gap locomotion at a clamped endpoint for motion.
+    private boolean bRetainedSceneMovementSegmentInProgress = false;
+    private int RetainedMovementProgressTick = -1;
+    private int RetainedMovementProgressGameCycle = -1;
+    private boolean bFreshMovementPublicationBoundaryBridgeActive = false;
+    private int FreshMovementPublicationBoundaryGameCycle = -1;
+    // A non-zero post-scene recovery is real visible movement even though the
+    // replacement scene is still awaiting its first authoritative route point.
+    // Let only that proven recovery use the ordinary bounded route-gap grace;
+    // zero-distance waits and fresh clicks retain stable endpoint idle.
+    private boolean bPostSceneRecoveryRouteGapEligible = false;
     // [TMA-SCENE-PRESENTATION-CLOCK] A scene can be prepared at
     // BeforeRender and then spend ~200 ms finishing its first drawable frame.
     // Defer that missing time and repay it gradually instead of applying the
@@ -146,6 +211,10 @@ public class CustomMovementHandler
     private boolean bScenePresentationClockActive = false;
     private boolean bSceneLoadFramePresentationPending = false;
     private int ScenePresentationTimeDebtMilliseconds = 0;
+    // Preserve sub-millisecond-share debt entitlement across render frames.
+    // Rounding each frame upward makes 5/6 ms frames repay 1/2 ms, producing
+    // an alternating recovery velocity at high FPS instead of a steady 20%.
+    private int ScenePresentationDebtPaybackRemainder = 0;
     // When a newer route point arrives while presentation is intentionally
     // behind, preserve the established movement velocity by extending the
     // tween duration rather than accelerating toward the newest point.
@@ -185,6 +254,10 @@ public class CustomMovementHandler
     // Rotation
     private int TargetOrientation = 0;
     private int CurrentOrientation = 0;
+    // [TMA-TURN-CONTINUITY] RuneLiteObject orientation is integer-valued, but
+    // the configured render-frame turn step is fractional at high FPS. Keep
+    // that sub-unit phase here so it is not discarded on every publication.
+    private double PreciseCurrentOrientation = 0;
     // [TMA-STOP-FACING] Yellow Walk clicks may leave the hidden native player
     // finishing its route behind the visible model. During that catch-up only,
     // retain the visible model's final movement direction instead of adopting
@@ -205,10 +278,19 @@ public class CustomMovementHandler
     private boolean bWalkMovementObserved = false;
     private boolean bWalkStartPendingDuringCatchUp = false;
     private boolean bWalkSegmentAwaitingMovement = false;
-    private boolean bWalkReclickOccurredDuringVisibleMovement = false;
+    // A new yellow click can arrive while the old route is already using its
+    // proven, bounded animation-only feed-gap bridge. Let only that existing
+    // bridge finish its original deadline; the new click receives no fresh
+    // grace and an ordinary mid-segment re-click still settles to idle.
+    private boolean bPendingWalkInheritedActiveRouteGap = false;
+    // Provenance for the RuneLiteObject's current base mesh. Existence alone
+    // is insufficient: a completed action/spot model must never be retained as
+    // the stopped fallback while a yellow segment is pending.
+    private boolean bPublishedStoppedGeometrySafe = false;
     private boolean bPreserveReleasedWalkFacing = false;
     private boolean bHoldWalkStopFacingThisFrame = false;
     private boolean bNativeWalkFacingSettled = false;
+
     // [TMA-YELLOW-RECLICK-ROUTE-GRACE] Route-gap animation continuity belongs
     // only to the yellow click which produced the displayed segment. A newer
     // click can publish its destination before its first movement segment;
@@ -240,6 +322,7 @@ public class CustomMovementHandler
     public RuneLiteObject cameraModel = null;
     private int CurrentCameraObjectOrientation = 0;
     private int CurrentCameraModelIndex = 0;
+    private boolean bCameraModelNeedsPublish = false;
     private double CurrentArrowPointingAnimationFrame = 0.0f;
 
     @Inject
@@ -364,6 +447,26 @@ public class CustomMovementHandler
                 !SceneLoadFramePresentationPending;
     }
 
+    static boolean ShouldUseAuthoritativeTeleportAction(
+            int OwnerAnimation)
+    {
+        // The live action is sufficient authority. Do not wait for the
+        // game-tick detector to arm the wider arrival window: a render between
+        // those events must still show the teleport, never locomotion.
+        return TrueTileMovementPlugin.IsGenuineTeleportAnimation(
+                OwnerAnimation);
+    }
+
+    static boolean ShouldUseIdlePoseDuringTeleportLeadIn(
+            boolean TeleportPresentationActive,
+            long TeleportElapsedNanoseconds)
+    {
+        return TeleportPresentationActive &&
+                TeleportElapsedNanoseconds >= 0 &&
+                TeleportElapsedNanoseconds <
+                        TELEPORT_ANIMATION_FIRST_TICK_NANOS;
+    }
+
     static double ApplyContinuousMovementSpeedLead(
             double BaseProgress,
             double CombinedMultiplier)
@@ -473,7 +576,8 @@ public class CustomMovementHandler
 
     static int GetScenePresentationDebtPayback(
             int ImmediateDeltaMilliseconds,
-            int TimeDebtMilliseconds)
+            int TimeDebtMilliseconds,
+            int PaybackRemainder)
     {
         if (ImmediateDeltaMilliseconds <= 0 ||
                 TimeDebtMilliseconds <= 0)
@@ -481,13 +585,45 @@ public class CustomMovementHandler
             return 0;
         }
 
+        int SafeRemainder = Math.max(
+                0,
+                Math.min(
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR - 1,
+                        PaybackRemainder));
         int MaximumPaybackThisFrame =
-                (ImmediateDeltaMilliseconds +
-                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR - 1) /
+                (SafeRemainder + ImmediateDeltaMilliseconds) /
                         SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR;
         return Math.min(
                 TimeDebtMilliseconds,
                 MaximumPaybackThisFrame);
+    }
+
+    static int GetScenePresentationDebtPaybackRemainder(
+            int ImmediateDeltaMilliseconds,
+            int TimeDebtMilliseconds,
+            int PaybackRemainder)
+    {
+        if (TimeDebtMilliseconds <= 0)
+        {
+            return 0;
+        }
+
+        int SafeRemainder = Math.max(
+                0,
+                Math.min(
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR - 1,
+                        PaybackRemainder));
+        int PaybackNumerator =
+                SafeRemainder +
+                        Math.max(0, ImmediateDeltaMilliseconds);
+        int Payback = Math.min(
+                TimeDebtMilliseconds,
+                PaybackNumerator /
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR);
+        return TimeDebtMilliseconds <= Payback
+                ? 0
+                : PaybackNumerator %
+                        SCENE_PRESENTATION_DEBT_PAYBACK_DIVISOR;
     }
 
     static long GetSceneRecoveryTweenDuration(
@@ -636,11 +772,13 @@ public class CustomMovementHandler
 
     static boolean CanPreserveSceneMovementVelocity(
             boolean BoundaryBridgeActive,
+            boolean RetainedPresentationMoving,
             boolean YellowWalkRouteActive,
             boolean SamePlane,
             boolean SpecialMovementDiscontinuity)
     {
-        return BoundaryBridgeActive &&
+        return (BoundaryBridgeActive ||
+                RetainedPresentationMoving) &&
                 YellowWalkRouteActive &&
                 SamePlane &&
                 !SpecialMovementDiscontinuity;
@@ -740,12 +878,18 @@ public class CustomMovementHandler
 
     static boolean ShouldKeepMovementAnimationDuringRouteGap(
             int MillisecondsSinceTileChange,
+            long MovementDurationMilliseconds,
             boolean WasMoving,
             boolean WalkRouteContinuityArmed,
             boolean WalkSegmentAwaitingMovement,
             LocalPoint CurrentSegmentDestination,
             LocalPoint RouteDestination)
     {
+        long TimeSinceSegmentCompleted =
+                (long) MillisecondsSinceTileChange -
+                        Math.max(
+                                BASE_MOVEMENT_TWEEN_MILLIS,
+                                MovementDurationMilliseconds);
         // A route destination alone is not enough: red-click interactions
         // publish destinations too. Their synchronous cancel clears this
         // yellow-walk arm so object/NPC stops cannot inherit locomotion grace
@@ -753,11 +897,9 @@ public class CustomMovementHandler
         return WasMoving &&
                 WalkRouteContinuityArmed &&
                 !WalkSegmentAwaitingMovement &&
-                MillisecondsSinceTileChange >=
-                        BASE_MOVEMENT_TWEEN_MILLIS &&
-                MillisecondsSinceTileChange <
-                        BASE_MOVEMENT_TWEEN_MILLIS +
-                                MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS &&
+                TimeSinceSegmentCompleted >= 0 &&
+                TimeSinceSegmentCompleted <
+                        MOVEMENT_ANIMATION_CONTINUITY_GRACE_MILLIS &&
                 CurrentSegmentDestination != null &&
                 RouteDestination != null &&
                 IsSameWorldView(
@@ -771,6 +913,25 @@ public class CustomMovementHandler
             boolean WasMoving,
             boolean WalkRouteContinuityArmed,
             boolean WalkSegmentAwaitingMovement,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        return ShouldKeepMovementAnimationDuringRouteGap(
+                MillisecondsSinceTileChange,
+                BASE_MOVEMENT_TWEEN_MILLIS,
+                WasMoving,
+                WalkRouteContinuityArmed,
+                WalkSegmentAwaitingMovement,
+                CurrentSegmentDestination,
+                RouteDestination);
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringRouteGap(
+            int MillisecondsSinceTileChange,
+            long MovementDurationMilliseconds,
+            boolean WasMoving,
+            boolean WalkRouteContinuityArmed,
+            boolean WalkSegmentAwaitingMovement,
             boolean HoldingStopFacing,
             LocalPoint CurrentSegmentDestination,
             LocalPoint RouteDestination)
@@ -781,9 +942,96 @@ public class CustomMovementHandler
         return !HoldingStopFacing &&
                 ShouldKeepMovementAnimationDuringRouteGap(
                         MillisecondsSinceTileChange,
+                        MovementDurationMilliseconds,
                         WasMoving,
                         WalkRouteContinuityArmed,
                         WalkSegmentAwaitingMovement,
+                        CurrentSegmentDestination,
+                        RouteDestination);
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringRouteGap(
+            int MillisecondsSinceTileChange,
+            boolean WasMoving,
+            boolean WalkRouteContinuityArmed,
+            boolean WalkSegmentAwaitingMovement,
+            boolean HoldingStopFacing,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        return ShouldKeepMovementAnimationDuringRouteGap(
+                MillisecondsSinceTileChange,
+                BASE_MOVEMENT_TWEEN_MILLIS,
+                WasMoving,
+                WalkRouteContinuityArmed,
+                WalkSegmentAwaitingMovement,
+                HoldingStopFacing,
+                CurrentSegmentDestination,
+                RouteDestination);
+    }
+
+    static boolean ShouldArmPostSceneRecoveryRouteGap(
+            boolean AwaitingPostSceneWalkSegment,
+            boolean HasRecoveryDistance)
+    {
+        return AwaitingPostSceneWalkSegment &&
+                HasRecoveryDistance;
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+            boolean PostSceneRecoveryRouteGapEligible,
+            int MillisecondsSinceTileChange,
+            long MovementDurationMilliseconds,
+            boolean WasMoving,
+            boolean WalkRouteContinuityArmed,
+            boolean MovementSegmentFromLatestWalkClick,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        // Eligibility is created only by a non-zero recovery which inherited
+        // this same observed yellow route. It may therefore bypass the
+        // scene-created awaiting flag, but it retains the existing duration,
+        // ownership, destination, and 300 ms expiry checks.
+        return PostSceneRecoveryRouteGapEligible &&
+                ShouldKeepMovementAnimationDuringRouteGap(
+                        MillisecondsSinceTileChange,
+                        MovementDurationMilliseconds,
+                        WasMoving,
+                        WalkRouteContinuityArmed &&
+                                MovementSegmentFromLatestWalkClick,
+                        false,
+                        CurrentSegmentDestination,
+                        RouteDestination);
+    }
+
+    static boolean ShouldKeepMovementAnimationDuringInheritedPendingRouteGap(
+            boolean InheritedActiveRouteGap,
+            int MillisecondsSinceTileChange,
+            long MovementDurationMilliseconds,
+            boolean WasMoving,
+            boolean WalkRouteContinuityArmed,
+            boolean WalkStartPending,
+            boolean WalkSegmentAwaitingMovement,
+            boolean MovementSegmentFromLatestWalkClick,
+            boolean HoldingStopFacing,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        // The latch is created only while the old click is already inside the
+        // ordinary bounded route-gap bridge. Bypass the newer click's awaiting
+        // flag, but keep the old segment clock, route, facing, and 300 ms expiry
+        // checks. This cannot create or extend locomotion grace.
+        return InheritedActiveRouteGap &&
+                WalkStartPending &&
+                WalkSegmentAwaitingMovement &&
+                !MovementSegmentFromLatestWalkClick &&
+                ShouldKeepMovementAnimationDuringRouteGap(
+                        MillisecondsSinceTileChange,
+                        MovementDurationMilliseconds,
+                        WasMoving,
+                        WalkRouteContinuityArmed,
+                        false,
+                        HoldingStopFacing,
                         CurrentSegmentDestination,
                         RouteDestination);
     }
@@ -796,6 +1044,61 @@ public class CustomMovementHandler
                 RouteDestination != null &&
                 IsSameWorldView(SegmentDestination, RouteDestination) &&
                 !SegmentDestination.equals(RouteDestination);
+    }
+
+    static boolean ShouldBridgeFreshMovementPublicationBoundary(
+            int MillisecondsSinceTileChange,
+            long MovementDurationMilliseconds,
+            boolean PlayerOwner,
+            boolean RetainedMovementSegmentInProgress,
+            boolean WalkSegmentAwaitingMovement,
+            boolean HoldingStopFacing,
+            boolean SpecialPresentationActive,
+            int OwnerActionAnimation,
+            LocalPoint CurrentSegmentDestination,
+            LocalPoint RouteDestination)
+    {
+        // This is eligibility for a one-shot render-boundary bridge. Frame
+        // pacing can make the first render after 600 ms arrive one or several
+        // native cycles after the last moving render, so clock distance is not
+        // reliable provenance. The retained snapshot proves that the previous
+        // presented frame was genuinely traversing this non-zero segment. The
+        // caller latches only the first completed render's current game cycle;
+        // the snapshot is not refreshed, so the bridge cannot re-arm.
+        return PlayerOwner &&
+                RetainedMovementSegmentInProgress &&
+                MillisecondsSinceTileChange >=
+                        Math.max(
+                                BASE_MOVEMENT_TWEEN_MILLIS,
+                                MovementDurationMilliseconds) &&
+                // A newer yellow click can arm the pending-facing hold while
+                // this old segment is still visibly moving. At an unfinished
+                // route that is publication ordering, not a final stop. A
+                // genuine stop-facing hold remains excluded.
+                (!HoldingStopFacing || WalkSegmentAwaitingMovement) &&
+                !SpecialPresentationActive &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                HasUnfinishedRoute(
+                        CurrentSegmentDestination,
+                        RouteDestination);
+    }
+
+    static boolean IsFreshMovementPublicationBoundaryBridgeCycle(
+            int BoundaryGameCycle,
+            int CurrentGameCycle)
+    {
+        return BoundaryGameCycle >= 0 &&
+                BoundaryGameCycle == CurrentGameCycle;
+    }
+
+    static int SelectFreshMovementPublicationBoundaryGameCycle(
+            boolean BridgeEligible,
+            int ExistingBoundaryGameCycle,
+            int CurrentGameCycle)
+    {
+        return BridgeEligible && ExistingBoundaryGameCycle < 0
+                ? CurrentGameCycle
+                : ExistingBoundaryGameCycle;
     }
 
     static boolean ShouldAwaitPostSceneWalkSegment(
@@ -853,9 +1156,44 @@ public class CustomMovementHandler
                 CurrentAnimationId != RequestedAnimationId;
     }
 
-    private int ShortestAngleDifference(int from, int to)
+    private static int ShortestAngleDifference(int from, int to)
     {
         return ((to - from + 3095) % 2047) - 1048;
+    }
+
+    static double AdvanceOrientationPhase(
+            double CurrentOrientationPhase,
+            int TargetOrientation,
+            double MaximumStep)
+    {
+        int PublishedOrientation = (int) CurrentOrientationPhase;
+        int ShortestAngle = ShortestAngleDifference(
+                PublishedOrientation,
+                TargetOrientation);
+        if (ShortestAngle == 0)
+        {
+            return TargetOrientation;
+        }
+        if (!Double.isFinite(MaximumStep) || MaximumStep <= 0)
+        {
+            return CurrentOrientationPhase;
+        }
+        if (Math.abs(ShortestAngle) <= MaximumStep)
+        {
+            return TargetOrientation;
+        }
+
+        double NextOrientation = CurrentOrientationPhase +
+                Math.copySign(MaximumStep, ShortestAngle);
+        if (NextOrientation < 0)
+        {
+            NextOrientation += 2047;
+        }
+        else if (NextOrientation > 2047)
+        {
+            NextOrientation -= 2047;
+        }
+        return NextOrientation;
     }
 
     private int getOrientationBetweenPoints(double point1X, double point1Y, double point2X, double point2Y, int OffsetAngle)
@@ -918,6 +1256,18 @@ public class CustomMovementHandler
         if (Model == null || bReplaceSceneObjects)
         {
             RuneLiteObject OldModel = Model;
+            if (bEndpointNativeIdlePoseOverrideActive)
+            {
+                SetAllIdlePosesDefault();
+            }
+            ClearHeldEndpointIdleModel();
+            bEndpointIdlePresentationActive = false;
+            bEndpointNativeHandoffReadyThisFrame = false;
+            bEndpointNativeHandoffEstablished = false;
+            bLocomotionResetPendingAfterEndpointIdle = false;
+            bPublishedStoppedGeometrySafe = false;
+            bPostSceneRecoveryRouteGapEligible = false;
+            bPendingWalkInheritedActiveRouteGap = false;
             Model = client.createRuneLiteObject();
             // [TMA-TRANSPARENCY-DEPTH] Force depth-sorted rendering
             // so transparent faces draw after body faces.
@@ -934,8 +1284,24 @@ public class CustomMovementHandler
             }
         }
 
+        if (bReplaceSceneObjects)
+        {
+            RemoveMirroredActorSpotAnimations();
+        }
+
         if (IsPlayerOwner())
         {
+            if (bReplaceSceneObjects &&
+                    !config.SpawnModelAtCameraTile() &&
+                    cameraModel != null)
+            {
+                // A disabled auxiliary model still belongs to the old scene.
+                // Drop that stale object now so enabling the option later
+                // creates and registers a current-scene replacement.
+                client.removeRuneLiteObject(cameraModel);
+                cameraModel = null;
+                bCameraModelNeedsPublish = false;
+            }
             if (config.SpawnModelAtCameraTile())
             {
                 if (cameraModelAnimController == null)
@@ -967,6 +1333,7 @@ public class CustomMovementHandler
                     // 3,404-3,406->more arrows!
                     // 3,405-> best arrow?
                     cameraModel = client.createRuneLiteObject();
+                    bCameraModelNeedsPublish = true;
 
                     if (OldModel != null)
                     {
@@ -995,12 +1362,22 @@ public class CustomMovementHandler
         bShouldRenderOwner = true;
         bAttemptToRenderOwner = true;
         CancelWalkStopFacingHold();
+        bPublishedStoppedGeometrySafe = false;
         bSceneRebasePending = false;
         bSceneRecoveryRetargetPending = false;
         bSceneBoundaryBridgeActive = false;
+        bRetainedSceneMovementSegmentInProgress = false;
+        RetainedMovementProgressTick = -1;
+        RetainedMovementProgressGameCycle = -1;
+        bFreshMovementPublicationBoundaryBridgeActive = false;
+        FreshMovementPublicationBoundaryGameCycle = -1;
+        bPostSceneRecoveryRouteGapEligible = false;
+        MovementSegmentPublicationTick = -1;
+        MovementSegmentPublicationGameCycle = -1;
         bScenePresentationClockActive = false;
         bSceneLoadFramePresentationPending = false;
         ScenePresentationTimeDebtMilliseconds = 0;
+        ScenePresentationDebtPaybackRemainder = 0;
         SceneRecoveryBaseVelocity = 0;
         SceneRecoveryTweenDurationOverride = 0;
         bNativeSceneLoadHandoffPresented = false;
@@ -1009,6 +1386,15 @@ public class CustomMovementHandler
         PohArrivalCoordinateGuardSceneGeneration = -1;
         LastValidOwnerPoseAnimation = NO_ANIMATION;
         LastValidOwnerPoseFrame = 0;
+        if (bEndpointNativeIdlePoseOverrideActive)
+        {
+            SetAllIdlePosesDefault();
+        }
+        ClearHeldEndpointIdleModel();
+        bEndpointIdlePresentationActive = false;
+        bEndpointNativeHandoffReadyThisFrame = false;
+        bEndpointNativeHandoffEstablished = false;
+        bLocomotionResetPendingAfterEndpointIdle = false;
         if (AnimController != null)
         {
             AnimController = null;
@@ -1065,6 +1451,8 @@ public class CustomMovementHandler
             cameraModel.setActive(false);
             client.removeRuneLiteObject(cameraModel);
         }
+
+        RemoveMirroredActorSpotAnimations();
     }
 
     void ArmWalkStopFacingHold()
@@ -1073,6 +1461,34 @@ public class CustomMovementHandler
         {
             return;
         }
+
+        long MovementDuration =
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride);
+        boolean bActiveRouteGapBeforeClick =
+                ShouldKeepMovementAnimationDuringInheritedPendingRouteGap() ||
+                        ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap() ||
+                        ShouldKeepMovementAnimationDuringRouteGap(
+                                MillisecondsSinceTileChange,
+                                MovementDuration,
+                                bMovingThisAction,
+                                bWalkStopFacingHoldArmed &&
+                                        bWalkMovementObserved &&
+                                        IsMovementSegmentFromLatestWalkClick(
+                                                WalkClickRevision,
+                                                WalkClickRevisionAtMovementSegment),
+                                bWalkSegmentAwaitingMovement,
+                                bHoldWalkStopFacingThisFrame,
+                                NextLerpPosition,
+                                client.getLocalDestinationLocation());
+        // A newer click cannot start a replacement grace window. If the old
+        // route was already inside its valid bridge, remember only that fact so
+        // it can reach the unchanged original expiry without an idle flash.
+        // Repeated clicks may keep this same latch, but its segment clock is
+        // never reset or extended.
+        bPendingWalkInheritedActiveRouteGap =
+                bActiveRouteGapBeforeClick;
+        bPostSceneRecoveryRouteGapEligible = false;
 
         boolean bContinueActiveCatchUp =
                 ShouldContinueActiveWalkStopCatchUp(
@@ -1086,20 +1502,51 @@ public class CustomMovementHandler
                         GetMovementTweenDurationMilliseconds(),
                         LastLerpPosition,
                         NextLerpPosition);
+        boolean bContinueReleasedFacingAsPendingIdle =
+                ShouldContinueReleasedFacingForPendingWalk(
+                        bPreserveReleasedWalkFacing,
+                        bNativeWalkFacingSettled);
+        if (bPreserveReleasedWalkFacing &&
+                !bContinueReleasedFacingAsPendingIdle)
+        {
+            // [TMA-FRESH-WALK-RESPONSE] A fully settled old route no longer
+            // owns presentation after the next yellow click. Keep the new
+            // route armed/awaiting authority, but do not make that click look
+            // inert by carrying an obsolete facing hold into established
+            // idle. An active, not-yet-settled catch-up still keeps its hold.
+            bPreserveReleasedWalkFacing = false;
+            bNativeWalkFacingSettled = false;
+        }
+        boolean bContinuePendingWalkPresentation =
+                bActiveRouteGapBeforeClick ||
+                        ShouldContinuePendingWalkPresentation(
+                                bContinueActiveCatchUp,
+                                bVisibleMovementSegmentInProgress,
+                                bContinueReleasedFacingAsPendingIdle,
+                                bEndpointIdlePresentationActive,
+                                bEndpointNativeHandoffEstablished,
+                                bRenderOriginalOwnerDueToProximity,
+                                !bMovingThisAction &&
+                                        Model != null &&
+                                        Model.isActive() &&
+                                        Model.getBaseModel() != null);
         ++WalkClickRevision;
         // Every yellow click waits for a segment published after that click.
         // The already-visible segment continues normally until its endpoint;
         // only stale route-gap locomotion is excluded.
         bWalkSegmentAwaitingMovement = true;
         bWalkStopFacingHoldArmed = true;
-        bWalkMovementObserved =
-                bContinueActiveCatchUp ||
-                        bVisibleMovementSegmentInProgress;
+        bWalkMovementObserved = bContinuePendingWalkPresentation;
         bWalkStartPendingDuringCatchUp =
-                bContinueActiveCatchUp ||
-                        bVisibleMovementSegmentInProgress;
-        bWalkReclickOccurredDuringVisibleMovement =
-                bVisibleMovementSegmentInProgress;
+                bContinuePendingWalkPresentation;
+        // [TMA-FRESH-WALK-PRESENTATION] World input can arrive after a frame's
+        // pre-render snapshot but before its draw callback. Retire only native
+        // render authority synchronously with the click. An
+        // established native-geometry path remains on the custom object so its
+        // current idle phase, location, and orientation survive until a real
+        // segment is published.
+        bEndpointNativeHandoffReadyThisFrame = false;
+        bRenderOriginalOwnerDueToProximity = false;
         // If the previous route is already preserving its released facing,
         // keep that stable during the short click-to-movement delay. A click
         // during a genuinely moving segment also retains its observed state
@@ -1114,12 +1561,50 @@ public class CustomMovementHandler
         bWalkMovementObserved = false;
         bWalkStartPendingDuringCatchUp = false;
         bWalkSegmentAwaitingMovement = false;
-        bWalkReclickOccurredDuringVisibleMovement = false;
+        bPostSceneRecoveryRouteGapEligible = false;
+        bPendingWalkInheritedActiveRouteGap = false;
         bPreserveReleasedWalkFacing = false;
         bHoldWalkStopFacingThisFrame = false;
         bNativeWalkFacingSettled = false;
         WalkClickRevision = 0;
         WalkClickRevisionAtMovementSegment = 0;
+    }
+
+    private boolean ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap()
+    {
+        return ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap(
+                bPostSceneRecoveryRouteGapEligible,
+                MillisecondsSinceTileChange,
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride),
+                bMovingThisAction,
+                bWalkStopFacingHoldArmed &&
+                        bWalkMovementObserved,
+                IsMovementSegmentFromLatestWalkClick(
+                        WalkClickRevision,
+                        WalkClickRevisionAtMovementSegment),
+                NextLerpPosition,
+                client.getLocalDestinationLocation());
+    }
+
+    private boolean ShouldKeepMovementAnimationDuringInheritedPendingRouteGap()
+    {
+        return ShouldKeepMovementAnimationDuringInheritedPendingRouteGap(
+                bPendingWalkInheritedActiveRouteGap,
+                MillisecondsSinceTileChange,
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride),
+                bMovingThisAction,
+                bWalkStopFacingHoldArmed &&
+                        bWalkMovementObserved,
+                bWalkStartPendingDuringCatchUp,
+                bWalkSegmentAwaitingMovement,
+                IsMovementSegmentFromLatestWalkClick(
+                        WalkClickRevision,
+                        WalkClickRevisionAtMovementSegment),
+                bHoldWalkStopFacingThisFrame,
+                NextLerpPosition,
+                client.getLocalDestinationLocation());
     }
 
     private void UpdateWalkStopFacingHold()
@@ -1133,10 +1618,32 @@ public class CustomMovementHandler
         // Scene recovery can deliberately take longer than one normal game
         // tick. Use the same duration as animation selection so stop-facing
         // cannot begin while the visible model is still traversing recovery.
+        long MovementDuration =
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride);
+        boolean bPostSceneRecoveryRouteGapGraceActive =
+                ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap();
+        boolean bInheritedPendingRouteGapGraceActive =
+                ShouldKeepMovementAnimationDuringInheritedPendingRouteGap();
         boolean VisibleModelIsMoving =
-                MillisecondsSinceTileChange <
-                        GetSceneMovementAnimationDuration(
-                                SceneRecoveryTweenDurationOverride);
+                MillisecondsSinceTileChange < MovementDuration ||
+                        bPostSceneRecoveryRouteGapGraceActive ||
+                        bInheritedPendingRouteGapGraceActive;
+        if (bPostSceneRecoveryRouteGapEligible &&
+                !bPostSceneRecoveryRouteGapGraceActive &&
+                MillisecondsSinceTileChange >= MovementDuration)
+        {
+            // The bounded seam expired (or its route ownership stopped being
+            // valid). Restore the existing pending idle/facing handoff.
+            bPostSceneRecoveryRouteGapEligible = false;
+        }
+        if (bPendingWalkInheritedActiveRouteGap &&
+                !bInheritedPendingRouteGapGraceActive)
+        {
+            // Expiry and every invalidating condition restore the established
+            // pending-idle handoff. The latch can never feed itself forward.
+            bPendingWalkInheritedActiveRouteGap = false;
+        }
         if (VisibleModelIsMoving)
         {
             if (bWalkStopFacingHoldArmed)
@@ -1196,6 +1703,17 @@ public class CustomMovementHandler
                 // resume. Red interactions still cancel synchronously in the
                 // menu-click handler and do not wait for this branch.
                 bPreserveReleasedWalkFacing = false;
+                if (ShouldHoldPendingWalkStart(
+                        bWalkStartPendingDuringCatchUp,
+                        bWalkStopFacingHoldArmed,
+                        bWalkMovementObserved,
+                        false))
+                {
+                    // A yellow re-click can change target orientation before
+                    // its first authoritative segment. Preserve endpoint idle
+                    // for that publication seam; never revive locomotion.
+                    bHoldWalkStopFacingThisFrame = true;
+                }
             }
             return;
         }
@@ -1253,7 +1771,7 @@ public class CustomMovementHandler
         bWalkStopFacingHoldArmed = RetainPendingWalkArm;
         bWalkMovementObserved = false;
         bWalkStartPendingDuringCatchUp = false;
-        bWalkReclickOccurredDuringVisibleMovement = false;
+        bPendingWalkInheritedActiveRouteGap = false;
         bPreserveReleasedWalkFacing = true;
         bNativeWalkFacingSettled = false;
         NativeTargetOrientationAtWalkFacingRelease =
@@ -1269,6 +1787,244 @@ public class CustomMovementHandler
         return WalkDestination == null ||
                 (NextLerpPosition != null &&
                         NextLerpPosition.equals(WalkDestination));
+    }
+
+    static boolean ShouldUseEndpointIdlePresentation(
+            boolean CustomPresentationActive,
+            boolean SegmentComplete,
+            boolean SegmentHasDistance,
+            boolean SceneBoundaryBridgeActive,
+            boolean OrdinaryPoseRequest,
+            boolean SpecialPresentationActive,
+            boolean HoldingWalkStopFacing,
+            boolean AtFinalDestination,
+            boolean HiddenOwnerReadyForIdleHandoff,
+            int OwnerActionAnimation)
+    {
+        // [TMA-ENDPOINT-IDLE-PRESENTATION] Route intent is deliberately separate
+        // from visible velocity. A route may continue, but a model clamped at
+        // the end of its last published segment is spatially stationary and
+        // must not select locomotion from its previous pose state.
+        return CustomPresentationActive &&
+                SegmentComplete &&
+                SegmentHasDistance &&
+                !SceneBoundaryBridgeActive &&
+                OrdinaryPoseRequest &&
+                !SpecialPresentationActive &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                (AtFinalDestination
+                        ? !HiddenOwnerReadyForIdleHandoff
+                        : HoldingWalkStopFacing);
+    }
+
+    static boolean ShouldContinuePendingWalkPresentation(
+            boolean ContinueActiveCatchUp,
+            boolean VisibleMovementSegmentInProgress,
+            boolean PreservingReleasedFacing,
+            boolean EndpointIdlePresentationActive,
+            boolean NativeEndpointGeometryEstablished,
+            boolean RenderingOriginalOwner,
+            boolean StationaryCustomPresentationActive)
+    {
+        return ContinueActiveCatchUp ||
+                VisibleMovementSegmentInProgress ||
+                PreservingReleasedFacing ||
+                EndpointIdlePresentationActive ||
+                NativeEndpointGeometryEstablished ||
+                RenderingOriginalOwner ||
+                StationaryCustomPresentationActive;
+    }
+
+    static boolean ShouldContinueReleasedFacingForPendingWalk(
+            boolean PreservingReleasedFacing,
+            boolean NativeFacingSettled)
+    {
+        return PreservingReleasedFacing &&
+                !NativeFacingSettled;
+    }
+
+    static boolean ShouldUseDetachedEndpointIdleForFacingHold(
+            boolean HoldingWalkStopFacing,
+            boolean NativeEndpointGeometryEstablished)
+    {
+        return HoldingWalkStopFacing &&
+                !NativeEndpointGeometryEstablished;
+    }
+
+    static boolean ShouldBlockOriginalOwnerForPendingWalk(
+            boolean WalkSegmentAwaitingMovement,
+            boolean HoldingWalkStopFacing,
+            boolean NativeHandoffReadyThisFrame,
+            boolean NativeEndpointGeometryEstablished)
+    {
+        return WalkSegmentAwaitingMovement ||
+                (HoldingWalkStopFacing &&
+                        !NativeHandoffReadyThisFrame &&
+                        !NativeEndpointGeometryEstablished);
+    }
+
+    static boolean ShouldPreservePendingWalkEndpointGeometry(
+            boolean WalkSegmentAwaitingMovement,
+            boolean HoldingStoppedPresentation,
+            boolean EndpointIdlePresentationActive,
+            boolean PublishedStoppedModelIsSafe,
+            int OwnerActionAnimation,
+            boolean SpecialPresentationActive,
+            int OwnerPoseAnimation,
+            int IdlePoseAnimation)
+    {
+        // A yellow click can expose the hidden actor's locomotion pose before
+        // its first authoritative segment. Keep refreshing the ordinary
+        // smoothed idle while that actor is still idle, but retain the last
+        // safe published geometry throughout this premature pose seam. A real
+        // action remains authoritative and bypasses this hold. Dedicated
+        // detached endpoint idle also has priority so locomotion can never be
+        // retained as its fallback geometry.
+        return WalkSegmentAwaitingMovement &&
+                HoldingStoppedPresentation &&
+                !EndpointIdlePresentationActive &&
+                PublishedStoppedModelIsSafe &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                !SpecialPresentationActive &&
+                OwnerPoseAnimation != IdlePoseAnimation;
+    }
+
+    static boolean ShouldMarkPublishedStoppedGeometrySafe(
+            boolean Moving,
+            int OwnerActionAnimation,
+            boolean SpecialPresentationActive,
+            int OwnerPoseAnimation,
+            int OwnerPoseFrame,
+            int IdlePoseAnimation,
+            boolean PublishedBaseModelAvailable)
+    {
+        return !Moving &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                !SpecialPresentationActive &&
+                IdlePoseAnimation != NO_ANIMATION &&
+                OwnerPoseAnimation == IdlePoseAnimation &&
+                OwnerPoseFrame >= 0 &&
+                PublishedBaseModelAvailable;
+    }
+
+    static boolean ShouldSelectMovementPose(
+            boolean EndpointIdlePresentationActive,
+            boolean SegmentPositionMoving,
+            boolean SceneBoundaryBridgeActive,
+            boolean RouteGapGraceActive)
+    {
+        return !EndpointIdlePresentationActive &&
+                (SegmentPositionMoving ||
+                        SceneBoundaryBridgeActive ||
+                        RouteGapGraceActive);
+    }
+
+    static boolean ShouldResetLocomotionAfterEndpointIdle(
+            boolean HeldEndpointIdleWasDisplayed,
+            boolean NewAuthoritativeSegmentStarted)
+    {
+        return HeldEndpointIdleWasDisplayed &&
+                NewAuthoritativeSegmentStarted;
+    }
+
+    static boolean ShouldResetLocomotionForNewSegment(
+            boolean EndpointIdlePresentationActive,
+            boolean ResetAlreadyPending)
+    {
+        return EndpointIdlePresentationActive ||
+                ResetAlreadyPending;
+    }
+
+    static boolean UpdateEndpointNativeHandoffLatch(
+            boolean HandoffEstablished,
+            boolean HandoffReadyNow,
+            boolean NewAuthoritativeSegment,
+            boolean AllowNativeEndpointGeometry)
+    {
+        return AllowNativeEndpointGeometry &&
+                !NewAuthoritativeSegment &&
+                (HandoffEstablished || HandoffReadyNow);
+    }
+
+    static boolean CanUseNativeEndpointGeometry(
+            boolean AllowOriginalModel,
+            boolean AnimationSmoothingActive)
+    {
+        // Smoothing is implemented by the ordinary Player.getModel() path.
+        // The custom RuneLiteObject can consume that geometry while retaining
+        // its own position/orientation even when drawing the original actor is
+        // disabled by configuration.
+        return AllowOriginalModel ||
+                AnimationSmoothingActive;
+    }
+
+    static boolean DoesEndpointIdleGeometryMatch(
+            boolean NativeIdleClockShared,
+            int OwnerPoseFrame,
+            int HeldEndpointIdleFrame)
+    {
+        return NativeIdleClockShared ||
+                (HeldEndpointIdleFrame >= 0 &&
+                        OwnerPoseFrame == HeldEndpointIdleFrame);
+    }
+
+    static boolean IsEndpointNativeIdleClockShared(
+            boolean AnimationSmoothingActive,
+            boolean NativeIdlePoseOverrideActive)
+    {
+        return AnimationSmoothingActive &&
+                NativeIdlePoseOverrideActive;
+    }
+
+    static boolean ShouldInvalidateEndpointIdleCache(
+            boolean NativeIdlePoseOverrideActive,
+            int PreviousIdlePoseAnimation,
+            int CurrentIdlePoseAnimation)
+    {
+        // The native-smoothed path refreshes Owner.getModel every render. A
+        // walk/run/turn selector update therefore needs caching, but must not
+        // restart the unchanged idle clock. A different idle sequence has no
+        // compatible phase and still requires the ordinary reset.
+        return !NativeIdlePoseOverrideActive ||
+                PreviousIdlePoseAnimation != CurrentIdlePoseAnimation;
+    }
+
+    static int GetNativeEndpointGeometryOrientationThreshold(
+            boolean AnimationSmoothingActive,
+            int OriginalModelOrientationThreshold)
+    {
+        // Orientation is a render transform, not part of Player model-local
+        // geometry. Smoothed geometry may therefore move to the custom object
+        // before the actual original actor is orientation-safe to display.
+        return AnimationSmoothingActive
+                ? 2047
+                : OriginalModelOrientationThreshold;
+    }
+
+    static boolean IsEndpointNativeHandoffReady(
+            boolean AllowNativeEndpointGeometry,
+            boolean AtFinalDestination,
+            boolean HiddenOwnerCaughtUp,
+            boolean HiddenOwnerIdlePoseReady,
+            boolean HiddenOwnerIdleGeometryMatches,
+            boolean NativeStateObservedAfterEntry,
+            boolean NativeFacingReadyForHandoff,
+            int OwnerActionAnimation,
+            boolean HasActiveSpotAnimation,
+            int OrientationDifference,
+            int OrientationThreshold)
+    {
+        return AllowNativeEndpointGeometry &&
+                AtFinalDestination &&
+                HiddenOwnerCaughtUp &&
+                HiddenOwnerIdlePoseReady &&
+                HiddenOwnerIdleGeometryMatches &&
+                NativeStateObservedAfterEntry &&
+                NativeFacingReadyForHandoff &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                !HasActiveSpotAnimation &&
+                Math.abs(OrientationDifference) <=
+                        OrientationThreshold;
     }
 
     static boolean HasHiddenOwnerCaughtUp(
@@ -1342,57 +2098,6 @@ public class CustomMovementHandler
                 !SegmentStart.equals(SegmentEnd);
     }
 
-    static boolean ShouldPreservePendingReclickMovementPose(
-            int MillisecondsSinceTileChange,
-            long MovementTweenDurationMilliseconds,
-            boolean PreviousFrameSelectedMovement,
-            boolean ReclickOccurredDuringVisibleMovement,
-            boolean WalkStartPending,
-            boolean WalkSegmentAwaitingMovement,
-            long LatestWalkClickRevision,
-            long MovementSegmentWalkClickRevision,
-            LocalPoint SegmentStart,
-            LocalPoint SegmentEnd)
-    {
-        return PreviousFrameSelectedMovement &&
-                IsPendingReclickMovementHandoff(
-                        MillisecondsSinceTileChange,
-                        MovementTweenDurationMilliseconds,
-                        ReclickOccurredDuringVisibleMovement,
-                        WalkStartPending,
-                        WalkSegmentAwaitingMovement,
-                        LatestWalkClickRevision,
-                        MovementSegmentWalkClickRevision,
-                        SegmentStart,
-                        SegmentEnd) &&
-                MillisecondsSinceTileChange <
-                        MovementTweenDurationMilliseconds +
-                                PENDING_RECLICK_POSE_GRACE_MILLIS;
-    }
-
-    private static boolean IsPendingReclickMovementHandoff(
-            int MillisecondsSinceTileChange,
-            long MovementTweenDurationMilliseconds,
-            boolean ReclickOccurredDuringVisibleMovement,
-            boolean WalkStartPending,
-            boolean WalkSegmentAwaitingMovement,
-            long LatestWalkClickRevision,
-            long MovementSegmentWalkClickRevision,
-            LocalPoint SegmentStart,
-            LocalPoint SegmentEnd)
-    {
-        return ReclickOccurredDuringVisibleMovement &&
-                WalkStartPending &&
-                WalkSegmentAwaitingMovement &&
-                !IsMovementSegmentFromLatestWalkClick(
-                        LatestWalkClickRevision,
-                        MovementSegmentWalkClickRevision) &&
-                MillisecondsSinceTileChange >=
-                        MovementTweenDurationMilliseconds &&
-                IsSameWorldView(SegmentStart, SegmentEnd) &&
-                !SegmentStart.equals(SegmentEnd);
-    }
-
     static int SelectPoseFrameForPublication(
             int CurrentPoseAnimation,
             int CurrentPoseFrame,
@@ -1449,27 +2154,550 @@ public class CustomMovementHandler
                 CurrentPoseAnimation != RequestedPoseAnimation;
     }
 
+    private PlayerAppearanceKey GetCurrentPlayerAppearance()
+    {
+        if (!(Owner instanceof Player))
+        {
+            return null;
+        }
+        return PlayerAppearanceKey.From(
+                ((Player) Owner).getPlayerComposition());
+    }
+
+    private boolean HeldEndpointIdleAppearanceMatches()
+    {
+        return Owner instanceof Player &&
+                HeldEndpointIdleAppearance != null &&
+                HeldEndpointIdleAppearance.Matches(
+                        ((Player) Owner).getPlayerComposition());
+    }
+
+    private boolean HasActiveSpotAnimation()
+    {
+        IterableHashTable<ActorSpotAnim> SpotAnimations =
+                Owner.getSpotAnims();
+        if (SpotAnimations == null)
+        {
+            return false;
+        }
+
+        for (ActorSpotAnim SpotAnimation : SpotAnimations)
+        {
+            if (SpotAnimation != null &&
+                    SpotAnimation.getId() != NO_ANIMATION &&
+                    SpotAnimation.getFrame() >= 0 &&
+                    SpotAnimation.getStartCycle() <=
+                            client.getGameCycle())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean ShouldMirrorActorSpotAnimation(
+            int SpotAnimationId,
+            int SpotAnimationFrame,
+            int SpotAnimationStartCycle,
+            int GameCycle,
+            boolean NativeOwnerSuppressed)
+    {
+        return NativeOwnerSuppressed &&
+                SpotAnimationId != NO_ANIMATION &&
+                SpotAnimationFrame >= 0 &&
+                SpotAnimationStartCycle <= GameCycle;
+    }
+
+    private void ClearMirroredActorSpotAnimations()
+    {
+        PublishedActorSpotSlots.clear();
+        for (RuneLiteObject SpotModel :
+                MirroredActorSpotModels.values())
+        {
+            if (SpotModel.getBaseModel() != null)
+            {
+                // Keep the registered object available for its bounded actor
+                // spot slot, but make it inert between native effects.
+                SpotModel.setModel(null);
+            }
+        }
+    }
+
+    private void RemoveMirroredActorSpotAnimations()
+    {
+        for (RuneLiteObject SpotModel :
+                MirroredActorSpotModels.values())
+        {
+            SpotModel.setActive(false);
+            client.removeRuneLiteObject(SpotModel);
+        }
+        MirroredActorSpotModels.clear();
+        PublishedActorSpotSlots.clear();
+    }
+
+    private void UpdateMirroredActorSpotAnimations(
+            boolean NativeOwnerSuppressed)
+    {
+        if (!NativeOwnerSuppressed ||
+                Model == null ||
+                Model.getLocation() == null)
+        {
+            ClearMirroredActorSpotAnimations();
+            return;
+        }
+
+        IterableHashTable<ActorSpotAnim> SpotAnimations =
+                Owner.getSpotAnims();
+        if (SpotAnimations == null)
+        {
+            ClearMirroredActorSpotAnimations();
+            return;
+        }
+
+        PublishedActorSpotSlots.clear();
+        int GameCycle = client.getGameCycle();
+        for (ActorSpotAnim SpotAnimation : SpotAnimations)
+        {
+            if (SpotAnimation == null ||
+                    !ShouldMirrorActorSpotAnimation(
+                            SpotAnimation.getId(),
+                            SpotAnimation.getFrame(),
+                            SpotAnimation.getStartCycle(),
+                            GameCycle,
+                            NativeOwnerSuppressed))
+            {
+                continue;
+            }
+
+            net.runelite.api.Model SourceSpotModel =
+                    SpotAnimation.getModel();
+            net.runelite.api.Model DetachedSpotModel =
+                    SourceSpotModel == null
+                            ? null
+                            : client.mergeModels(SourceSpotModel);
+            if (DetachedSpotModel == null)
+            {
+                continue;
+            }
+            DetachedSpotModel.calculateBoundsCylinder();
+
+            long SpotSlot = SpotAnimation.getHash();
+            RuneLiteObject SpotModel =
+                    MirroredActorSpotModels.get(SpotSlot);
+            if (SpotModel == null)
+            {
+                SpotModel = client.createRuneLiteObject();
+                MirroredActorSpotModels.put(SpotSlot, SpotModel);
+            }
+
+            // Match the native actor-spot submission: the effect model already
+            // owns its height offset; only the actor's scene transform remains.
+            SpotModel.setRenderMode(SpotAnimation.getRenderMode());
+            SpotModel.setLocation(
+                    Model.getLocation(),
+                    Model.getLevel());
+            SpotModel.setOrientation(Model.getOrientation());
+            SpotModel.setZ(Model.getZ());
+            SpotModel.setModel(DetachedSpotModel);
+            if (!SpotModel.isActive())
+            {
+                SpotModel.setActive(true);
+            }
+            PublishedActorSpotSlots.add(SpotSlot);
+        }
+
+        for (Map.Entry<Long, RuneLiteObject> Entry :
+                MirroredActorSpotModels.entrySet())
+        {
+            if (!PublishedActorSpotSlots.contains(Entry.getKey()) &&
+                    Entry.getValue().getBaseModel() != null)
+            {
+                Entry.getValue().setModel(null);
+            }
+        }
+    }
+
+    private boolean IsAnimationInterpolationActive(int AnimationId)
+    {
+        IntPredicate AnimationInterpolationFilter =
+                client.getAnimationInterpolationFilter();
+        return AnimationId != NO_ANIMATION &&
+                AnimationInterpolationFilter != null &&
+                AnimationInterpolationFilter.test(AnimationId);
+    }
+
+    private void StopUsingHeldEndpointIdleModel()
+    {
+        if (bUsingHeldEndpointIdleModel)
+        {
+            bUsingHeldEndpointIdleModel = false;
+        }
+    }
+
+    private void ClearHeldEndpointIdleModel()
+    {
+        StopUsingHeldEndpointIdleModel();
+        bEndpointIdlePoseWasDisplayed = false;
+        HeldEndpointIdleModel = null;
+        HeldEndpointIdleAppearance = null;
+        HeldEndpointIdleAnimation = NO_ANIMATION;
+        HeldEndpointIdleFrame = -1;
+        EndpointIdlePresentationStartGameCycle = -1;
+        EndpointIdleFrameClock = null;
+        EndpointIdleFrameClockAnimation = NO_ANIMATION;
+        EndpointIdleFrameClockGameCycle = -1;
+        EndpointIdleDesiredFrame = 0;
+        bEndpointIdleFrameNeedsPublication = false;
+    }
+
+    private void InvalidateHeldEndpointIdleForRecapture()
+    {
+        StopUsingHeldEndpointIdleModel();
+        HeldEndpointIdleModel = null;
+        HeldEndpointIdleAppearance = null;
+        HeldEndpointIdleAnimation = NO_ANIMATION;
+        HeldEndpointIdleFrame = -1;
+        if (bEndpointIdlePresentationActive)
+        {
+            bEndpointIdleFrameNeedsPublication = true;
+            bResetCurrentAnimation = true;
+        }
+    }
+
+    static int GetEndpointIdleClockDelta(
+            int CurrentGameCycle,
+            int PreviousGameCycle)
+    {
+        return PreviousGameCycle < 0 ||
+                CurrentGameCycle <= PreviousGameCycle
+                ? 0
+                : CurrentGameCycle - PreviousGameCycle;
+    }
+
+    static boolean ShouldPublishEndpointIdleFrame(
+            int HeldAnimation,
+            int HeldFrame,
+            int RequestedAnimation,
+            int RequestedFrame,
+            boolean AppearanceMatches)
+    {
+        return !AppearanceMatches ||
+                HeldAnimation != RequestedAnimation ||
+                HeldFrame != RequestedFrame;
+    }
+
+    private boolean UpdateEndpointIdleFrameClock()
+    {
+        if (!bEndpointIdlePresentationActive ||
+                CurrentAnimationRequest == null ||
+                CurrentAnimationRequest.PoseAnimationToPlay !=
+                        OldAnimationSet.IdlePoseAnimation)
+        {
+            return false;
+        }
+
+        int RequestedIdleAnimation =
+                OldAnimationSet.IdlePoseAnimation;
+        Animation IdleAnimation =
+                client.loadAnimation(RequestedIdleAnimation);
+        if (IdleAnimation == null ||
+                IdleAnimation.getNumFrames() <= 0)
+        {
+            return false;
+        }
+
+        int CurrentGameCycle = client.getGameCycle();
+        boolean bResetClock =
+                EndpointIdleFrameClock == null ||
+                        EndpointIdleFrameClockAnimation !=
+                                RequestedIdleAnimation ||
+                        EndpointIdleFrameClock.getAnimation() == null ||
+                        EndpointIdleFrameClock.getAnimation().getId() !=
+                                RequestedIdleAnimation;
+        if (bResetClock)
+        {
+            EndpointIdleFrameClock =
+                    new AnimationController(client, IdleAnimation);
+            EndpointIdleFrameClock.setOnFinished(
+                    AnimationController::loop);
+            EndpointIdleDesiredFrame =
+                    CurrentAnimationRequest.StartingFrame >= 0 &&
+                            CurrentAnimationRequest.StartingFrame <
+                                    IdleAnimation.getNumFrames()
+                            ? CurrentAnimationRequest.StartingFrame
+                            : 0;
+            EndpointIdleFrameClock.setFrame(
+                    EndpointIdleDesiredFrame);
+            EndpointIdleFrameClockAnimation =
+                    RequestedIdleAnimation;
+            EndpointIdleFrameClockGameCycle =
+                    CurrentGameCycle;
+            bEndpointIdleFrameNeedsPublication = true;
+            return true;
+        }
+
+        int ElapsedClientCycles = GetEndpointIdleClockDelta(
+                CurrentGameCycle,
+                EndpointIdleFrameClockGameCycle);
+        EndpointIdleFrameClockGameCycle = CurrentGameCycle;
+        if (ElapsedClientCycles > 0)
+        {
+            try
+            {
+                EndpointIdleFrameClock.tick(
+                        ElapsedClientCycles);
+            }
+            catch (RuntimeException ClockFailure)
+            {
+                // A malformed/replaced animation must not expose hidden
+                // locomotion. Restart the independent idle clock and retry
+                // the native keyframe build below.
+                log.debug(
+                        "Unable to advance endpoint idle animation",
+                        ClockFailure);
+                EndpointIdleFrameClock.setAnimation(
+                        IdleAnimation);
+                EndpointIdleFrameClock.setFrame(0);
+            }
+        }
+
+        int NextDesiredFrame = EndpointIdleFrameClock.getFrame();
+        if (NextDesiredFrame < 0 ||
+                NextDesiredFrame >= IdleAnimation.getNumFrames())
+        {
+            NextDesiredFrame = 0;
+            EndpointIdleFrameClock.reset();
+        }
+        if (EndpointIdleDesiredFrame != NextDesiredFrame)
+        {
+            EndpointIdleDesiredFrame = NextDesiredFrame;
+            bEndpointIdleFrameNeedsPublication = true;
+        }
+        return true;
+    }
+
+    private boolean IsHeldEndpointIdleModelPublished()
+    {
+        return HeldEndpointIdleModel != null &&
+                Model.getBaseModel() == HeldEndpointIdleModel;
+    }
+
+    private boolean TryPublishHeldEndpointIdleModel()
+    {
+        if (bEndpointIdlePresentationActive &&
+                IsAnimationInterpolationActive(
+                        OldAnimationSet.IdlePoseAnimation))
+        {
+            StopUsingHeldEndpointIdleModel();
+            return false;
+        }
+
+        if (!bEndpointIdlePresentationActive ||
+                Owner.getAnimation() != NO_ANIMATION ||
+                HasActiveSpotAnimation() ||
+                AnimController == null ||
+                AnimController.getAnimation() != null)
+        {
+            StopUsingHeldEndpointIdleModel();
+            return false;
+        }
+
+        if (!UpdateEndpointIdleFrameClock())
+        {
+            StopUsingHeldEndpointIdleModel();
+            return false;
+        }
+
+        boolean bAppearanceMatches =
+                HeldEndpointIdleAppearanceMatches();
+        if (ShouldPublishEndpointIdleFrame(
+                HeldEndpointIdleAnimation,
+                HeldEndpointIdleFrame,
+                OldAnimationSet.IdlePoseAnimation,
+                EndpointIdleDesiredFrame,
+                bAppearanceMatches))
+        {
+            if (!bAppearanceMatches &&
+                    HeldEndpointIdleAppearance != null)
+            {
+                InvalidateHeldEndpointIdleForRecapture();
+            }
+            else
+            {
+                bEndpointIdleFrameNeedsPublication = true;
+            }
+            return false;
+        }
+
+        if (bEndpointIdleFrameNeedsPublication ||
+                HeldEndpointIdleModel == null)
+        {
+            return false;
+        }
+
+        if (!bUsingHeldEndpointIdleModel ||
+                Model.getBaseModel() != HeldEndpointIdleModel)
+        {
+            // Both null is RuneLiteObject's static-mesh mode. The mesh itself
+            // advances at authored idle keyframes through the independent
+            // clock above; it is never transformed a second time here.
+            Model.setAnimationController(null);
+            Model.setPoseAnimationController(null);
+            Model.setModel(HeldEndpointIdleModel);
+        }
+        bUsingHeldEndpointIdleModel = true;
+        bEndpointIdlePoseWasDisplayed = true;
+        // This mesh was built explicitly from the authored endpoint idle and
+        // is always safe stopped presentation geometry.
+        bPublishedStoppedGeometrySafe = true;
+        return true;
+    }
+
+    private boolean CanCaptureEndpointIdleModel()
+    {
+        if (bEndpointIdlePresentationActive &&
+                IsAnimationInterpolationActive(
+                        OldAnimationSet.IdlePoseAnimation))
+        {
+            return false;
+        }
+
+        if (!UpdateEndpointIdleFrameClock())
+        {
+            return false;
+        }
+        return ShouldCaptureEndpointIdleModel(
+                Owner instanceof Player,
+                bEndpointIdlePresentationActive,
+                CurrentAnimationRequest != null &&
+                        CurrentAnimationRequest.AnimationToPlay ==
+                                NO_ANIMATION,
+                CurrentAnimationRequest != null &&
+                        CurrentAnimationRequest.PoseAnimationToPlay ==
+                                OldAnimationSet.IdlePoseAnimation,
+                Owner.getAnimation() == NO_ANIMATION,
+                Owner.getPoseAnimation() ==
+                        OldAnimationSet.IdlePoseAnimation,
+                Owner.getPoseAnimationFrame() ==
+                        EndpointIdleDesiredFrame,
+                HasActiveSpotAnimation());
+    }
+
+    static boolean ShouldCaptureEndpointIdleModel(
+            boolean PlayerOwner,
+            boolean EndpointIdlePresentationActive,
+            boolean OrdinaryAnimationRequest,
+            boolean RequestedPoseIsIdle,
+            boolean OwnerActionFree,
+            boolean OwnerPoseIsIdle,
+            boolean OwnerPoseAtRequestedFrame,
+            boolean HasActiveSpotAnimation)
+    {
+        return PlayerOwner &&
+                EndpointIdlePresentationActive &&
+                OrdinaryAnimationRequest &&
+                RequestedPoseIsIdle &&
+                OwnerActionFree &&
+                OwnerPoseIsIdle &&
+                OwnerPoseAtRequestedFrame &&
+                !HasActiveSpotAnimation;
+    }
+
+    private boolean TryCaptureEndpointIdleModel()
+    {
+        if (!CanCaptureEndpointIdleModel())
+        {
+            return false;
+        }
+
+        PlayerAppearanceKey Appearance = GetCurrentPlayerAppearance();
+        if (Appearance == null)
+        {
+            return false;
+        }
+
+        // Explicit pose publication is continuity-sensitive in the ordinary
+        // render path, and an integer frame alone does not guarantee that
+        // Animation Smoothing will build the requested discrete geometry.
+        // Temporarily disable smoothing for this one synchronous native model
+        // build, then restore the caller's filter before any other client work
+        // can run. Do not restore the owner's pose fields afterward: doing so
+        // previously produced malformed limbs, and the hidden native update
+        // will repopulate them normally.
+        IntPredicate AnimationInterpolationFilter =
+                client.getAnimationInterpolationFilter();
+        net.runelite.api.Model DetachedIdleModel;
+        try
+        {
+            client.setAnimationInterpolationFilter(null);
+            net.runelite.api.Model SourceOwnerModel = Owner.getModel();
+            DetachedIdleModel = SourceOwnerModel == null
+                    ? null
+                    : client.mergeModels(SourceOwnerModel);
+        }
+        catch (RuntimeException CaptureFailure)
+        {
+            log.debug(
+                    "Unable to capture endpoint idle model",
+                    CaptureFailure);
+            return false;
+        }
+        finally
+        {
+            client.setAnimationInterpolationFilter(
+                    AnimationInterpolationFilter);
+        }
+        if (DetachedIdleModel == null)
+        {
+            return false;
+        }
+        DetachedIdleModel.calculateBoundsCylinder();
+
+        HeldEndpointIdleModel = DetachedIdleModel;
+        HeldEndpointIdleAppearance = Appearance;
+        HeldEndpointIdleAnimation =
+                OldAnimationSet.IdlePoseAnimation;
+        HeldEndpointIdleFrame =
+                EndpointIdleDesiredFrame;
+        bEndpointIdleFrameNeedsPublication = false;
+        return true;
+    }
+
     private boolean TrySetModel(net.runelite.api.Model SourceModel)
     {
         if (SourceModel == null)
         {
             return false;
         }
-        net.runelite.api.Model MergedModel = client.mergeModels(SourceModel);
+        net.runelite.api.Model MergedModel =
+                client.mergeModels(SourceModel);
         if (MergedModel == null)
         {
             return false;
         }
 
         Model.setModel(MergedModel);
+        // Any replacement must prove that it is stopped-idle geometry before
+        // a pending yellow-click seam may retain it. This prevents a completed
+        // action or spot model from becoming the frozen fallback.
+        bPublishedStoppedGeometrySafe = false;
         return true;
     }
 
     private void UpdateOldIdleAnimations()
     {
+        // Ignore the pose value currently owned by the plugin, while still
+        // accepting any different selector values the game publishes during
+        // the brief override (for example, an equipment/movement-set change).
+        int PluginOwnedPoseAnimation =
+                bEndpointNativeIdlePoseOverrideActive
+                        ? OldAnimationSet.IdlePoseAnimation
+                        : CurrentPoseAnimation;
+        int PreviousIdlePoseAnimation =
+                OldAnimationSet.IdlePoseAnimation;
         boolean bAnyChanges = false;
         if (Owner.getIdleRotateLeft() != NO_ANIMATION &&
-                Owner.getIdleRotateLeft() != CurrentPoseAnimation &&
+                Owner.getIdleRotateLeft() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.IdleRotateLeft != Owner.getIdleRotateLeft())
         {
             OldAnimationSet.IdleRotateLeft = Owner.getIdleRotateLeft();
@@ -1477,7 +2705,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getIdleRotateRight() != NO_ANIMATION &&
-                Owner.getIdleRotateRight() != CurrentPoseAnimation &&
+                Owner.getIdleRotateRight() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.IdleRotateRight != Owner.getIdleRotateRight())
         {
             OldAnimationSet.IdleRotateRight = Owner.getIdleRotateRight();
@@ -1485,7 +2713,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkAnimation() != NO_ANIMATION &&
-                Owner.getWalkAnimation() != CurrentPoseAnimation &&
+                Owner.getWalkAnimation() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.WalkAnimation != Owner.getWalkAnimation())
         {
             OldAnimationSet.WalkAnimation = Owner.getWalkAnimation();
@@ -1493,7 +2721,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotateLeft() != NO_ANIMATION &&
-                Owner.getWalkRotateLeft() != CurrentPoseAnimation &&
+                Owner.getWalkRotateLeft() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.WalkRotateLeft != Owner.getWalkRotateLeft())
         {
             OldAnimationSet.WalkRotateLeft = Owner.getWalkRotateLeft();
@@ -1501,7 +2729,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotateRight() != NO_ANIMATION &&
-                Owner.getWalkRotateRight() != CurrentPoseAnimation &&
+                Owner.getWalkRotateRight() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.WalkRotateRight != Owner.getWalkRotateRight())
         {
             OldAnimationSet.WalkRotateRight = Owner.getWalkRotateRight();
@@ -1509,7 +2737,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotate180() != NO_ANIMATION &&
-                Owner.getWalkRotate180() != CurrentPoseAnimation &&
+                Owner.getWalkRotate180() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.WalkRotate180 != Owner.getWalkRotate180())
         {
             OldAnimationSet.WalkRotate180 = Owner.getWalkRotate180();
@@ -1517,7 +2745,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getIdlePoseAnimation() != NO_ANIMATION &&
-                Owner.getIdlePoseAnimation() != CurrentPoseAnimation &&
+                Owner.getIdlePoseAnimation() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.IdlePoseAnimation != Owner.getIdlePoseAnimation())
         {
             OldAnimationSet.IdlePoseAnimation = Owner.getIdlePoseAnimation();
@@ -1525,7 +2753,7 @@ public class CustomMovementHandler
         }
 
         if (Owner.getRunAnimation() != NO_ANIMATION &&
-                Owner.getRunAnimation() != CurrentPoseAnimation &&
+                Owner.getRunAnimation() != PluginOwnedPoseAnimation &&
                 OldAnimationSet.RunAnimation != Owner.getRunAnimation())
         {
             OldAnimationSet.RunAnimation = Owner.getRunAnimation();
@@ -1534,6 +2762,15 @@ public class CustomMovementHandler
 
         if (bAnyChanges)
         {
+            // A different movement set can carry a different authored idle
+            // pose even when the equipment arrays did not change.
+            if (ShouldInvalidateEndpointIdleCache(
+                    bEndpointNativeIdlePoseOverrideActive,
+                    PreviousIdlePoseAnimation,
+                    OldAnimationSet.IdlePoseAnimation))
+            {
+                InvalidateHeldEndpointIdleForRecapture();
+            }
             OldAnimationSet.CacheUniqueLabel();
             OldAnimationHeight = Owner.getAnimationHeightOffset();
 
@@ -1551,16 +2788,70 @@ public class CustomMovementHandler
             }
         }
     }
+    private static long GetTotalGcCollectionTimeMillis()
+    {
+        long TotalCollectionTimeMillis = 0;
+        for (GarbageCollectorMXBean CollectorBean :
+                ManagementFactory.getGarbageCollectorMXBeans())
+        {
+            TotalCollectionTimeMillis += CollectorBean.getCollectionTime();
+        }
+        return TotalCollectionTimeMillis;
+    }
+
     private void UpdateFrameTimer()
     {
         CurrentTime = System.currentTimeMillis();
-        int RawFrameDelta = (int) Math.max(
-                0,
-                Math.min(
-                        Integer.MAX_VALUE,
-                        CurrentTime - LastTimeMilliseconds));
+        // A freshly constructed handler has no previous frame to measure
+        // against. Treating it as one huge delta would overflow the elapsed
+        // clock and corrupt the first-frame movement state.
+        int RawFrameDelta = 0;
+        if (LastTimeMilliseconds > 0)
+        {
+            RawFrameDelta = (int) Math.max(
+                    0,
+                    Math.min(
+                            Integer.MAX_VALUE,
+                            CurrentTime - LastTimeMilliseconds));
+        }
         LastTimeMilliseconds = CurrentTime;
         CurrentFrameDelta = RawFrameDelta;
+
+        // [TMA-STALL-TRACE] A long gap between consecutive Update() calls
+        // means the hitch happened outside this handler (client tick, GPU
+        // draw/upload, other plugins, or a GC pause), not in a traced stage.
+        // The GC collector clock tells those apart: a pause reports gcMs in
+        // the same magnitude as the gap, a GPU/driver stall reports ~0.
+        if (config.DebugStallTrace())
+        {
+            long GcCollectionTimeMillis =
+                    GetTotalGcCollectionTimeMillis();
+            if (RawFrameDelta >=
+                    DebugFileLogger.STALL_TRACE_FRAME_GAP_THRESHOLD_MILLIS)
+            {
+                long GcTimeDeltaMillis =
+                        GcCollectionTimeMillis -
+                                LastGcCollectionTimeMillis;
+                Runtime RuntimeSnapshot = Runtime.getRuntime();
+                long HeapUsedMb =
+                        (RuntimeSnapshot.totalMemory() -
+                                RuntimeSnapshot.freeMemory()) /
+                                (1024L * 1024L);
+                DebugFileLogger.Append(
+                        DebugFileLogger.STALL_TRACE_LOG_FILE,
+                        "[TMA-STALL-TRACE] frame-gap ms=" + RawFrameDelta +
+                                " gcMs=" + GcTimeDeltaMillis +
+                                " heapUsedMB=" + HeapUsedMb +
+                                " moving=" + bMovingThisAction +
+                                " walkArmed=" +
+                                bWalkStopFacingHoldArmed +
+                                " awaiting=" +
+                                bWalkSegmentAwaitingMovement +
+                                " elapsed=" +
+                                MillisecondsSinceTileChange);
+            }
+            LastGcCollectionTimeMillis = GcCollectionTimeMillis;
+        }
 
         if (bScenePresentationClockActive)
         {
@@ -1578,7 +2869,13 @@ public class CustomMovementHandler
             int DebtPayback =
                     GetScenePresentationDebtPayback(
                             ImmediateDelta,
-                            ScenePresentationTimeDebtMilliseconds);
+                            ScenePresentationTimeDebtMilliseconds,
+                            ScenePresentationDebtPaybackRemainder);
+            ScenePresentationDebtPaybackRemainder =
+                    GetScenePresentationDebtPaybackRemainder(
+                            ImmediateDelta,
+                            ScenePresentationTimeDebtMilliseconds,
+                            ScenePresentationDebtPaybackRemainder);
             CurrentFrameDelta = ImmediateDelta + DebtPayback;
             ScenePresentationTimeDebtMilliseconds -= DebtPayback;
 
@@ -1589,6 +2886,7 @@ public class CustomMovementHandler
                     bSceneLoadFramePresentationPending))
             {
                 bScenePresentationClockActive = false;
+                ScenePresentationDebtPaybackRemainder = 0;
                 SceneRecoveryBaseVelocity = 0;
             }
         }
@@ -1781,11 +3079,21 @@ public class CustomMovementHandler
         CurrentTrueTilePosition = NativeLocation;
         CurrentWorldPoint = NativeWorldPoint;
         MillisecondsSinceTileChange = BASE_MOVEMENT_TWEEN_MILLIS;
+        bRetainedSceneMovementSegmentInProgress = false;
+        RetainedMovementProgressTick = -1;
+        RetainedMovementProgressGameCycle = -1;
+        bFreshMovementPublicationBoundaryBridgeActive = false;
+        FreshMovementPublicationBoundaryGameCycle = -1;
+        MovementSegmentPublicationTick = -1;
+        MovementSegmentPublicationGameCycle = -1;
         bSceneRecoveryRetargetPending = false;
         bSceneBoundaryBridgeActive = false;
+        bPostSceneRecoveryRouteGapEligible = false;
+        bPendingWalkInheritedActiveRouteGap = false;
         bScenePresentationClockActive = false;
         bSceneLoadFramePresentationPending = false;
         ScenePresentationTimeDebtMilliseconds = 0;
+        ScenePresentationDebtPaybackRemainder = 0;
         SceneRecoveryBaseVelocity = 0;
         SceneRecoveryTweenDurationOverride = 0;
         if (Model != null)
@@ -2035,20 +3343,32 @@ public class CustomMovementHandler
         boolean bCanPreserveMovementVelocity =
                 CanPreserveSceneMovementVelocity(
                         bSceneBoundaryBridgeActive,
+                        bRetainedSceneMovementSegmentInProgress,
                         bWalkStopFacingHoldArmed &&
                                 bWalkMovementObserved,
                         bRetainedSegmentOnCurrentPlane,
                         bSpecialMovementDiscontinuity);
         // [TMA-SCENE-RECOVERY-VELOCITY] LOADING soft-suspends Update(), so
-        // these endpoints still describe the last pre-load segment. Capture
-        // its scalar speed before the rebase overwrites them. Direction is
-        // deliberately not retained or extrapolated.
+        // these endpoints still describe the last pre-load segment. A cached
+        // rebuild can begin while that segment is visibly moving, before the
+        // overdue boundary bridge arms. Capture its scalar speed in either
+        // case before the rebase overwrites it. Direction is deliberately not
+        // retained or extrapolated.
         double PreservedMovementVelocity =
                 GetPreservedSceneMovementVelocity(
                         bCanPreserveMovementVelocity,
                         LastLerpPosition,
                         NextLerpPosition,
                         PreservedTweenDuration);
+        // This proof belongs only to the pre-load presentation just consumed.
+        // A successful destination-scene update records a fresh snapshot below.
+        bRetainedSceneMovementSegmentInProgress = false;
+        RetainedMovementProgressTick = -1;
+        RetainedMovementProgressGameCycle = -1;
+        bFreshMovementPublicationBoundaryBridgeActive = false;
+        FreshMovementPublicationBoundaryGameCycle = -1;
+        MovementSegmentPublicationTick = -1;
+        MovementSegmentPublicationGameCycle = -1;
 
         LocalPoint RetainedCustomLocation =
                 LastRenderedWorldPoint == null
@@ -2123,6 +3443,10 @@ public class CustomMovementHandler
                         bWalkMovementObserved,
                         CurrentTrueLocation,
                         client.getLocalDestinationLocation());
+        bPostSceneRecoveryRouteGapEligible =
+                ShouldArmPostSceneRecoveryRouteGap(
+                        bAwaitingPostSceneWalkSegment,
+                        bHasRecoveryDistance);
         if (bRealDiscontinuity ||
                 bSpecialMovementDiscontinuity)
         {
@@ -2136,13 +3460,12 @@ public class CustomMovementHandler
             // the old destination before its first new route segment. Reuse
             // the pending-yellow state so the endpoint keeps a stable idle and
             // facing instead of running in place and then chasing the hidden
-            // actor's orientation. No position is invented; the state releases
-            // as soon as UpdateLerpDestinations sees a real segment.
+            // actor's orientation. A genuinely moving recovery may retain
+            // locomotion through only the existing bounded publication seam;
+            // after that, this stable handoff resumes. No position is invented,
+            // and the state releases as soon as a real segment arrives.
             bWalkStartPendingDuringCatchUp = true;
             bWalkSegmentAwaitingMovement = true;
-            // A scene rebuild is not a user re-click during an actively
-            // displayed segment; leave its existing continuity path intact.
-            bWalkReclickOccurredDuringVisibleMovement = false;
         }
         double RecoveryDistance = bHasRecoveryDistance
                 ? RenderedLocation.distanceTo(CurrentTrueLocation)
@@ -2180,6 +3503,7 @@ public class CustomMovementHandler
                         : 0;
         bScenePresentationClockActive =
                 bHasRecoveryDistance;
+        ScenePresentationDebtPaybackRemainder = 0;
         bSceneLoadFramePresentationPending =
                 bHasRecoveryDistance;
         MillisecondsSinceTileChange =
@@ -2475,18 +3799,6 @@ public class CustomMovementHandler
                 }
                 ++FramesSinceIdle;
 
-                // [TMA-TELEPORT] Restored original teleport interrupt. If a
-                // route change arrives while the visible model is still
-                // performing the teleport-in presentation, cancel that
-                // presentation so the newer movement takes over. Only a
-                // genuine teleport can have armed it.
-                if (IsPlayerOwner() &&
-                        overlay.bShouldPlayTeleportAnimation &&
-                        FramesSinceIdle > 1)
-                {
-                    overlay.bTeleportInterrupted = true;
-                }
-
                 // Fallback to quick and dirty move
 
                 int DistanceInTilesToLast = 0;
@@ -2685,15 +3997,52 @@ public class CustomMovementHandler
 
     }
     private boolean bShouldUseTrueLocationOrientation = false;
+
+    private boolean IsTeleportPresentationActive()
+    {
+        return IsPlayerOwner() &&
+                overlay.bShouldPlayTeleportAnimation &&
+                GetTeleportElapsedNanoseconds() <
+                        TELEPORT_ANIMATION_WINDOW_NANOS &&
+                !overlay.bTeleportInterrupted;
+    }
+
     private void UpdateAnimationSelection()
     {
         bShouldUseTrueLocationOrientation = false;
+        boolean bEndpointIdleSmoothingActive =
+                IsAnimationInterpolationActive(
+                        OldAnimationSet.IdlePoseAnimation);
+        boolean bAllowNativeEndpointGeometry =
+                CanUseNativeEndpointGeometry(
+                        config.AllowOriginalModelWhenCloseProximity(),
+                        bEndpointIdleSmoothingActive);
+        bEndpointNativeHandoffEstablished =
+                UpdateEndpointNativeHandoffLatch(
+                        bEndpointNativeHandoffEstablished,
+                        false,
+                        false,
+                        bAllowNativeEndpointGeometry);
+        if (!bAllowNativeEndpointGeometry)
+        {
+            bEndpointNativeHandoffReadyThisFrame = false;
+        }
         bSceneBoundaryBridgeActive =
                 ShouldBridgeSceneBoundaryMovement(
                         GetMovementTweenDurationMilliseconds());
+        long MovementDuration =
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride);
+        boolean bKeepMovementAnimationDuringPostSceneRecoveryRouteGap =
+                ShouldKeepMovementAnimationDuringPostSceneRecoveryRouteGap();
+        boolean bKeepMovementAnimationDuringInheritedPendingRouteGap =
+                ShouldKeepMovementAnimationDuringInheritedPendingRouteGap();
         boolean bKeepMovementAnimationDuringRouteGap =
+                bKeepMovementAnimationDuringPostSceneRecoveryRouteGap ||
+                bKeepMovementAnimationDuringInheritedPendingRouteGap ||
                 ShouldKeepMovementAnimationDuringRouteGap(
                         MillisecondsSinceTileChange,
+                        MovementDuration,
                         bMovingThisAction,
                         bWalkStopFacingHoldArmed &&
                                 bWalkMovementObserved &&
@@ -2704,18 +4053,128 @@ public class CustomMovementHandler
                         bHoldWalkStopFacingThisFrame,
                         NextLerpPosition,
                         client.getLocalDestinationLocation());
-        boolean bPreservePendingReclickMovementPose =
-                ShouldPreservePendingReclickMovementPose(
+        boolean bSegmentHasDistance =
+                IsSameWorldView(LastLerpPosition, NextLerpPosition) &&
+                        !LastLerpPosition.equals(NextLerpPosition);
+        boolean bOrdinaryPoseRequest =
+                CurrentAnimationRequest != null &&
+                        CurrentAnimationRequest.AnimationToPlay ==
+                                NO_ANIMATION;
+        boolean bTeleportPresentationActive =
+                IsTeleportPresentationActive();
+        boolean bCelebrationPresentationActive =
+                bTargetWasKilled &&
+                        config.AllowNPCKilledCelebrationEmote() &&
+                        LastNPCCombatLevel > 50 &&
+                        bIsDefaultHumanAnimationSet;
+        boolean bSpotAnimationPresentationActive =
+                HasActiveSpotAnimation();
+        boolean bSpecialPresentationActive =
+                bTeleportPresentationActive ||
+                        bCelebrationPresentationActive ||
+                        bSpotAnimationPresentationActive;
+        boolean bFreshMovementPublicationBoundaryBridgeEligible =
+                ShouldBridgeFreshMovementPublicationBoundary(
                         MillisecondsSinceTileChange,
-                        GetMovementTweenDurationMilliseconds(),
-                        bMovingThisAction,
-                        bWalkReclickOccurredDuringVisibleMovement,
-                        bWalkStartPendingDuringCatchUp,
+                        MovementDuration,
+                        IsPlayerOwner(),
+                        bRetainedSceneMovementSegmentInProgress,
                         bWalkSegmentAwaitingMovement,
-                        WalkClickRevision,
-                        WalkClickRevisionAtMovementSegment,
-                        LastLerpPosition,
-                        NextLerpPosition);
+                        bHoldWalkStopFacingThisFrame,
+                        bSpecialPresentationActive,
+                        Owner.getAnimation(),
+                        NextLerpPosition,
+                        client.getLocalDestinationLocation());
+        FreshMovementPublicationBoundaryGameCycle =
+                SelectFreshMovementPublicationBoundaryGameCycle(
+                        bFreshMovementPublicationBoundaryBridgeEligible,
+                        FreshMovementPublicationBoundaryGameCycle,
+                        client.getGameCycle());
+        bFreshMovementPublicationBoundaryBridgeActive =
+                bFreshMovementPublicationBoundaryBridgeEligible &&
+                        IsFreshMovementPublicationBoundaryBridgeCycle(
+                                FreshMovementPublicationBoundaryGameCycle,
+                                client.getGameCycle());
+        boolean bWasEndpointIdlePresentationActive =
+                bEndpointIdlePresentationActive;
+        bEndpointIdlePresentationActive =
+                ShouldUseEndpointIdlePresentation(
+                        IsPlayerOwner() &&
+                                !bAttemptToRenderOwner,
+                        MillisecondsSinceTileChange >= MovementDuration &&
+                                !bFreshMovementPublicationBoundaryBridgeActive,
+                        bSegmentHasDistance,
+                        bSceneBoundaryBridgeActive,
+                        bOrdinaryPoseRequest,
+                        bSpecialPresentationActive,
+                        ShouldUseDetachedEndpointIdleForFacingHold(
+                                bHoldWalkStopFacingThisFrame,
+                                bEndpointNativeHandoffEstablished),
+                        IsAtFinalWalkDestination(),
+                        bEndpointNativeHandoffReadyThisFrame ||
+                                bEndpointNativeHandoffEstablished,
+                        Owner.getAnimation());
+        if (bEndpointIdlePresentationActive &&
+                !bWasEndpointIdlePresentationActive)
+        {
+            // Begin at the authored idle entry. Animation Smoothing keeps the
+            // native actor clock from there; the fallback detached path uses
+            // its independent client-cycle keyframe clock.
+            ClearHeldEndpointIdleModel();
+            EndpointIdlePresentationStartGameCycle =
+                    client.getGameCycle();
+            bEndpointIdleFrameNeedsPublication =
+                    !bEndpointIdleSmoothingActive;
+            bResetCurrentAnimation = true;
+        }
+        else if (!bEndpointIdlePresentationActive &&
+                bWasEndpointIdlePresentationActive)
+        {
+            boolean bEndpointIdleWasDisplayed =
+                    bEndpointIdlePoseWasDisplayed;
+            boolean bResetLocomotionEntry =
+                    ShouldResetLocomotionAfterEndpointIdle(
+                            bEndpointIdleWasDisplayed,
+                            bNewTileMovementStarted);
+            if (bEndpointNativeIdlePoseOverrideActive)
+            {
+                SetAllIdlePosesDefault();
+            }
+            ClearHeldEndpointIdleModel();
+            if (bResetLocomotionEntry)
+            {
+                // Continuous segment-to-segment movement retains phase. A
+                // endpoint idle has no compatible locomotion phase, so resume
+                // the new authoritative route at its authored entry.
+                bResetCurrentAnimation = true;
+            }
+            else if (bEndpointIdleWasDisplayed)
+            {
+                // A fresh click can release endpoint presentation before its
+                // first authoritative segment exists. Remember that phase
+                // boundary so the later segment cannot inherit an arbitrary
+                // idle frame.
+                bLocomotionResetPendingAfterEndpointIdle = true;
+            }
+        }
+
+        if (bEndpointIdlePresentationActive &&
+                bEndpointIdleSmoothingActive)
+        {
+            // The ordinary Player.getModel path below owns presentation while
+            // smoothing is active. Never force another integer keyframe after
+            // the one-time idle entry publication.
+            StopUsingHeldEndpointIdleModel();
+            bEndpointIdleFrameNeedsPublication = false;
+        }
+        else if (bEndpointNativeIdlePoseOverrideActive)
+        {
+            // Animation Smoothing may be toggled while catch-up is active.
+            // Return to the existing detached-keyframe path without leaving
+            // the hidden actor's movement selectors remapped.
+            SetAllIdlePosesDefault();
+            InvalidateHeldEndpointIdleForRecapture();
+        }
 
         // Override all animations
         //if (devConfig.DebugAnimation() != 0)
@@ -2726,12 +4185,13 @@ public class CustomMovementHandler
         //else
 
         // Currently moving
-        if (MillisecondsSinceTileChange <
-                        GetSceneMovementAnimationDuration(
-                                SceneRecoveryTweenDurationOverride) ||
-                bSceneBoundaryBridgeActive ||
+        if (ShouldSelectMovementPose(
+                bEndpointIdlePresentationActive,
+                MillisecondsSinceTileChange < MovementDuration ||
+                        bTeleportPresentationActive,
+                bSceneBoundaryBridgeActive,
                 bKeepMovementAnimationDuringRouteGap ||
-                bPreservePendingReclickMovementPose)
+                        bFreshMovementPublicationBoundaryBridgeActive))
         {
             bMovingThisAction = true;
 
@@ -2764,11 +4224,20 @@ public class CustomMovementHandler
                 if (overlay.bShouldPlayTeleportAnimation &&
                         bIsDefaultHumanAnimationSet)
                 {
-                    if (GetTeleportElapsedNanoseconds() <
-                            TELEPORT_ANIMATION_FIRST_TICK_NANOS)
+                    if (ShouldUseIdlePoseDuringTeleportLeadIn(
+                            bTeleportPresentationActive,
+                            GetTeleportElapsedNanoseconds()))
                     {
-                        // Blend with the first tick
-                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                        // The native Player model owns the real cast/tablet
+                        // action. If that action ends just before the arrival
+                        // phase begins, hold ordinary idle rather than filling
+                        // the stationary seam with a stale walk/run selector.
+                        CurrentAnimationRequest =
+                                AnimationRequestMoveset
+                                        .GetDefaultIdleMoveAnimationRequest(
+                                                config);
+                        CurrentAnimationRequest.PoseAnimationToPlay =
+                                OldAnimationSet.IdlePoseAnimation;
                         CurrentAnimationRequest.bShouldTeleportToLocation = false;
                     }
                     else
@@ -2917,7 +4386,8 @@ public class CustomMovementHandler
             CurrentAnimationRequest.MovementSpeedMultiplier = 1.0;
             CurrentAnimationRequest.AnimationSpeed = 1;
             CurrentAnimationRequest.StartingFrame = 0;
-            if (bHoldWalkStopFacingThisFrame)
+            if (bHoldWalkStopFacingThisFrame ||
+                    bEndpointIdlePresentationActive)
             {
                 // [TMA-STOP-FACING] Do not select a turn-in-place pose while
                 // the hidden actor is completing a yellow-click route.
@@ -3019,7 +4489,15 @@ public class CustomMovementHandler
         return ShouldUseOriginalOwnerPresentation(
                 config.AllowOriginalModelWhenCloseProximity(),
                 bMovingThisAction,
-                bHoldWalkStopFacingThisFrame,
+                // Native-smoothed geometry is still being drawn at the custom
+                // endpoint transform. Do not expose the actor's catch-up
+                // location merely because it entered the proximity tolerance.
+                bEndpointIdlePresentationActive ||
+                        ShouldBlockOriginalOwnerForPendingWalk(
+                                bWalkSegmentAwaitingMovement,
+                                bHoldWalkStopFacingThisFrame,
+                                bEndpointNativeHandoffReadyThisFrame,
+                                bEndpointNativeHandoffEstablished),
                 bUsedCustomAnimation,
                 Owner.getAnimation(),
                 OwnerLocation.getX() - ModelLocation.getX(),
@@ -3029,6 +4507,79 @@ public class CustomMovementHandler
                         Model.getOrientation()),
                 config.OriginalModelProximityDistanceThreshold(),
                 config.OriginalModelProximityOrientationThreshold());
+    }
+
+    private void UpdateEndpointNativeHandoffReadiness()
+    {
+        boolean bEndpointIdleSmoothingActive =
+                IsAnimationInterpolationActive(
+                        OldAnimationSet.IdlePoseAnimation);
+        boolean bNativeIdleClockShared =
+                IsEndpointNativeIdleClockShared(
+                        bEndpointIdleSmoothingActive,
+                        bEndpointNativeIdlePoseOverrideActive);
+        boolean bAllowNativeEndpointGeometry =
+                CanUseNativeEndpointGeometry(
+                        config.AllowOriginalModelWhenCloseProximity(),
+                        bEndpointIdleSmoothingActive);
+        boolean bNativeStateObservedAfterEntry =
+                EndpointIdlePresentationStartGameCycle < 0 ||
+                        client.getGameCycle() !=
+                                EndpointIdlePresentationStartGameCycle;
+        boolean bNativeHandoffReadyNow =
+                IsEndpointNativeHandoffReady(
+                        bAllowNativeEndpointGeometry,
+                        IsAtFinalWalkDestination(),
+                        HasHiddenOwnerCaughtUp(
+                                Owner.getLocalLocation(),
+                                Model.getLocation()),
+                        Owner.getPoseAnimation() ==
+                                OldAnimationSet.IdlePoseAnimation &&
+                                Owner.getPoseAnimationFrame() >= 0,
+                        DoesEndpointIdleGeometryMatch(
+                                bNativeIdleClockShared,
+                                Owner.getPoseAnimationFrame(),
+                                HeldEndpointIdleFrame),
+                        bNativeStateObservedAfterEntry,
+                        !bPreserveReleasedWalkFacing ||
+                                bNativeWalkFacingSettled,
+                        Owner.getAnimation(),
+                        HasActiveSpotAnimation(),
+                        ShortestAngleDifference(
+                                Owner.getCurrentOrientation(),
+                                Model.getOrientation()),
+                        GetNativeEndpointGeometryOrientationThreshold(
+                                bEndpointIdleSmoothingActive,
+                                config.OriginalModelProximityOrientationThreshold()));
+        bEndpointNativeHandoffReadyThisFrame =
+                bEndpointNativeHandoffEstablished ||
+                        bNativeHandoffReadyNow;
+
+        if (bEndpointIdlePresentationActive &&
+                bNativeHandoffReadyNow)
+        {
+            // Position, native idle geometry, and facing settlement are ready.
+            // Leave catch-up ownership for RuneLite's ordinary Player.getModel
+            // geometry path. The custom object retains its transform; actual
+            // original-player display remains independently orientation-gated.
+            bLocomotionResetPendingAfterEndpointIdle |=
+                    bEndpointIdlePoseWasDisplayed;
+            bEndpointNativeHandoffEstablished =
+                    UpdateEndpointNativeHandoffLatch(
+                            bEndpointNativeHandoffEstablished,
+                            true,
+                            false,
+                            bAllowNativeEndpointGeometry);
+            if (bEndpointNativeIdlePoseOverrideActive)
+            {
+                // Restore only the selector table. The native actor is now
+                // stationary and already on this same idle sequence, so its
+                // pose frame and smoothing subframe continue uninterrupted.
+                SetAllIdlePosesDefault();
+            }
+            bEndpointIdlePresentationActive = false;
+            ClearHeldEndpointIdleModel();
+        }
     }
 
     private long GetNormalMovementTweenDurationMilliseconds()
@@ -3227,15 +4778,36 @@ public class CustomMovementHandler
                             NextLerpPosition.getX(), NextLerpPosition.getY(), 270));
                     CurrentCameraModelIndex = NextCameraModelIndex;
                     CurrentCameraObjectOrientation = SnapToOrientation;
+                    bCameraModelNeedsPublish = true;
                 }
 
                 if (CurrentCameraModelIndex == 0)
                 {
-                    cameraModel.setActive(false);
+                    if (cameraModel.isActive())
+                    {
+                        cameraModel.setActive(false);
+                    }
                 }
                 else
                 {
-                    cameraModel.setModel(client.mergeModels(/*cameraModelAnimController.animate*/(client.loadModel(CurrentCameraModelIndex))));
+                    // Re-merging and re-publishing an unchanged model every
+                    // frame is pure client-thread churn (model copy + GPU
+                    // upload attempt). Publish once per index switch.
+                    if (bCameraModelNeedsPublish)
+                    {
+                        net.runelite.api.Model CameraSourceModel =
+                                client.loadModel(CurrentCameraModelIndex);
+                        net.runelite.api.Model DetachedCameraModel =
+                                CameraSourceModel == null
+                                        ? null
+                                        : client.mergeModels(
+                                                CameraSourceModel);
+                        if (DetachedCameraModel != null)
+                        {
+                            cameraModel.setModel(DetachedCameraModel);
+                            bCameraModelNeedsPublish = false;
+                        }
+                    }
                 }
 
                 // Need to rotate to our target rotation smoothly
@@ -3288,6 +4860,13 @@ public class CustomMovementHandler
 
     private void SetAllIdlePosesDefault()
     {
+        if (bEndpointNativeIdlePoseOverrideActive)
+        {
+            // A scene/equipment update can publish a new movement set before
+            // the next ordinary handler update. Preserve any non-sentinel
+            // native values before restoring the selector table.
+            UpdateOldIdleAnimations();
+        }
         if (Owner.getIdleRotateLeft() != OldAnimationSet.IdleRotateLeft)
         {
             Owner.setIdleRotateLeft(OldAnimationSet.IdleRotateLeft);
@@ -3327,7 +4906,47 @@ public class CustomMovementHandler
         {
             Owner.setRunAnimation(OldAnimationSet.RunAnimation);
         }
+        bEndpointNativeIdlePoseOverrideActive = false;
     }
+
+    private void SetAllMovementPosesToIdleAnimation()
+    {
+        int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
+        if (Owner.getIdleRotateLeft() != IdlePoseAnimation)
+        {
+            Owner.setIdleRotateLeft(IdlePoseAnimation);
+        }
+        if (Owner.getIdleRotateRight() != IdlePoseAnimation)
+        {
+            Owner.setIdleRotateRight(IdlePoseAnimation);
+        }
+        if (Owner.getWalkAnimation() != IdlePoseAnimation)
+        {
+            Owner.setWalkAnimation(IdlePoseAnimation);
+        }
+        if (Owner.getWalkRotateLeft() != IdlePoseAnimation)
+        {
+            Owner.setWalkRotateLeft(IdlePoseAnimation);
+        }
+        if (Owner.getWalkRotateRight() != IdlePoseAnimation)
+        {
+            Owner.setWalkRotateRight(IdlePoseAnimation);
+        }
+        if (Owner.getWalkRotate180() != IdlePoseAnimation)
+        {
+            Owner.setWalkRotate180(IdlePoseAnimation);
+        }
+        if (Owner.getIdlePoseAnimation() != IdlePoseAnimation)
+        {
+            Owner.setIdlePoseAnimation(IdlePoseAnimation);
+        }
+        if (Owner.getRunAnimation() != IdlePoseAnimation)
+        {
+            Owner.setRunAnimation(IdlePoseAnimation);
+        }
+        bEndpointNativeIdlePoseOverrideActive = true;
+    }
+
     private void SetAllIdlePosesNoAnimation()
     {
 
@@ -3370,7 +4989,7 @@ public class CustomMovementHandler
         {
             Owner.setRunAnimation(NO_ANIMATION);
         }
-
+        bEndpointNativeIdlePoseOverrideActive = false;
     }
 
     private void UpdateModelVisibleState()
@@ -3401,6 +5020,7 @@ public class CustomMovementHandler
                 }
 
                 CurrentOrientation = Owner.getOrientation();
+                PreciseCurrentOrientation = CurrentOrientation;
 
                 if (bShouldUseTrueLocationOrientation)
                 {
@@ -3414,28 +5034,13 @@ public class CustomMovementHandler
                     Model.setLocation(NewLocalPointToDraw,
                             Owner.getWorldView().getPlane());
                 }
-                // Find best direction to go, offset by 10000 for comparison to avoid negatives
-                int ShortestAngle = ShortestAngleDifference(CurrentOrientation, TargetOrientation);
-
                 // Need to rotate to our target rotation smoothly
                 double AdjustedOrientationSpeed = CurrentAnimationRequest.OrientationSpeed * (CurrentFrameDelta / 16.667);// Speed value centered at 60FPS
-                if (ShortestAngle > 0)
-                {
-                    CurrentOrientation += Math.min(ShortestAngle, AdjustedOrientationSpeed);
-                }
-                else if (ShortestAngle != 0)
-                {
-                    CurrentOrientation -= Math.min(-ShortestAngle, AdjustedOrientationSpeed);
-                }
-
-                if (CurrentOrientation < 0)
-                {
-                    CurrentOrientation += 2047;
-                }
-                else if (CurrentOrientation > 2047)
-                {
-                    CurrentOrientation -= 2047;
-                }
+                PreciseCurrentOrientation = AdvanceOrientationPhase(
+                        PreciseCurrentOrientation,
+                        TargetOrientation,
+                        AdjustedOrientationSpeed);
+                CurrentOrientation = (int) PreciseCurrentOrientation;
 
                 // Don't rotate if we are at the destination when we are not in battle mode
                 if (Model.getOrientation() != CurrentOrientation)
@@ -3444,19 +5049,50 @@ public class CustomMovementHandler
                 }
             }
 
-            // [TMA-STOP-POSE-SEPARATION] Yellow-click stop handling owns only
-            // orientation. Body geometry deliberately uses the same ordinary
-            // animation publication path as a red-click stop. A separate idle
-            // controller produced a malformed transition pose, while copying
-            // the hidden player exposed its remaining locomotion as running on
-            // the spot. Keeping both out of this branch avoids either seam.
-            boolean bUsedCustomAnimation = false;
+            UpdateEndpointNativeHandoffReadiness();
+
+            boolean bUseNativeSmoothedEndpointIdle =
+                    bEndpointIdlePresentationActive &&
+                            IsAnimationInterpolationActive(
+                                    OldAnimationSet.IdlePoseAnimation);
+
+            // [TMA-ENDPOINT-IDLE-PRESENTATION] Without Animation Smoothing, a
+            // held endpoint pose is an already composed native idle keyframe
+            // and bypasses every transform controller. With smoothing, this
+            // cache is skipped and the ordinary native model path is refreshed.
+            net.runelite.api.Model SourceOwnerModel = null;
+            boolean bUsedHeldEndpointIdleModel =
+                    TryPublishHeldEndpointIdleModel();
+            boolean bPreservePendingWalkEndpointGeometry =
+                    ShouldPreservePendingWalkEndpointGeometry(
+                            bWalkSegmentAwaitingMovement,
+                            bHoldWalkStopFacingThisFrame,
+                            bEndpointIdlePresentationActive,
+                            bPublishedStoppedGeometrySafe,
+                            Owner.getAnimation(),
+                            HasActiveSpotAnimation() ||
+                                    CurrentAnimationRequest.AnimationToPlay !=
+                                            NO_ANIMATION,
+                            Owner.getPoseAnimation(),
+                            OldAnimationSet.IdlePoseAnimation);
+            boolean bUsedCustomAnimation =
+                    bUsedHeldEndpointIdleModel ||
+                            bPreservePendingWalkEndpointGeometry;
+            boolean bUseAuthoritativeTeleportAction =
+                    ShouldUseAuthoritativeTeleportAction(
+                            Owner.getAnimation());
+            // [TMA-FRESH-WALK-PRESENTATION] Do not let a hidden early
+            // walk/turn pose replace the smoothed idle which was actually
+            // displayed when the click occurred. A real segment clears both
+            // pending and handoff state before reaching this branch.
             boolean bControllerAnimationRequested =
-                    (UniqueAnimationExceptionList.contains(
+                    !bUsedCustomAnimation &&
+                            !bUseAuthoritativeTeleportAction &&
+                            ((UniqueAnimationExceptionList.contains(
                                      Owner.getAnimation()) &&
                                     bMovingThisAction) ||
                                     CurrentAnimationRequest.AnimationToPlay !=
-                                            -1;
+                                            -1);
             if (bControllerAnimationRequested)
             {
                 // Anim controller takes control over the pose animation or custom anim
@@ -3525,11 +5161,11 @@ public class CustomMovementHandler
                         }
                     }
 
-                    net.runelite.api.Model OwnerModel = Owner.getModel();
-                    if (OwnerModel == null ||
+                    SourceOwnerModel = Owner.getModel();
+                    if (SourceOwnerModel == null ||
                             !TrySetModel(
                                     AnimController.animate(
-                                            OwnerModel)))
+                                            SourceOwnerModel)))
                     {
                         // Preserve the last drawable model and use the normal
                         // controller for this frame. Loading/model replacement
@@ -3542,7 +5178,14 @@ public class CustomMovementHandler
             {
                 // Normal controller takes back over
                 bTargetWasKilled = false; // If normal controller is taking it, cancel target killed animation
-                SetAllIdlePosesDefault();
+                if (bUseNativeSmoothedEndpointIdle)
+                {
+                    SetAllMovementPosesToIdleAnimation();
+                }
+                else
+                {
+                    SetAllIdlePosesDefault();
+                }
                 if (AnimController.getAnimation() != null)
                 {
                     Owner.setPoseAnimation(AnimController.getAnimation().getId());
@@ -3560,10 +5203,25 @@ public class CustomMovementHandler
                 // locomotion.  The TrySetModel fallback below already
                 // preserves the last valid model when the Owner cannot
                 // supply one for a single frame.
+                if (bEndpointIdlePresentationActive &&
+                        bEndpointIdleFrameNeedsPublication &&
+                        !HasActiveSpotAnimation() &&
+                        CurrentAnimationRequest.PoseAnimationToPlay !=
+                                NO_ANIMATION &&
+                        (Owner.getPoseAnimation() !=
+                                CurrentAnimationRequest.PoseAnimationToPlay ||
+                                Owner.getPoseAnimationFrame() !=
+                                        EndpointIdleDesiredFrame))
+                {
+                    bEndpointIdleFrameNeedsPublication = true;
+                }
                 if (CurrentAnimationRequest.PoseAnimationToPlay != -1 &&
                         (Owner.getPoseAnimation() !=
                                 CurrentAnimationRequest.PoseAnimationToPlay ||
-                                bResetCurrentAnimation))
+                                bResetCurrentAnimation ||
+                                (bEndpointIdlePresentationActive &&
+                                        bEndpointIdleFrameNeedsPublication &&
+                                        !HasActiveSpotAnimation())))
                 {
                     int RequestedPoseAnimation =
                             CurrentAnimationRequest.PoseAnimationToPlay;
@@ -3572,6 +5230,26 @@ public class CustomMovementHandler
 
                     if (CustomAnim != null)
                     {
+                        // A spatially stopped model uses the independent
+                        // authored idle frame even when another route segment
+                        // is pending. The native builder composes that exact
+                        // keyframe below; hidden locomotion never supplies the
+                        // visible endpoint geometry.
+                        boolean bRestartStationaryIdle =
+                                ShouldRestartStationaryIdlePose(
+                                        bMovingThisAction,
+                                        Owner.getAnimation(),
+                                        Owner.getPoseAnimation(),
+                                        RequestedPoseAnimation,
+                                        OldAnimationSet.IdlePoseAnimation);
+                        boolean bForceEndpointIdleFrame =
+                                bEndpointIdlePresentationActive &&
+                                        bEndpointIdleFrameNeedsPublication &&
+                                        !HasActiveSpotAnimation();
+                        int RequestedStartingFrame =
+                                bForceEndpointIdleFrame
+                                        ? EndpointIdleDesiredFrame
+                                        : CurrentAnimationRequest.StartingFrame;
                         int SafePoseFrame = SelectPoseFrameForPublication(
                                 Owner.getPoseAnimation(),
                                 Owner.getPoseAnimationFrame(),
@@ -3579,15 +5257,12 @@ public class CustomMovementHandler
                                 LastValidOwnerPoseAnimation,
                                 LastValidOwnerPoseFrame,
                                 CustomAnim.getNumFrames(),
-                                CurrentAnimationRequest.StartingFrame,
+                                RequestedStartingFrame,
                                 bResetCurrentAnimation,
-                                ShouldRestartStationaryIdlePose(
-                                        bMovingThisAction,
-                                        Owner.getAnimation(),
-                                        Owner.getPoseAnimation(),
-                                        RequestedPoseAnimation,
-                                        OldAnimationSet.IdlePoseAnimation));
-                        if (Owner.getPoseAnimationFrame() != SafePoseFrame)
+                                bRestartStationaryIdle ||
+                                        bForceEndpointIdleFrame);
+                        if (Owner.getPoseAnimationFrame() != SafePoseFrame ||
+                                bForceEndpointIdleFrame)
                         {
                             Owner.setPoseAnimationFrame(SafePoseFrame);
                         }
@@ -3604,8 +5279,58 @@ public class CustomMovementHandler
                 // momentarily unavailable while RuneLite rebuilds equipment
                 // or animation state. Keep the last complete model for that
                 // frame instead of assigning null and making the player pop.
-                if (TrySetModel(Owner.getModel()))
+                boolean bOwnerModelPublished = false;
+                boolean bEndpointIdleCaptureAttempted =
+                        CanCaptureEndpointIdleModel();
+                if (bEndpointIdleCaptureAttempted &&
+                        TryCaptureEndpointIdleModel())
                 {
+                    bUsedHeldEndpointIdleModel =
+                            TryPublishHeldEndpointIdleModel();
+                    bUsedCustomAnimation =
+                            bUsedHeldEndpointIdleModel;
+                    bOwnerModelPublished =
+                            bUsedHeldEndpointIdleModel;
+                }
+                else if (bEndpointIdleCaptureAttempted &&
+                        IsHeldEndpointIdleModelPublished())
+                {
+                    // A transient native-builder miss must retain the previous
+                    // valid idle keyframe, never fall through to the hidden
+                    // owner's locomotion model.
+                    bUsedHeldEndpointIdleModel = true;
+                    bUsedCustomAnimation = true;
+                    bOwnerModelPublished = true;
+                }
+
+                if (!bUsedHeldEndpointIdleModel &&
+                        !bEndpointIdleCaptureAttempted &&
+                        bEndpointIdlePresentationActive &&
+                        bEndpointIdleFrameNeedsPublication &&
+                        Model.getModel() != null)
+                {
+                    // The requested idle animation/model is temporarily
+                    // unavailable. Preserve the last drawable custom frame
+                    // for this render rather than exposing native locomotion.
+                    bUsedCustomAnimation = true;
+                }
+
+                if (!bUsedCustomAnimation &&
+                        !bEndpointIdleCaptureAttempted)
+                {
+                    SourceOwnerModel = Owner.getModel();
+                    if (TrySetModel(SourceOwnerModel))
+                    {
+                        bOwnerModelPublished = true;
+                    }
+                }
+
+                if (bOwnerModelPublished)
+                {
+                    if (bUseNativeSmoothedEndpointIdle)
+                    {
+                        bEndpointIdlePoseWasDisplayed = true;
+                    }
                     int PublishedPoseAnimation = Owner.getPoseAnimation();
                     int PublishedPoseFrame = Owner.getPoseAnimationFrame();
                     if (PublishedPoseAnimation != NO_ANIMATION &&
@@ -3614,45 +5339,35 @@ public class CustomMovementHandler
                         LastValidOwnerPoseAnimation = PublishedPoseAnimation;
                         LastValidOwnerPoseFrame = PublishedPoseFrame;
                     }
+
+                    if (ShouldMarkPublishedStoppedGeometrySafe(
+                            bMovingThisAction,
+                            Owner.getAnimation(),
+                            HasActiveSpotAnimation() ||
+                                    CurrentAnimationRequest.AnimationToPlay !=
+                                            NO_ANIMATION,
+                            Owner.getPoseAnimation(),
+                            Owner.getPoseAnimationFrame(),
+                            OldAnimationSet.IdlePoseAnimation,
+                            Model.getBaseModel() != null))
+                    {
+                        // Ordinary Player.getModel() supplied another safe
+                        // smoothed idle sample. It may replace the previous
+                        // sample without losing stopped-model provenance.
+                        bPublishedStoppedGeometrySafe = true;
+                    }
                 }
             }
 
             net.runelite.api.Model RenderedModel = Model.getModel();
-            net.runelite.api.Model OwnerModel = Owner.getModel();
             if (RenderedModel != null &&
-                    OwnerModel != null &&
+                    SourceOwnerModel != null &&
+                    !bUsedHeldEndpointIdleModel &&
                     RenderedModel.getModelHeight() !=
-                            OwnerModel.getModelHeight())
+                            SourceOwnerModel.getModelHeight())
             {
                 RenderedModel.setModelHeight(
-                        OwnerModel.getModelHeight());
-            }
-
-            if (RenderedModel != null &&
-                    OwnerModel != null &&
-                    RenderedModel.getUvBufferOffset() !=
-                            OwnerModel.getUvBufferOffset())
-            {
-                RenderedModel.setUvBufferOffset(
-                        OwnerModel.getUvBufferOffset());
-            }
-
-            if (RenderedModel != null &&
-                    OwnerModel != null &&
-                    RenderedModel.getBufferOffset() !=
-                            OwnerModel.getBufferOffset())
-            {
-                RenderedModel.setBufferOffset(
-                        OwnerModel.getBufferOffset());
-            }
-
-            if (RenderedModel != null &&
-                    OwnerModel != null &&
-                    RenderedModel.getSceneId() !=
-                            OwnerModel.getSceneId())
-            {
-                RenderedModel.setSceneId(
-                        OwnerModel.getSceneId());
+                        SourceOwnerModel.getModelHeight());
             }
 
             int FootprintHeight = Perspective.getFootprintTileHeight(client, Model.getLocation(), Owner.getWorldView().getPlane(), Owner.getFootprintSize());
@@ -3701,19 +5416,114 @@ public class CustomMovementHandler
                         RenderedModel == null;
             }
 
+            UpdateMirroredActorSpotAnimations(
+                    CanSuppressOwnerInCurrentScene());
+
             RecordLastRenderedLocation(Model.getLocation());
+            StallTraceStageBegin();
             UpdateCamera();
+            StallTraceStageEnd("UpdateCamera");
         }
         else
         {
             SetAllIdlePosesDefault();
             Model.setActive(false);
+            ClearMirroredActorSpotAnimations();
             if (cameraModel != null)
             {
                 cameraModel.setActive(false);
             }
         }
 
+    }
+
+    private long StallTraceStageStartNanos = 0;
+
+    private void StallTraceStageBegin()
+    {
+        if (!config.DebugStallTrace())
+        {
+            return;
+        }
+        StallTraceStageStartNanos = System.nanoTime();
+    }
+
+    private void StallTraceStageEnd(String StageName)
+    {
+        if (!config.DebugStallTrace())
+        {
+            return;
+        }
+        long ElapsedMillis =
+                (System.nanoTime() - StallTraceStageStartNanos) / 1_000_000L;
+        if (ElapsedMillis <
+                DebugFileLogger.STALL_TRACE_STAGE_THRESHOLD_MILLIS)
+        {
+            return;
+        }
+        DebugFileLogger.Append(
+                DebugFileLogger.STALL_TRACE_LOG_FILE,
+                "[TMA-STALL-TRACE] stage=" + StageName +
+                        " ms=" + ElapsedMillis +
+                        " frameGap=" + CurrentFrameDelta +
+                        " moving=" + bMovingThisAction +
+                        " walkArmed=" + bWalkStopFacingHoldArmed +
+                        " awaiting=" + bWalkSegmentAwaitingMovement);
+    }
+
+    private void MaybeLogMovementIdleFlick(boolean WasMovingThisAction)
+    {
+        if (!config.DebugMovementIdleFlick() ||
+                !WasMovingThisAction ||
+                bMovingThisAction ||
+                !HasUnfinishedRoute(
+                        NextLerpPosition,
+                        client.getLocalDestinationLocation()))
+        {
+            return;
+        }
+
+        String Message = "[MovementIdleFlick] moving->idle en route: reason=" +
+                (bEndpointIdlePresentationActive
+                        ? "endpoint-presentation"
+                        : "pose-selection") +
+                " elapsed=" +
+                MillisecondsSinceTileChange +
+                "ms frameDelta=" + CurrentFrameDelta +
+                " movementDuration=" +
+                GetSceneMovementAnimationDuration(
+                        SceneRecoveryTweenDurationOverride) +
+                " segmentTick=" + MovementSegmentPublicationTick +
+                " currentTick=" + client.getTickCount() +
+                " segmentCycle=" + MovementSegmentPublicationGameCycle +
+                " currentCycle=" + client.getGameCycle() +
+                " retainedMoving=" +
+                bRetainedSceneMovementSegmentInProgress +
+                " retainedTick=" + RetainedMovementProgressTick +
+                " retainedCycle=" + RetainedMovementProgressGameCycle +
+                " boundaryCycle=" +
+                FreshMovementPublicationBoundaryGameCycle +
+                " recoveryDuration=" + SceneRecoveryTweenDurationOverride +
+                " newTile=" + bNewTileMovementStarted +
+                " walkArmed=" + bWalkStopFacingHoldArmed +
+                " observed=" + bWalkMovementObserved +
+                " awaiting=" + bWalkSegmentAwaitingMovement +
+                " inheritedGap=" +
+                bPendingWalkInheritedActiveRouteGap +
+                " ownerAnim=" +
+                (Owner == null ? NO_ANIMATION : Owner.getAnimation()) +
+                " nextLerp=" + NextLerpPosition +
+                " dest=" + client.getLocalDestinationLocation();
+
+        log.debug(Message);
+        AppendMovementIdleFlickLog(Message);
+    }
+
+    private void AppendMovementIdleFlickLog(String Message)
+    {
+        DebugFileLogger.Append(
+                "tma-movement-idle-flick.log",
+                Message);
     }
 
     public void Update()
@@ -3739,7 +5549,10 @@ public class CustomMovementHandler
             bSceneRebasePending = false;
         }
 
-        if (!UpdateTrueTileLocation())
+        StallTraceStageBegin();
+        boolean bTrueTileAvailable = UpdateTrueTileLocation();
+        StallTraceStageEnd("UpdateTrueTileLocation");
+        if (!bTrueTileAvailable)
         {
             // Soft suspension while the client is rebuilding a scene: retain
             // the last valid model/interpolation state until conversion from
@@ -3755,10 +5568,15 @@ public class CustomMovementHandler
         ArmPohArrivalCoordinateGuard();
         SynchronizePohArrivalCoordinateToNative();
 
+        StallTraceStageBegin();
         UpdateLerpDestinations();
+        StallTraceStageEnd("UpdateLerpDestinations");
 
         if (bNewTileMovementStarted)
         {
+            FreshMovementPublicationBoundaryGameCycle = -1;
+            MovementSegmentPublicationTick = client.getTickCount();
+            MovementSegmentPublicationGameCycle = client.getGameCycle();
             // [TMA-FRESH-WALK-START] A real authoritative movement segment has
             // arrived. This clears both an ordinary re-click delay and the
             // first-segment wait carried through a scene rebuild. Recovery
@@ -3766,17 +5584,80 @@ public class CustomMovementHandler
             WalkClickRevisionAtMovementSegment = WalkClickRevision;
             bWalkSegmentAwaitingMovement = false;
             bWalkStartPendingDuringCatchUp = false;
-            bWalkReclickOccurredDuringVisibleMovement = false;
+            bPostSceneRecoveryRouteGapEligible = false;
+            bPendingWalkInheritedActiveRouteGap = false;
+            bPublishedStoppedGeometrySafe = false;
+            bEndpointNativeHandoffReadyThisFrame = false;
+            bEndpointNativeHandoffEstablished =
+                    UpdateEndpointNativeHandoffLatch(
+                            bEndpointNativeHandoffEstablished,
+                            false,
+                            true,
+                            config.AllowOriginalModelWhenCloseProximity());
+            boolean bResetLocomotionForNewSegment =
+                    ShouldResetLocomotionForNewSegment(
+                            bEndpointIdlePresentationActive,
+                            bLocomotionResetPendingAfterEndpointIdle);
+            if (bEndpointIdlePresentationActive)
+            {
+                // New authoritative position always outranks every old-route
+                // catch-up/idle state. Release the endpoint model before
+                // animation selection so movement begins in this same update.
+                if (bEndpointNativeIdlePoseOverrideActive)
+                {
+                    SetAllIdlePosesDefault();
+                }
+                bEndpointIdlePresentationActive = false;
+                ClearHeldEndpointIdleModel();
+            }
+            bResetCurrentAnimation |=
+                    bResetLocomotionForNewSegment;
+            bLocomotionResetPendingAfterEndpointIdle = false;
         }
 
+        StallTraceStageBegin();
         UpdateWalkStopFacingHold();
+        StallTraceStageEnd("UpdateWalkStopFacingHold");
 
+        boolean bWasMovingThisAction = bMovingThisAction;
+        StallTraceStageBegin();
         UpdateAnimationSelection();
+        StallTraceStageEnd("UpdateAnimationSelection");
 
+        MaybeLogMovementIdleFlick(bWasMovingThisAction);
+
+        StallTraceStageBegin();
         UpdateMovementType();
+        StallTraceStageEnd("UpdateMovementType");
 
+        StallTraceStageBegin();
         ApplyTweening();
+        StallTraceStageEnd("ApplyTweening");
 
+        StallTraceStageBegin();
         UpdateModelVisibleState();
+        StallTraceStageEnd("UpdateModelVisibleState");
+
+        boolean bVisibleMovementSegmentInProgress =
+                IsVisibleMovementSegmentInProgress(
+                        bMovingThisAction,
+                        MillisecondsSinceTileChange,
+                        GetMovementTweenDurationMilliseconds(),
+                        LastLerpPosition,
+                        NextLerpPosition);
+        if (bVisibleMovementSegmentInProgress)
+        {
+            bRetainedSceneMovementSegmentInProgress = true;
+            RetainedMovementProgressTick = client.getTickCount();
+            RetainedMovementProgressGameCycle = client.getGameCycle();
+            FreshMovementPublicationBoundaryGameCycle = -1;
+        }
+        else if (!bFreshMovementPublicationBoundaryBridgeActive)
+        {
+            bRetainedSceneMovementSegmentInProgress = false;
+            RetainedMovementProgressTick = -1;
+            RetainedMovementProgressGameCycle = -1;
+            FreshMovementPublicationBoundaryGameCycle = -1;
+        }
     }
 }

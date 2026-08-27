@@ -6,13 +6,15 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.kit.KitType;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.game.SpriteManager;
+import net.runelite.client.plugins.interfacestyles.InterfaceStylesPlugin;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.client.ui.overlay.components.LineComponent;
 import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.ImageUtil;
 import net.runelite.client.util.Text;
 import org.apache.commons.lang3.tuple.Pair;
 
@@ -34,6 +36,7 @@ public class TrueMovementOverlay extends OverlayPanel
     private final Client client;
     private final TrueTileMovementPlugin plugin;
     private final TrueTileMovementConfig config;
+    private final ConfigManager configManager;
 
     public boolean bEverythingIsStale = false;
     public boolean bRuneliteObjectsStale = false;
@@ -51,6 +54,13 @@ public class TrueMovementOverlay extends OverlayPanel
     private static final Color BAR_FILL_COLOR = Color.green;
     private static final Color BAR_BG_COLOR = Color.red;
     private static final Dimension HP_BAR_SIZE = new Dimension(30, 5);
+    private static final int HD_HEALTH_BAR_PADDING = 1;
+    private static final String INTERFACE_STYLES_CONFIG_GROUP =
+            "interfaceStyles";
+    private static final String HD_HEALTH_BARS_CONFIG_KEY =
+            "hdHealthBars";
+    private final BufferedImage InterfaceStylesHealthBarFront;
+    private final BufferedImage InterfaceStylesHealthBarBack;
 
     public void Cleanup()
     {
@@ -68,20 +78,116 @@ public class TrueMovementOverlay extends OverlayPanel
     public Map<Integer /* character ID */, CustomMovementHandler> MovementHandlerCache = new HashMap<>();
 
     @Inject
-    private TrueMovementOverlay(Client client, TrueTileMovementPlugin plugin, TrueTileMovementConfig config)
+    private TrueMovementOverlay(
+            Client client,
+            TrueTileMovementPlugin plugin,
+            TrueTileMovementConfig config,
+            ConfigManager configManager)
     {
         this.client = client;
         this.plugin = plugin;
         this.config = config;
+        this.configManager = configManager;
+        // Use Interface Styles' own bundled artwork, but do not depend on its
+        // transient client sprite-override map. Resource Packs and plugin
+        // startup ordering can republish that map after this overlay has
+        // started; the user-facing config value is the stable contract.
+        InterfaceStylesHealthBarFront = ImageUtil.loadImageResource(
+                InterfaceStylesPlugin.class,
+                "2010/healthbar/default_front_40px.png");
+        InterfaceStylesHealthBarBack = ImageUtil.loadImageResource(
+                InterfaceStylesPlugin.class,
+                "2010/healthbar/default_back_40px.png");
 
         setPosition(OverlayPosition.DYNAMIC);
         setPriority(PRIORITY_HIGH);
         setLayer(OverlayLayer.ABOVE_SCENE);
     }
 
+    static int GetHealthBarProgressFill(
+            int BarWidth,
+            float Ratio,
+            int Padding)
+    {
+        if (BarWidth <= 0)
+        {
+            return 0;
+        }
+
+        float ClampedRatio = Math.max(0.0f, Math.min(Ratio, 1.0f));
+        int MinimumFill = Math.min(
+                BarWidth,
+                Math.max(0, Padding) * 2);
+        return (int) Math.ceil(Math.max(
+                MinimumFill,
+                BarWidth * ClampedRatio));
+    }
+
+    static boolean IsInterfaceStylesHdHealthBarEnabled(
+            String ConfigValue)
+    {
+        return Boolean.parseBoolean(ConfigValue);
+    }
+
+    private boolean RenderOverriddenHPBar(
+            Graphics2D graphics,
+            Point HPBarPoint,
+            float Ratio)
+    {
+        if (!IsInterfaceStylesHdHealthBarEnabled(
+                configManager.getConfiguration(
+                        INTERFACE_STYLES_CONFIG_GROUP,
+                        HD_HEALTH_BARS_CONFIG_KEY)) ||
+                InterfaceStylesHealthBarFront == null ||
+                InterfaceStylesHealthBarBack == null)
+        {
+            return false;
+        }
+
+        if (InterfaceStylesHealthBarFront.getWidth() !=
+                InterfaceStylesHealthBarBack.getWidth() ||
+                InterfaceStylesHealthBarFront.getHeight() !=
+                        InterfaceStylesHealthBarBack.getHeight())
+        {
+            return false;
+        }
+
+        int BarWidth = InterfaceStylesHealthBarFront.getWidth();
+        int BarHeight = InterfaceStylesHealthBarFront.getHeight();
+        int BarX = HPBarPoint.getX() - BarWidth / 2;
+        int BarY = HPBarPoint.getY();
+        int ProgressFill = GetHealthBarProgressFill(
+                BarWidth,
+                Ratio,
+                HD_HEALTH_BAR_PADDING);
+
+        graphics.drawImage(
+                InterfaceStylesHealthBarBack,
+                BarX,
+                BarY,
+                null);
+        graphics.drawImage(
+                InterfaceStylesHealthBarFront,
+                BarX,
+                BarY,
+                BarX + ProgressFill,
+                BarY + BarHeight,
+                0,
+                0,
+                ProgressFill,
+                BarHeight,
+                null);
+        return true;
+    }
+
     public void RenderHPBar(Graphics2D graphics, Point HPBarPoint)
     {
         final float ratio = (float) client.getBoostedSkillLevel(Skill.HITPOINTS) / client.getRealSkillLevel(Skill.HITPOINTS);
+
+        if (RenderOverriddenHPBar(graphics, HPBarPoint, ratio))
+        {
+            return;
+        }
 
         // Draw bar
         final int barX = HPBarPoint.getX() - 15;
@@ -90,7 +196,10 @@ public class TrueMovementOverlay extends OverlayPanel
         final int barHeight = HP_BAR_SIZE.height;
 
         // Restricted by the width to prevent the bar from being too long while you are boosted above your real HP level.
-        final int progressFill = (int) Math.ceil(Math.min((barWidth * ratio), barWidth));
+        final int progressFill = GetHealthBarProgressFill(
+                barWidth,
+                ratio,
+                0);
 
         graphics.setColor(BAR_BG_COLOR);
         graphics.fillRect(barX, barY, barWidth, barHeight);
@@ -360,7 +469,7 @@ public class TrueMovementOverlay extends OverlayPanel
         playerEntry.Owner = client.getLocalPlayer();
         boolean bSceneObjectsWereStale = bRuneliteObjectsStale;
         boolean bUpdatedBeforeSceneRender =
-                plugin.ConsumeSceneLoadPreRenderUpdate(playerEntry);
+                plugin.ConsumePreRenderUpdate(playerEntry);
         if (!bUpdatedBeforeSceneRender)
         {
             // Initialize if needed
