@@ -2,6 +2,9 @@ package com.truetileanimationmovement;
 
 import java.lang.reflect.Array;
 
+import net.runelite.api.gameval.AnimationID;
+import com.truetileanimationmovement.movement.SpecialAnimationPreset;
+
 public class AnimationRequestMoveset
 {
 // Juicy animations
@@ -53,6 +56,8 @@ public class AnimationRequestMoveset
 // 4,003->land on your butt
 // 4,772->tight rope walk
 // 6529->shrinking animation from grim tales
+// 10429->biggg push
+// 9799->moons of peril, hit back
 // REMEMBER YOU CAN ALSO PLAY THESE BACKWARDS
 
     // 2D grid array
@@ -164,6 +169,8 @@ public class AnimationRequestMoveset
         NewRequest.bShouldTeleportToLocation = false;
         NewRequest.bAtDestinationLocation = false;
         NewRequest.OrientationSpeed = 60;
+        NewRequest.bAllowAnimationLoop = false;
+
         return NewRequest;
     }
 
@@ -185,8 +192,12 @@ public class AnimationRequestMoveset
         return NewRequest;
     }
 
-    public void ConstructFromSpecialAnimationSet(IdleAnimationSet AnimSet, String SpecialAnimationKey, TrueTileMovementConfig config) {
-        if (SpecialAnimationKey.equals("SpecialMoves")) {
+    public void ConstructFromSpecialAnimationSet(
+            final IdleAnimationSet AnimSet,
+            final SpecialAnimationPreset preset,
+            final TrueTileMovementConfig config)
+    {
+        if (preset == SpecialAnimationPreset.SPECIAL_MOVES) {
             for (int i = 0; i < 5; ++i) {
                 for (int j = 0; j < 5; ++j) {
                     MovesetArray[i][j] = GetDefaultSpecialMoveAnimationRequest();
@@ -195,173 +206,199 @@ public class AnimationRequestMoveset
             Initialize();
 
             // SOUTHEAST_2;
-            SOUTHEAST_2.AnimationToPlay = 1770; // lean WAY back
+            SOUTHEAST_2.AnimationToPlay = AnimationID.MDAUGHTER_ABSAIL_JUMP; // lean WAY back. 1770
             SOUTHEAST_2.bUseLinearTween = false;
             SOUTHEAST_2.MovementSpeedMultiplier = 1.5;
             SOUTHEAST_2.AnimationSpeed = 1;
             SOUTHEAST_2.StartingFrame = 0;
+            SOUTHEAST_2.bAllowAnimationLoop = false;
 
 
             // SOUTHSOUTHWEST;
-            SOUTHWESTWEST.AnimationToPlay = 1764; // sick jump land
+            SOUTHWESTWEST.AnimationToPlay = AnimationID.MDAUGHTER_TREE_CLIMB3; // sick jump land. 1764
             SOUTHWESTWEST.bUseLinearTween = false;
             SOUTHWESTWEST.MovementSpeedMultiplier = 1.5;
             SOUTHWESTWEST.AnimationSpeed = 1;
             SOUTHWESTWEST.StartingFrame = 0;
+            SOUTHWESTWEST.bAllowAnimationLoop = false;
 
 
             // WEST_2;
-            WEST_2.AnimationToPlay = 2107; // Side step 2, spin emote
+            WEST_2.AnimationToPlay = AnimationID.EMOTE_DANCE_SPIN; // Side step 2, spin emote. 2107
             WEST_2.MovementSpeedMultiplier = 2;
             WEST_2.AnimationSpeed = 1;
             WEST_2.StartingFrame = 4;
+            WEST_2.bAllowAnimationLoop = false;
 
             // NORTHWESTWEST;
-            NORTHWESTWEST.AnimationToPlay = 409; // another cool spin move
+            NORTHWESTWEST.AnimationToPlay = AnimationID.HUMAN_DHSWORD_SPIN; // another cool spin move. 409
             NORTHWESTWEST.MovementSpeedMultiplier = 2;
             NORTHWESTWEST.AnimationSpeed = 1;
             NORTHWESTWEST.StartingFrame = 0;
+            NORTHWESTWEST.bAllowAnimationLoop = false;
 
 
             // NORTHEAST_2;
-            NORTHEAST_2.AnimationToPlay = 1852; // huge jump land
+            NORTHEAST_2.AnimationToPlay = AnimationID.DWARFROCK_CANNON_FLY_GETUP; // huge jump land. 1852
             NORTHEAST_2.bUseLinearTween = false;
             NORTHEAST_2.MovementSpeedMultiplier = 1.5;
             NORTHEAST_2.AnimationSpeed = 1;
             NORTHEAST_2.StartingFrame = 0;
+            NORTHEAST_2.bAllowAnimationLoop = false;
 
 
             // SOUTHSOUTHEAST;
-            SOUTHSOUTHEAST.AnimationToPlay = 1764; // sick jump land
+            SOUTHSOUTHEAST.AnimationToPlay = AnimationID.MDAUGHTER_TREE_CLIMB3; // sick jump land. 1764
             SOUTHSOUTHEAST.bUseLinearTween = false;
             SOUTHSOUTHEAST.MovementSpeedMultiplier = 1.5;
             SOUTHSOUTHEAST.AnimationSpeed = 1;
             SOUTHSOUTHEAST.StartingFrame = 0;
+            SOUTHSOUTHEAST.bAllowAnimationLoop = false;
 
 
             // SOUTHWEST_1;
-            SOUTHWEST_1.AnimationToPlay = 1702; // side step small
+            SOUTHWEST_1.AnimationToPlay = AnimationID.HUMAN_ZAMORAKSPEAR_TURNONSPOT; // side step small. 1702
             SOUTHWEST_1.bUseLinearTween = true;
             SOUTHWEST_1.MovementSpeedMultiplier = 1.0;
             SOUTHWEST_1.AnimationSpeed = 1;
             SOUTHWEST_1.StartingFrame = 0;
+            SOUTHWEST_1.bAllowAnimationLoop = false;
 
             // WEST_1;
-            WEST_1.AnimationToPlay = 821; // SIDE STEP LEFT
+            WEST_1.AnimationToPlay = AnimationID.HUMAN_WALK_L; // SIDE STEP LEFT. 821
             WEST_1.MovementSpeedMultiplier = 1.5;
             WEST_1.AnimationSpeed = 2;
             WEST_1.StartingFrame = 0;
+            WEST_1.bAllowAnimationLoop = false;
 
             // NORTHWEST_1;
-            NORTHWEST_1.AnimationToPlay = 807; // Small hop
+            NORTHWEST_1.AnimationToPlay = AnimationID.HUMAN_LONGJUMP; // Small hop. 807
             NORTHWEST_1.MovementSpeedMultiplier = 3.0;
             NORTHWEST_1.StartingFrame = 7;
             NORTHWEST_1.AnimationSpeed = 1;
+            NORTHWEST_1.bAllowAnimationLoop = false;
 
 
             // NORTHNORTHEAST;
-            NORTHNORTHEAST.AnimationToPlay = 2750; // Super far jump forward
+            NORTHNORTHEAST.AnimationToPlay = AnimationID.OVERLOG; // Super far jump forward. 2750
             NORTHNORTHEAST.bUseLinearTween = false;
             NORTHNORTHEAST.MovementSpeedMultiplier = 1.6;
             NORTHNORTHEAST.AnimationSpeed = 2;
             NORTHNORTHEAST.StartingFrame = 2;
+            NORTHNORTHEAST.bAllowAnimationLoop = false;
 
             // BACK_2;
-            BACK_2.AnimationToPlay = 2390; // big knockback
+            BACK_2.AnimationToPlay = AnimationID.TBW_CLEANUP_PLAYER_SURPRISE_STEPBACK; // big knockback. 2390
             BACK_2.bUseLinearTween = false;
             BACK_2.MovementSpeedMultiplier = 2;
             BACK_2.AnimationSpeed = 1;
             BACK_2.StartingFrame = 0;
+            BACK_2.bAllowAnimationLoop = false;
 
             // BACK_1;
-            BACK_1.AnimationToPlay = 1441; // knockback
+            BACK_1.AnimationToPlay = AnimationID.HUMAN_STUMBLE_BACK_CONTINUOUS; // knockback. 1441
             BACK_1.bUseLinearTween = true;
             BACK_1.MovementSpeedMultiplier = 1;
             BACK_1.AnimationSpeed = 1;
             BACK_1.StartingFrame = 0;
+            BACK_1.bAllowAnimationLoop = false;
 
             CENTER.AnimationToPlay = AnimSet.IdleRotateRight; // Center
 
-            FORWARD_1.AnimationToPlay = 7515; // Jab forward
+            FORWARD_1.AnimationToPlay = AnimationID.HUMAN_DRAGON_SWORD_SPEC; // Jab forward. 7515
             FORWARD_1.MovementSpeedMultiplier = 2.0;
             FORWARD_1.StartingFrame = 0;
             FORWARD_1.AnimationSpeed = 1;
+            FORWARD_1.bAllowAnimationLoop = false;
 
             // FORWARD_2;
-            FORWARD_2.AnimationToPlay = 3067; // Big jump forward
+            FORWARD_2.AnimationToPlay = AnimationID.AGILITY_PYRAMID_GAP_JUMP; // Big jump forward. 3067
             FORWARD_2.MovementSpeedMultiplier = 2;
             FORWARD_2.AnimationSpeed = 2;
             FORWARD_2.StartingFrame = 2;
+            FORWARD_2.EndingFrame = 7;
+            FORWARD_2.bAllowAnimationLoop = false;
 
             // SOUTHWESTWEST;
-            SOUTHSOUTHWEST.AnimationToPlay = 870; // Jumping Jack
+            SOUTHSOUTHWEST.AnimationToPlay = AnimationID.EMOTE_STARJUMP_5; // Jumping Jack. 870
             SOUTHSOUTHWEST.bUseLinearTween = false;
             SOUTHSOUTHWEST.MovementSpeedMultiplier = 2;
             SOUTHSOUTHWEST.AnimationSpeed = 1;
             SOUTHSOUTHWEST.StartingFrame = 0;
+            SOUTHSOUTHWEST.bAllowAnimationLoop = false;
 
 
             // SOUTHEAST_1;
-            SOUTHEAST_1.AnimationToPlay = 1702; // side step small
+            SOUTHEAST_1.AnimationToPlay = AnimationID.HUMAN_ZAMORAKSPEAR_TURNONSPOT; // side step small. 1702
             SOUTHEAST_1.bUseLinearTween = true;
             SOUTHEAST_1.MovementSpeedMultiplier = 1.0;
             SOUTHEAST_1.AnimationSpeed = 1;
             SOUTHEAST_1.StartingFrame = 0;
+            SOUTHEAST_1.bAllowAnimationLoop = false;
 
 
             // EAST_2;
-            EAST_1.AnimationToPlay = 822; // SIDE STEP RIGHT
+            EAST_1.AnimationToPlay = AnimationID.HUMAN_WALK_R; // SIDE STEP RIGHT. 822
             EAST_1.MovementSpeedMultiplier = 1.5;
             EAST_1.AnimationSpeed = 2;
+            EAST_1.bAllowAnimationLoop = false;
 
             // NORTHEAST_1;
-            NORTHEAST_1.AnimationToPlay = 807; // North-east
+            NORTHEAST_1.AnimationToPlay = AnimationID.HUMAN_LONGJUMP; // North-east. 807
             NORTHEAST_1.MovementSpeedMultiplier = 3.0;
             NORTHEAST_1.StartingFrame = 7;
             NORTHEAST_1.AnimationSpeed = 1;
+            NORTHEAST_1.bAllowAnimationLoop = false;
 
             // NORTHNORTHWEST;
-            NORTHNORTHWEST.AnimationToPlay = 2750; // Super far jump forward
+            NORTHNORTHWEST.AnimationToPlay = AnimationID.OVERLOG; // Super far jump forward. 2750
             NORTHNORTHWEST.bUseLinearTween = false;
             NORTHNORTHWEST.MovementSpeedMultiplier = 1.6;
             NORTHNORTHWEST.AnimationSpeed = 2;
             NORTHNORTHWEST.StartingFrame = 2;
+            NORTHNORTHWEST.bAllowAnimationLoop = false;
 
             // SOUTHWEST_2;
-            SOUTHWEST_2.AnimationToPlay = 1770; // lean WAY back
+            SOUTHWEST_2.AnimationToPlay = AnimationID.MDAUGHTER_ABSAIL_JUMP; // lean WAY back. 1770
             SOUTHWEST_2.bUseLinearTween = false;
             SOUTHWEST_2.MovementSpeedMultiplier = 1.5;
             SOUTHWEST_2.AnimationSpeed = 1;
             SOUTHWEST_2.StartingFrame = 0;
+            SOUTHWEST_2.bAllowAnimationLoop = false;
 
             // SOUTHEASTEAST;
-            SOUTHEASTEAST.AnimationToPlay = 870; // Jumping Jack
+            SOUTHEASTEAST.AnimationToPlay = AnimationID.EMOTE_STARJUMP_5; // Jumping Jack. 870
             SOUTHEASTEAST.bUseLinearTween = false;
             SOUTHEASTEAST.MovementSpeedMultiplier = 2;
             SOUTHEASTEAST.AnimationSpeed = 1;
             SOUTHEASTEAST.StartingFrame = 0;
+            SOUTHEASTEAST.bAllowAnimationLoop = false;
 
             // EAST_2
-            EAST_2.AnimationToPlay = 2107; // SIDE_STEP 2 - spin emote
+            EAST_2.AnimationToPlay = AnimationID.EMOTE_DANCE_SPIN; // SIDE_STEP 2 - spin emote. 2107
             EAST_2.MovementSpeedMultiplier = 2;
             EAST_2.AnimationSpeed = 1;
             EAST_2.StartingFrame = 4;
+            EAST_2.bAllowAnimationLoop = false;
 
             // NORTHEASTEAST;
-            NORTHEASTEAST.AnimationToPlay = 409; // another cool spin move
+            NORTHEASTEAST.AnimationToPlay = AnimationID.HUMAN_DHSWORD_SPIN; // another cool spin move. 409
             NORTHEASTEAST.MovementSpeedMultiplier = 2;
             NORTHEASTEAST.AnimationSpeed = 1;
             NORTHEASTEAST.StartingFrame = 0;
+            NORTHEASTEAST.bAllowAnimationLoop = false;
 
 
             // NORTHWEST_2;
-            NORTHWEST_2.AnimationToPlay = 1852; // huge jump land
+            NORTHWEST_2.AnimationToPlay = AnimationID.DWARFROCK_CANNON_FLY_GETUP; // huge jump land. 1852
             NORTHWEST_2.bUseLinearTween = false;
             NORTHWEST_2.MovementSpeedMultiplier = 1.5;
             NORTHWEST_2.AnimationSpeed = 1;
             NORTHWEST_2.StartingFrame = 0;
+            NORTHWEST_2.bAllowAnimationLoop = false;
         }
-        else if (SpecialAnimationKey.equals("WooxWalk"))
+        else if (preset == SpecialAnimationPreset.WOOX_WALK ||
+                preset == SpecialAnimationPreset.TICK_PERFECT_MOVEMENT)
         {
             for (int i = 0; i < 5; ++i)
             {
@@ -373,56 +410,28 @@ public class AnimationRequestMoveset
                     if (i == 0 || j == 0 || i == 4 || j == 4)
                     {
                         MovesetArray[i][j].bResetAnimationOnNewTile = true;
-                        MovesetArray[i][j].AnimationToPlay = 1604;
+                        MovesetArray[i][j].AnimationToPlay = AnimationID.HUMAN_JUMP_STONES; // 1604
                         MovesetArray[i][j].bUseLinearTween = false;
                         MovesetArray[i][j].MovementSpeedMultiplier = 1.5;
                         MovesetArray[i][j].AnimationSpeed = 1;
                         MovesetArray[i][j].StartingFrame = 2;
+                        MovesetArray[i][j].EndingFrame = 7;
+                        MovesetArray[i][j].bAllowAnimationLoop = false;
                     }
                     // 1 Tile
                     else if (i == 1 || j == 1 || i == 3 || j == 3)
                     {
-                        MovesetArray[i][j].AnimationToPlay = 741; // Little jump
+                        MovesetArray[i][j].AnimationToPlay = AnimationID.HUMAN_SPOT_JUMP; // Little jump. 741
                         MovesetArray[i][j].MovementSpeedMultiplier = 2.0;
                         MovesetArray[i][j].bUseLinearTween = false;
                         MovesetArray[i][j].StartingFrame = 2;
                         MovesetArray[i][j].AnimationSpeed = 1;
+                        MovesetArray[i][j].EndingFrame = 7;
+                        MovesetArray[i][j].bAllowAnimationLoop = false;
                     }
                 }
             }
             Initialize();
-        }
-        else if (SpecialAnimationKey.equals("TickPerfectMovement"))
-        {
-            for (int i = 0; i < 5; ++i)
-            {
-                for (int j = 0; j < 5; ++j)
-                {
-                    MovesetArray[i][j] = GetDefaultSpecialMoveAnimationRequest();
-
-                    // 2 Tiles
-                    if (i == 0 || j == 0 || i == 4 || j == 4)
-                    {
-                        MovesetArray[i][j].bResetAnimationOnNewTile = true;
-                        MovesetArray[i][j].AnimationToPlay = 1604;
-                        MovesetArray[i][j].bUseLinearTween = false;
-                        MovesetArray[i][j].MovementSpeedMultiplier = 1.5;
-                        MovesetArray[i][j].AnimationSpeed = 1;
-                        MovesetArray[i][j].StartingFrame = 2;
-                    }
-                    // 1 Tile
-                    else if (i == 1 || j == 1 || i == 3 || j == 3)
-                    {
-                        MovesetArray[i][j].AnimationToPlay = 741; // Little jump
-                        MovesetArray[i][j].MovementSpeedMultiplier = 2.0;
-                        MovesetArray[i][j].bUseLinearTween = false;
-                        MovesetArray[i][j].StartingFrame = 2;
-                        MovesetArray[i][j].AnimationSpeed = 1;
-                    }
-                }
-            }
-            Initialize();
-
         }
     }
 

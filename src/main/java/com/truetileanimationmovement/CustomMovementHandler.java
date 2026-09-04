@@ -1,5 +1,6 @@
 package com.truetileanimationmovement;
 
+import com.truetileanimationmovement.movement.SpecialAnimationPreset;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -253,7 +254,6 @@ public class CustomMovementHandler
     // cleanup can safely re-arm the destination-scene guard.
     private int PohArrivalGuardReleasedSceneGeneration = -1;
     // Animation Handling
-    private int CurrentAnimation = 0;
     private int CurrentPoseAnimation = 0;
     private boolean bResetCurrentAnimation = true;
     Set<Integer> UniqueAnimationExceptionList = new HashSet<Integer>();
@@ -263,7 +263,7 @@ public class CustomMovementHandler
 
     // Original true animations
     private AnimationRequestDetails CurrentAnimationRequest;
-    private IdleAnimationSet OldAnimationSet = new IdleAnimationSet();
+    private final IdleAnimationSet OldAnimationSet = new IdleAnimationSet();
     public int OldAnimationHeight = 0;
     private boolean bIsDefaultHumanAnimationSet = true;
 
@@ -351,9 +351,9 @@ public class CustomMovementHandler
         this.Owner = Owner;
 
         // Initialize all animations we do want to lerp
-        UniqueAnimationExceptionList.add(2588); // Agility
-        UniqueAnimationExceptionList.add(2586); // Agility
-        UniqueAnimationExceptionList.add(2583); // Agility
+        UniqueAnimationExceptionList.add(AnimationID.AGILITY_SHORTCUT_WALL_JUMPDOWN2); // Agility. 2588
+        UniqueAnimationExceptionList.add(AnimationID.AGILITY_SHORTCUT_WALL_JUMPDOWN); // Agility. 2586
+        UniqueAnimationExceptionList.add(AnimationID.AGILITY_SHORTCUT_WALL_JUMP); // Agility. 2583
         // [TMA-TELEPORT-CORRECT] Only genuine teleport animations are treated
         // as unique lerped animations. The original list also contained
         // ZAROS_VERTICAL_CASTING (1979, Ancient Magick cast) and
@@ -361,33 +361,35 @@ public class CustomMovementHandler
         // ordinary spell casts and falsely armed the teleport-in snap during
         // PvP combat. Combat spells (entangle, fire surge, Flames of Zamorak,
         // Claws of Guthix, etc.) were never in this list and are unaffected.
-        UniqueAnimationExceptionList.add(714); // Teleport
-        UniqueAnimationExceptionList.add(878); // Teleport
-        UniqueAnimationExceptionList.add(1816); // Teleport
-        UniqueAnimationExceptionList.add(3872); // Teleport
-        UniqueAnimationExceptionList.add(13811); // Teleport
-        UniqueAnimationExceptionList.add(4069); // Teleport
-        UniqueAnimationExceptionList.add(4071); // Teleport
-        UniqueAnimationExceptionList.add(3869); // Teleport
-        UniqueAnimationExceptionList.add(2881); // Teleport
+        UniqueAnimationExceptionList.add(AnimationID.HUMAN_CASTTELEPORT); // Teleport. 714
+        UniqueAnimationExceptionList.add(AnimationID.AHOY_ECTO_TELEPORT); // Teleport. 878
+        UniqueAnimationExceptionList.add(AnimationID.HUMAN_TELEPORT_OTHER_IMPACT); // Teleport. 1816
+        UniqueAnimationExceptionList.add(AnimationID.TELEPORT_NARDAH_HUMAN); // Teleport. 3872
+        UniqueAnimationExceptionList.add(AnimationID.HUMAN_COWBOSS_TELEPORT); // Teleport. 13811
+        UniqueAnimationExceptionList.add(AnimationID.POH_SMASH_MAGIC_TABLET); // Teleport. 4069
+        UniqueAnimationExceptionList.add(AnimationID.POH_ABSORB_TABLET_TELEPORT); // Teleport. 4071
+        UniqueAnimationExceptionList.add(AnimationID.TELEPORT_CABBAGE_HUMAN); // Teleport. 3869
+        UniqueAnimationExceptionList.add(AnimationID.NTK_HUMAN_TELE); // Teleport. 2881
 
-        UniqueAnimationLocationAndOrientationExceptionList.add(749); // crawl pipe
-        UniqueAnimationLocationAndOrientationExceptionList.add(751); // rope swing
-        UniqueAnimationLocationAndOrientationExceptionList.add(840); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(839); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(1252); // climb over
-        UniqueAnimationLocationAndOrientationExceptionList.add(828); // climb up
-        UniqueAnimationLocationAndOrientationExceptionList.add(740); // climb up
-        UniqueAnimationLocationAndOrientationExceptionList.add(7134); // slide down
-        UniqueAnimationLocationAndOrientationExceptionList.add(844); // crawl
-        UniqueAnimationLocationAndOrientationExceptionList.add(769); // long hop
-        UniqueAnimationLocationAndOrientationExceptionList.add(3057); // Wall climb
-        UniqueAnimationLocationAndOrientationExceptionList.add(3058); // Wall climb
-        UniqueAnimationLocationAndOrientationExceptionList.add(3067); // long jump
-        UniqueAnimationLocationAndOrientationExceptionList.add(3068); // long jump
-        UniqueAnimationLocationAndOrientationExceptionList.add(1115); // jump and cover
-        UniqueAnimationLocationAndOrientationExceptionList.add(5708); // penguin
-        UniqueAnimationLocationAndOrientationExceptionList.add(5709); // penguin
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_DOUBLEPIPESQUEEZE); // crawl pipe. 749
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_ROPESWING_LONG); // rope swing. 751
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_CRUMBLEDWALL); // climb over. 840
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_STYLE); // climb over. 839
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_LOWWALL); // climb over. 1252
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_REACHFORLADDER); // climb up. 828
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_CLIMBING_DOWN); // climb up. 740
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_WALK_LOGBALANCE_LOOP); // slide down. 7134
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_CRAWLING); // crawl. 844
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.HUMAN_STEPPINGSTONEJUMP); // long hop. 769
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_LEDGE_ON_RIGHT); // Wall climb. 3057
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_LEDGE_OFF_RIGHT); // Wall climb. 3058
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_GAP_JUMP); // long jump. 3067
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITY_PYRAMID_GAP_JUMP_FALL); // long jump. 3068
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.AGILITYARENA_DIVE_PLAYER); // jump and cover. 1115
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.PENG_JUMP_A); // penguin. 5708
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.PENG_JUMP_B); // penguin. 5709
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.RAILING_SQUEEZE); // fence shuffle. 3844
+        UniqueAnimationLocationAndOrientationExceptionList.add(AnimationID.REGICIDE_TIGHTFIT); // tir obstacles. 1237
     }
 
     double quadraticTween(long startTime, long endTime, long currentTime)
@@ -1272,7 +1274,11 @@ public class CustomMovementHandler
                 // can replay that lead-in and seam controller-driven action or
                 // locomotion cycles. (Native idle 808 has no authored loop
                 // point and is documented separately.)
-                InController.loop();
+                if (CurrentAnimationRequest == null ||
+                        CurrentAnimationRequest.bAllowAnimationLoop)
+                {
+                    InController.loop();
+                }
                 bTargetWasKilled = false;
             });
         }
@@ -2873,10 +2879,11 @@ public class CustomMovementHandler
             OldAnimationHeight = Owner.getAnimationHeightOffset();
 
             // Monkey or penguin
-            if (OldAnimationSet.IdlePoseAnimation == 1386 ||
-                    OldAnimationSet.IdlePoseAnimation == 222 ||
-                    OldAnimationSet.IdlePoseAnimation == 1401 ||
-                    OldAnimationSet.IdlePoseAnimation == 5668)
+            // 1386, 222, 1401, 5668
+            if (OldAnimationSet.IdlePoseAnimation == AnimationID.M_MONKEY_READY ||
+                    OldAnimationSet.IdlePoseAnimation == AnimationID.MONKEY_READY ||
+                    OldAnimationSet.IdlePoseAnimation == AnimationID.M_GORILLA_READY ||
+                    OldAnimationSet.IdlePoseAnimation == AnimationID.PENG_GENTOO_READY)
             {
                 bIsDefaultHumanAnimationSet = false;
             }
@@ -3843,6 +3850,11 @@ public class CustomMovementHandler
             {
                 return;
             }
+            int RequestedLerpPlane = CurrentWorldPoint.getPlane();
+            if (NextLerpPosition == null)
+            {
+                NextLerpPosition = RequestedLerpPoint;
+            }
             if (LastLerpPosition == null)
             {
                 NextLerpPosition = RequestedLerpPoint;
@@ -3852,20 +3864,17 @@ public class CustomMovementHandler
 
                 NextLerpPositionWorldPoint = CurrentWorldPoint;
             }
-            if (NextLerpPosition == null)
-            {
-                NextLerpPosition = RequestedLerpPoint;
-            }
 
             if (NextLerpPositionWorldPoint == null)
             {
                 NextLerpPositionWorldPoint = CurrentWorldPoint;
             }
-            if (!NextLerpPosition.equals(RequestedLerpPoint))
+            if (RequestedLerpPoint != null && !NextLerpPosition.equals(RequestedLerpPoint))
             {
                 // Try all planes and use whichever one is the closest
                 double ClosestPlaneDistance = 10000000;
                 LocalPoint NextLerpPoint = null;
+                int NextLerpPlane = 0;
                 for (int PlaneIter = CurrentWorldPoint.getPlane(); PlaneIter < CurrentWorldPoint.getPlane() + 4; ++PlaneIter)
                 {
                     int CurrentIndex = PlaneIter % 4;
@@ -3880,6 +3889,7 @@ public class CustomMovementHandler
                         {
                             ClosestPlaneDistance = DistToPoint;
                             NextLerpPoint = TempNextLerpPoint;
+                            NextLerpPlane = CurrentIndex;
                         }
                     }
                 }
@@ -3902,10 +3912,29 @@ public class CustomMovementHandler
                 int DistanceInTilesToLast = 0;
                 int DistanceInTilesToNextLerp = 0;
 
+                int LastLerpPlane = NextLerpPlane;
+                if (LastLerpPositionWorldPoint != null)
+                {
+                    LastLerpPlane = LastLerpPositionWorldPoint.getPlane();
+                }
+
                 if (NextLerpPoint != null)
                 {
+
                     DistanceInTilesToLast = (int) (euclideanDistance(NextLerpPoint.getX(), NextLerpPoint.getY(), LastLerpPosition.getX(), LastLerpPosition.getY()) / 128);
                     DistanceInTilesToNextLerp = (int) (euclideanDistance(NextLerpPoint.getX(), NextLerpPoint.getY(), RequestedLerpPoint.getX(), RequestedLerpPoint.getY()) / 128);
+
+                    // Different planes, huge distance
+                    if (LastLerpPlane != NextLerpPlane)
+                    {
+                        DistanceInTilesToLast += 1000;
+                    }
+
+                    // Different planes, huge distance
+                    if (RequestedLerpPlane != NextLerpPlane)
+                    {
+                        DistanceInTilesToNextLerp += 1000;
+                    }
                 }
 
                 long CurrentTweenDuration =
@@ -4369,7 +4398,7 @@ public class CustomMovementHandler
                         int TempRotatedDirectionX = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * cos - DirectionY * sin) / 128.0))));
                         int TempRotatedDirectionY = Math.max(-2, Math.min(2, Math.toIntExact(Math.round((DirectionX * sin + DirectionY * cos) / 128.0))));
 
-                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + TempRotatedDirectionX][2 + TempRotatedDirectionY]);
+                        CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.getMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + TempRotatedDirectionX][2 + TempRotatedDirectionY]);
                     }
                     bShouldUseTrueLocationOrientation = true;
                     CurrentAnimationRequest.bShouldTeleportToLocation = true;
@@ -4398,7 +4427,7 @@ public class CustomMovementHandler
                 // still use the normal movement request path; only the
                 // delayed duplicate authority was removed.
                 // Handle woox walking
-                CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"WooxWalk", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.getMovesetFromUniqueKey(OldAnimationSet,SpecialAnimationPreset.WOOX_WALK, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
 
                 // No turning if no target
                 if (currentTarget == null)
@@ -4417,7 +4446,7 @@ public class CustomMovementHandler
                     bIsDefaultHumanAnimationSet)
             {
                 // Handle tick perfect moving
-                CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"TickPerfectMovement", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.getMovesetFromUniqueKey(OldAnimationSet,SpecialAnimationPreset.TICK_PERFECT_MOVEMENT, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
             }
             else
             {
@@ -4425,12 +4454,12 @@ public class CustomMovementHandler
                 if (bSpecialMoveAnimation && bIsDefaultHumanAnimationSet)
                 {
                     // Handle normal walking
-                    CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromUniqueKey(OldAnimationSet,"SpecialMoves", config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                    CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.getMovesetFromUniqueKey(OldAnimationSet,SpecialAnimationPreset.SPECIAL_MOVES, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
                 }
                 else
                 {
                     // Handle normal walking
-                    CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.GetAnimationRequestMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
+                    CurrentAnimationRequest = AnimationRequestDetails.NewObject(AnimationRequestMovesetCache.getMovesetFromAnimationSet(OldAnimationSet, config).MovesetArray[2 + RotatedDirectionX][2 + RotatedDirectionY]);
                 }
             }
         }
@@ -4442,22 +4471,22 @@ public class CustomMovementHandler
             if (LastNPCCombatLevel > 300)
             {
                 // 2,387->Fist pump
-                CurrentAnimationRequest.AnimationToPlay = 2106; // Jig
+                CurrentAnimationRequest.AnimationToPlay = AnimationID.EMOTE_DANCE_SCOTTISH; // Jig. 2106
             }
             else if (LastNPCCombatLevel > 200)
             {
                 // 2,387->Fist pump
-                CurrentAnimationRequest.AnimationToPlay = 866; // Dance
+                CurrentAnimationRequest.AnimationToPlay = AnimationID.EMOTE_DANCE; // Dance. 866
             }
             else if (LastNPCCombatLevel > 150)
             {
                 // 2,387->Fist pump
-                CurrentAnimationRequest.AnimationToPlay = 8917; // Flex
+                CurrentAnimationRequest.AnimationToPlay = AnimationID.EMOTE_FLEX; // Flex. 8917
             }
             else if (LastNPCCombatLevel > 100)
             {
                 // 2,387->Fist pump
-                CurrentAnimationRequest.AnimationToPlay = 862; // Cheer
+                CurrentAnimationRequest.AnimationToPlay = AnimationID.EMOTE_CHEER; // Cheer. 862
             }
             // > 50
             else

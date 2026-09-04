@@ -1,44 +1,51 @@
 package com.truetileanimationmovement;
 
+import com.truetileanimationmovement.movement.SpecialAnimationPreset;
+
 import java.util.HashMap;
 import java.util.Map;
 
 public class AnimationRequestMovesetCache
 {
-    static public Map<String, AnimationRequestMoveset> NameToMovesetRequest = new HashMap<>();
-    static public AnimationRequestMoveset GetAnimationRequestMovesetFromUniqueKey(IdleAnimationSet AnimSet, String UniqueLabel, TrueTileMovementConfig config)
+    private static final Map<String, AnimationRequestMoveset>
+            NAME_TO_MOVESET_REQUEST = new HashMap<>();
+
+    private AnimationRequestMovesetCache()
+    {
+    }
+
+    public static AnimationRequestMoveset getMovesetFromUniqueKey(
+            final IdleAnimationSet animSet,
+            final SpecialAnimationPreset preset,
+            final TrueTileMovementConfig config)
     {
         // TODO: BUG->Config not effecting Label, so changes to the config does not update this
-        if (NameToMovesetRequest.containsKey(UniqueLabel))
-        {
-            return NameToMovesetRequest.get(UniqueLabel);
-        }
-
-        AnimationRequestMoveset NewMoveset = new AnimationRequestMoveset();
-        NewMoveset.Initialize();
-
-        NewMoveset.ConstructFromSpecialAnimationSet(AnimSet, UniqueLabel, config);
-
-        NameToMovesetRequest.put(UniqueLabel, NewMoveset);
-
-        return NewMoveset;
+        return NAME_TO_MOVESET_REQUEST.computeIfAbsent(preset.getUniqueLabel(),
+                key ->
+                {
+                    final AnimationRequestMoveset newMoveset =
+                            new AnimationRequestMoveset();
+                    newMoveset.Initialize();
+                    newMoveset.ConstructFromSpecialAnimationSet(
+                            animSet, preset, config);
+                    return newMoveset;
+                });
     }
-    static public AnimationRequestMoveset GetAnimationRequestMovesetFromAnimationSet(IdleAnimationSet AnimSet, TrueTileMovementConfig config)
+
+    public static AnimationRequestMoveset getMovesetFromAnimationSet(
+            final IdleAnimationSet animSet,
+            final TrueTileMovementConfig config)
     {
         // Have the label encode a unique String for all config options that can mess with it
-        String UniqueLabel = AnimSet.GetUniqueLabel() + config.OrientationRotationSpeed();
-        if (NameToMovesetRequest.containsKey(UniqueLabel))
+        final String uniqueLabel =
+                animSet.GetUniqueLabel() + config.OrientationRotationSpeed();
+        return NAME_TO_MOVESET_REQUEST.computeIfAbsent(uniqueLabel, key ->
         {
-            return NameToMovesetRequest.get(UniqueLabel);
-        }
-
-        AnimationRequestMoveset NewMoveset = new AnimationRequestMoveset();
-        NewMoveset.Initialize();
-
-        NewMoveset.ConstructFromIdleAnimationSet(AnimSet, config);
-
-        NameToMovesetRequest.put(UniqueLabel, NewMoveset);
-
-        return NewMoveset;
+            final AnimationRequestMoveset newMoveset =
+                    new AnimationRequestMoveset();
+            newMoveset.Initialize();
+            newMoveset.ConstructFromIdleAnimationSet(animSet, config);
+            return newMoveset;
+        });
     }
 }

@@ -63,7 +63,6 @@ public class TrueTileMovementPlugin extends Plugin
 
 	@Inject
 	private DrawManager drawManager;
-
 	@Inject
 	private MouseManager mouseManager;
 
@@ -109,6 +108,10 @@ public class TrueTileMovementPlugin extends Plugin
 			WORLD_ENTITY_FOURTH_OPTION,
 			WORLD_ENTITY_FIFTH_OPTION);
 
+	public boolean bDelayedStartup = false;
+	private boolean bStartupComplete = false;
+
+	private Set<Integer> CharacterIDs = new HashSet<>();
 	public List<Hitsplat> CurrentHitsplats = new ArrayList<>();
 	public volatile boolean bIsPluginSupportedCurrently = true;
 	public volatile int TicksSincePluginWasSupport = 0;
@@ -133,14 +136,69 @@ public class TrueTileMovementPlugin extends Plugin
 		@Override
 		public boolean addEntity(Renderable renderable, boolean ui)
 		{
-			return !hideLocalPlayerUi ||
-					!ui ||
-					renderable != hiddenLocalPlayer;
+			if (hideLocalPlayerUi &&
+					ui &&
+					renderable == hiddenLocalPlayer)
+			{
+				return false;
+			}
+
+			if (bForceEarlyOut || !bIsPluginSupportedCurrently || !config.CustomOverheadRendering() || client.getLocalPlayer() == null)
+			{
+				return true;
+			}
+
+			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(client.getLocalPlayer().getId());
+			if (ui && FoundHandler != null && !FoundHandler.bShouldRenderOwner && renderable != null)
+			{
+				if (Objects.equals(renderable.toString(), client.getLocalPlayer().toString()))
+				{
+					return !(renderable instanceof Player);
+				}
+				else
+				{
+					// Other player's UI
+					for (Player player : client.getPlayers())
+					{
+						if (player != null && renderable.toString().equals(player.toString()))
+						{
+							String ChatOverhead = player.getOverheadText();
+
+							// hide player UI if needed
+							int PlayerID = client.getLocalPlayer().getId();
+							CustomMovementHandler PlayerHandler = OverlayRenderer.MovementHandlerCache.get(PlayerID);
+							if (PlayerHandler != null && PlayerHandler.Model != null && ChatOverhead == null)
+							{
+								LocalPoint CurrentModelPoint = PlayerHandler.Model.getLocation();
+								LocalPoint TileLocation = player.getLocalLocation();
+								int Tolerance = config.HideUnderPlayerDistanceTolerance();
+
+								if (CurrentModelPoint != null &&
+										TileLocation != null &&
+										(Math.abs(CurrentModelPoint.getX() - TileLocation.getX()) < Tolerance) &&
+										(Math.abs(CurrentModelPoint.getY() - TileLocation.getY()) < Tolerance))
+								{
+									return false;
+								}
+							}
+
+							break;
+						}
+					}
+				}
+			}
+
+			return true;
 		}
 
 		@Override
 		public boolean drawObject(Scene scene, TileObject object)
 		{
+			if (bForceEarlyOut || client.getLocalPlayer() == null)
+			{
+				return true;
+			}
+
 			long ObjectHash = object.getHash();
 			// Unlike addEntity, drawObject is supplied by the GPU renderer. A
 			// player entry occurs every rendered player frame, so use only that
@@ -150,15 +208,52 @@ public class TrueTileMovementPlugin extends Plugin
 			{
 				MarkGpuRenderCallbackObserved();
 			}
+
 			// TileObject IDs are object/player IDs from different namespaces.
 			// A hash-qualified published snapshot ensures an ordinary object can
 			// never collide with the local player's index and be suppressed.
-			return ShouldDrawTileObject(
+			if (!ShouldDrawTileObject(
 					hideLocalPlayerScene,
 					hiddenLocalPlayerId,
 					hiddenLocalPlayerWorldViewId,
 					ObjectHash,
-					object.getId());
+					object.getId()))
+			{
+				return false;
+			}
+
+			// hide player
+			int ObjectID = object.getId();
+			int PlayerID = client.getLocalPlayer().getId();
+			CustomMovementHandler FoundHandler = OverlayRenderer.MovementHandlerCache.get(ObjectID);
+			CustomMovementHandler PlayerHandler = OverlayRenderer.MovementHandlerCache.get(PlayerID);
+			if (PlayerHandler != null)
+
+			{
+				if (FoundHandler != null &&
+						!FoundHandler.bShouldRenderOwner && !FoundHandler.bRenderOriginalOwnerDueToProximity)
+				{
+					return false;
+				}
+
+				if (PlayerHandler.Model != null)
+				{
+					LocalPoint CurrentModelPoint = PlayerHandler.Model.getLocation();
+					LocalPoint TileLocation = object.getLocalLocation();
+					int Tolerance = config.HideUnderPlayerDistanceTolerance();
+
+					if (CurrentModelPoint != null &&
+							ObjectID != -1 /* -1 = Runelite object */ &&
+							CharacterIDs.contains(ObjectID) &&
+							(Math.abs(CurrentModelPoint.getX() - TileLocation.getX()) < Tolerance) &&
+							(Math.abs(CurrentModelPoint.getY() - TileLocation.getY()) < Tolerance) &&
+							!PlayerHandler.bShouldRenderOwner && !PlayerHandler.bRenderOriginalOwnerDueToProximity) {
+						return false;
+					}
+				}
+			}
+
+			return true;
         }
 	};
 
@@ -895,11 +990,26 @@ public class TrueTileMovementPlugin extends Plugin
 			LastAdaptiveCameraUpdateNanos = 0;
 			return;
 		}
-
 		// Start every prepared frame in fail-open mode. Suppression is enabled
 		// below only after the current-scene replacement has passed every
 		// readiness/handoff check.
 		PublishLocalPlayerRenderState(player, false);
+
+		CharacterIDs.clear();
+		for (Player ScenePlayer : client.getPlayers())
+		{
+			if (ScenePlayer != null)
+			{
+				CharacterIDs.add(ScenePlayer.getId());
+			}
+		}
+		for (NPC npc : client.getNpcs())
+		{
+			if (npc != null && npc.getComposition().getSize() == 1)
+			{
+				CharacterIDs.add(npc.getId());
+			}
+		}
 		CustomMovementHandler PlayerMovementHandler = OverlayRenderer.MovementHandlerCache.get(player.getId());
 		if (PlayerMovementHandler == null)
 		{
@@ -1065,8 +1175,11 @@ public class TrueTileMovementPlugin extends Plugin
 	{
 		if (event.getActor() == client.getLocalPlayer())
 		{
-			LastTimeHitSplatApplied = System.currentTimeMillis();
-			CurrentHitsplats.add(event.getHitsplat());
+			LastTimeHitSplatApplied = System.nanoTime();
+			if (!CurrentHitsplats.contains(event.getHitsplat()))
+			{
+				CurrentHitsplats.add(event.getHitsplat());
+			}
 		}
 	}
 
@@ -1087,7 +1200,7 @@ public class TrueTileMovementPlugin extends Plugin
         CurrentHitsplats.removeIf(hitsplat -> client.getGameCycle() >= hitsplat.getDisappearsOnGameCycle());
 
 		// Recently been in combat
-		if (System.currentTimeMillis() - LastTimeHitSplatApplied < 6000) // 6 seconds
+		if (System.nanoTime() - LastTimeHitSplatApplied < 6e+9) // 6 seconds
 		{
 			// Show this one
 			OverlayRenderer.bShowHPBar = true;
@@ -1096,7 +1209,6 @@ public class TrueTileMovementPlugin extends Plugin
 		{
 			OverlayRenderer.bShowHPBar = false;
 		}
-
 		// [TMA-TELEPORT] Restored original teleport detection. A genuine
 		// teleport is identified only by the teleport animation the client
 		// publishes on the player. Ordinary fast running/walking never plays
@@ -1238,11 +1350,10 @@ public class TrueTileMovementPlugin extends Plugin
 		);
 	}
 
-
-
-	@Override
-	protected void startUp() throws Exception
+	private void DoStartUp()
 	{
+		bDelayedStartup = false;
+		bStartupComplete = true;
 		InitializePrayerImages();
 		InitializeSkullImages();
 		InitializeHitsplatImages();
@@ -1250,7 +1361,6 @@ public class TrueTileMovementPlugin extends Plugin
 		renderCallbackManager.register(renderCallback);
 		drawManager.registerEveryFrameListener(PostDrawCameraModeHandoff);
 		mouseManager.registerMouseListener(MinimapClickListener);
-		overlayManager.add(OverlayRenderer);
 		bForceEarlyOut = false;
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionY = Float.NaN;
@@ -1262,6 +1372,23 @@ public class TrueTileMovementPlugin extends Plugin
 		PreRenderedHandler = null;
 		bPreRenderedSceneLoadFrame = false;
 		PublishLocalPlayerRenderState(null, false);
+	}
+
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		overlayManager.add(OverlayRenderer);
+		if (client.getGameState() == GameState.LOGIN_SCREEN)
+		{
+			DoStartUp();
+		}
+		else
+		{
+			bDelayedStartup = true;
+			bStartupComplete = false;
+			bForceEarlyOut = true;
+		}
 	}
 
 	public BufferedImage GetPrayerIcon(HeadIcon currentHeadIcon)
@@ -1280,6 +1407,8 @@ public class TrueTileMovementPlugin extends Plugin
 		// Clear the callback snapshot synchronously before unregistering is
 		// queued, so an in-flight upload can only draw the native player.
 		PublishLocalPlayerRenderState(null, false);
+		bDelayedStartup = false;
+		bStartupComplete = false;
 		CurrentCameraPositionX = -1;
 		CurrentCameraPositionY = Float.NaN;
 		CurrentCameraPositionZ = -1;
@@ -1365,6 +1494,11 @@ public class TrueTileMovementPlugin extends Plugin
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
 	{
 		GameState NewState = gameStateChanged.getGameState();
+		if (NewState == GameState.LOGIN_SCREEN && bDelayedStartup)
+		{
+			DoStartUp();
+		}
+
 		// Scene ownership changes regardless of the GPU support detector. Mark
 		// this before its early-out so a coincident support pause cannot leave
 		// an old RuneLiteObject or adaptive-camera target alive indefinitely.
