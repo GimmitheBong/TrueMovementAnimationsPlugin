@@ -1164,3 +1164,24 @@ wins. Endpoint-idle selection defers to the bridge. Scene rebases clear the proo
 and true idle has no moving snapshot with which to arm it. This is a one-shot
 render boundary, not a time window or route-wide grace, so it cannot renew itself
 into running on the spot.
+
+## `[TMA-EXACT-NATIVE-PLAYER-HANDOFF]`: preserve player-pass ordering when stationary
+
+117 HD renders a `RuneLiteObject` as a generic scene object rather than in its
+dedicated `Player` pass. When many players occupied or crossed the local
+player's tile, their models could therefore draw over the custom player model
+and make it appear to disappear.
+
+When the custom and native players have an exact stationary position and
+orientation match, the native local player now supplies the visible body. The
+custom object stays active in the background so movement can resume without a
+spawn-in scale transition. Custom overheads are skipped during this handoff and
+the native player supplies overhead text, icons, hitsplats, and health bars once.
+Displaced movement, endpoint-idle presentation, stop-facing, and custom
+animations continue to use the custom object.
+
+In-game validation confirmed that this exact native-player handoff fixes the
+local character disappearing when large numbers of players repeatedly walk
+onto and off the character's tile. Do not replace this with player-count or
+same-tile crowd scanning; the render-authority decision depends only on the
+native and custom presentations being exactly interchangeable.

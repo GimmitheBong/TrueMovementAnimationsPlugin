@@ -231,7 +231,8 @@ public class TrueMovementOverlay extends OverlayPanel
 
         Player player = client.getLocalPlayer();
         var playerEntry = MovementHandlerCache.get(player.getId());
-        if (playerEntry == null)
+        if (playerEntry == null ||
+                playerEntry.bRenderOriginalOwnerDueToProximity)
         {
             return;
         }
@@ -338,7 +339,9 @@ public class TrueMovementOverlay extends OverlayPanel
         String OverheadText = player.getOverheadText();
         boolean bIsOverheadTextActive = OverheadText != null;
 
-        if ((!bShowHPBar && headIcon == null && skullIcon == -1 && !bIsOverheadTextActive) || playerEntry == null)
+        if (playerEntry == null ||
+                playerEntry.bRenderOriginalOwnerDueToProximity ||
+                (!bShowHPBar && headIcon == null && skullIcon == -1 && !bIsOverheadTextActive))
         {
             return;
         }

@@ -887,6 +887,20 @@ public class MovementContinuityTest
 						-200,
 						1,
 						10));
+		// An exact stationary transform can use RuneScape's native player pass
+		// even during an action or when the optional proximity handoff is off.
+		assertTrue(CustomMovementHandler
+				.ShouldUseOriginalOwnerPresentation(
+						false,
+						false,
+						false,
+						false,
+						AnimationID.HUMAN_WOODCUTTING_RUNE_AXE,
+						0,
+						0,
+						0,
+						1,
+						10));
 	}
 
 	@Test
@@ -907,6 +921,133 @@ public class MovementContinuityTest
 						808,
 						808,
 						true));
+	}
+
+	@Test
+	public void controllerAnimationClockUsesClientCyclesAndBoundsCatchup()
+	{
+		// Render FPS can vary without changing the number of RuneLite client
+		// cycles that an AnimationController should consume.
+		assertEquals(1, CustomMovementHandler
+				.GetControllerAnimationClockDelta(121, 120));
+		assertEquals(1, CustomMovementHandler
+				.GetControllerAnimationClockDelta(122, 121));
+		assertEquals(5, CustomMovementHandler
+				.GetControllerAnimationClockDelta(125, 120));
+		assertEquals(0, CustomMovementHandler
+				.GetControllerAnimationClockDelta(120, 120));
+		assertEquals(0, CustomMovementHandler
+				.GetControllerAnimationClockDelta(119, 120));
+		assertEquals(0, CustomMovementHandler
+				.GetControllerAnimationClockDelta(120, -1));
+		assertEquals(100, CustomMovementHandler
+				.GetControllerAnimationClockDelta(500, 120));
+	}
+
+	@Test
+	public void nativeLocomotionSelectorsShareTheSmoothedRequestedPose()
+	{
+		assertTrue(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, true, false,
+						-1, -1, 1661));
+
+		// The selector override belongs only to ordinary native-model
+		// locomotion while RuneLite Animation Smoothing owns the pose clock.
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						false, true, false, true, false,
+						-1, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, false, false, true, false,
+						-1, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, true, true, false,
+						-1, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, false, false,
+						-1, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, true, true,
+						-1, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, true, false,
+						422, -1, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, true, false,
+						-1, 2106, 1661));
+		assertFalse(CustomMovementHandler
+				.ShouldOverrideNativeLocomotionPoseSelectors(
+						true, true, false, true, false,
+						-1, -1, -1));
+
+		// Directional locomotion selectors use the requested pose, but the
+		// actor's idle selector must continue to identify genuine idle state.
+		assertEquals(808, CustomMovementHandler
+				.SelectNativeIdlePoseSelectorAnimation(
+						false, 1661, 808));
+		assertEquals(808, CustomMovementHandler
+				.SelectNativeIdlePoseSelectorAnimation(
+						true, 808, 1660));
+	}
+
+	@Test
+	public void orientationUsesRuneLite2048UnitRing()
+	{
+		// Crossing the 0/2047 seam is one orientation unit, not zero.
+		assertEquals(2047.0, CustomMovementHandler
+				.AdvanceOrientationPhase(0, 2047, 1), 0.0);
+		assertEquals(0.0, CustomMovementHandler
+				.AdvanceOrientationPhase(2047, 0, 1), 0.0);
+
+		// A one-unit target change below the real half-turn must not reverse
+		// the selected turn direction.
+		assertEquals(1.0, CustomMovementHandler
+				.AdvanceOrientationPhase(0, 998, 1), 0.0);
+		assertEquals(1.0, CustomMovementHandler
+				.AdvanceOrientationPhase(0, 999, 1), 0.0);
+		assertEquals(1.0, CustomMovementHandler
+				.AdvanceOrientationPhase(0, 1023, 1), 0.0);
+		assertEquals(2047.0, CustomMovementHandler
+				.AdvanceOrientationPhase(0, 1024, 1), 0.0);
+
+		// Fractional progress must survive either direction across the seam.
+		assertEquals(0.25, CustomMovementHandler
+				.AdvanceOrientationPhase(2047.75, 1, 0.5), 0.0);
+		assertEquals(2047.75, CustomMovementHandler
+				.AdvanceOrientationPhase(0.25, 2047, 0.5), 0.0);
+	}
+
+	@Test
+	public void pointOrientationMapsCardinalsWithoutDuplicatingTheSeam()
+	{
+		assertEquals(0, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, 0, -1, 90));
+		assertEquals(256, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, -1, -1, 90));
+		assertEquals(512, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, -1, 0, 90));
+		assertEquals(768, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, -1, 1, 90));
+		assertEquals(1024, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, 0, 1, 90));
+		assertEquals(1280, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, 1, 1, 90));
+		assertEquals(1536, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, 1, 0, 90));
+		assertEquals(1792, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, 1, -1, 90));
+
+		// The auxiliary-camera offset can exceed 360 degrees before
+		// normalization; it must still produce a valid orientation.
+		assertEquals(1536, CustomMovementHandler
+				.getOrientationBetweenPoints(0, 0, -1, 0, 270));
 	}
 
 	@Test

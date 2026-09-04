@@ -11,6 +11,7 @@ import java.lang.management.ManagementFactory;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.IntPredicate;
 import org.slf4j.Logger;
@@ -20,7 +21,10 @@ public class CustomMovementHandler
 {
     private static final Logger log =
             LoggerFactory.getLogger(CustomMovementHandler.class);
+    private static final int NO_ANIMATION = -1;
     private static final int BASE_MOVEMENT_TWEEN_MILLIS = 600;
+    private static final int ORIENTATION_UNITS = 2048;
+    private static final int ORIENTATION_MASK = ORIENTATION_UNITS - 1;
     // [TMA-CONTINUOUS-MOVEMENT-SPEED] A multiplier cannot make the visible
     // model move faster than RuneScape publishes collision-valid route steps
     // indefinitely without either waiting at the endpoint or predicting a
@@ -119,6 +123,14 @@ public class CustomMovementHandler
     // without exposing a locomotion pose. Restoring the selectors never
     // touches the pose ID/frame, so the stationary handoff keeps its phase.
     private boolean bEndpointNativeIdlePoseOverrideActive = false;
+    // RuneLite's native actor update chooses from its movement selectors every
+    // client cycle. During ordinary custom locomotion the directional movement
+    // selectors are temporarily mapped to the already-selected pose so the
+    // hidden actor cannot replace (and then make us restore) that pose every
+    // 20 ms. The native idle selector remains semantically truthful. Keeping
+    // the actual plugin-owned ID lets UpdateOldIdleAnimations still observe a
+    // genuine equipment/movement-set publication while the override is active.
+    private int NativePoseSelectorOverrideAnimation = NO_ANIMATION;
     private boolean bEndpointNativeHandoffReadyThisFrame = false;
     // A successful native-geometry handoff owns this completed segment until
     // real movement or a scene reset. A one-frame readiness flag is insufficient:
@@ -132,7 +144,12 @@ public class CustomMovementHandler
     private long CurrentTime;
     public int CurrentFrameDelta;
     private long LastTimeMilliseconds = 0;
-    private long LastAnimationTickTime = 0;
+    // AnimationController.tick() is expressed in RuneLite client-game
+    // cycles, not render frames. Keeping this clock on the client cycle makes
+    // controller-driven special/action animations independent of FPS while
+    // AnimationController.animate() remains available to the native
+    // animation interpolation filter at render time.
+    private int LastAnimationGameCycle = -1;
     private long LastGcCollectionTimeMillis = 0;
     private int MillisecondsSinceTileChange = 1000;
     // Diagnostic provenance for the latest authoritative route segment. The
@@ -236,7 +253,6 @@ public class CustomMovementHandler
     // cleanup can safely re-arm the destination-scene guard.
     private int PohArrivalGuardReleasedSceneGeneration = -1;
     // Animation Handling
-    private static final int NO_ANIMATION = -1;
     private int CurrentAnimation = 0;
     private int CurrentPoseAnimation = 0;
     private boolean bResetCurrentAnimation = true;
@@ -1130,19 +1146,25 @@ public class CustomMovementHandler
             int DistanceThreshold,
             int OrientationThreshold)
     {
-        // [TMA-STEADY-PRESENTATION] Never change render authority in the
-        // middle of locomotion or an action. At tile boundaries the native and
-        // custom locations can briefly coincide; swapping there produces a
-        // one-frame phase/visibility seam before the next segment starts.
-        return AllowOriginalModel &&
-                !Moving &&
+        boolean ExactPresentationMatch =
+                DistanceX == 0 &&
+                        DistanceY == 0 &&
+                        OrientationDifference == 0;
+        // [TMA-STEADY-PRESENTATION] Never change render authority during
+        // locomotion. An exact stationary transform can safely use RuneScape's
+        // native player pass; the configurable tolerance still excludes actions.
+        return !Moving &&
                 !HoldingStopFacing &&
                 !UsedCustomAnimation &&
-                OwnerActionAnimation == -1 &&
-                Math.abs(DistanceX) <= DistanceThreshold &&
-                Math.abs(DistanceY) <= DistanceThreshold &&
-                Math.abs(OrientationDifference) <=
-                        OrientationThreshold;
+                (ExactPresentationMatch ||
+                        AllowOriginalModel &&
+                                OwnerActionAnimation == -1 &&
+                                Math.abs(DistanceX) <=
+                                        DistanceThreshold &&
+                                Math.abs(DistanceY) <=
+                                        DistanceThreshold &&
+                                Math.abs(OrientationDifference) <=
+                                        OrientationThreshold);
     }
 
     static boolean ShouldReplaceAnimationController(
@@ -1158,7 +1180,8 @@ public class CustomMovementHandler
 
     private static int ShortestAngleDifference(int from, int to)
     {
-        return ((to - from + 3095) % 2047) - 1048;
+        return ((to - from + ORIENTATION_UNITS / 2) &
+                ORIENTATION_MASK) - ORIENTATION_UNITS / 2;
     }
 
     static double AdvanceOrientationPhase(
@@ -1166,13 +1189,14 @@ public class CustomMovementHandler
             int TargetOrientation,
             double MaximumStep)
     {
-        int PublishedOrientation = (int) CurrentOrientationPhase;
+        int PublishedOrientation =
+                ((int) CurrentOrientationPhase) & ORIENTATION_MASK;
         int ShortestAngle = ShortestAngleDifference(
                 PublishedOrientation,
                 TargetOrientation);
         if (ShortestAngle == 0)
         {
-            return TargetOrientation;
+            return TargetOrientation & ORIENTATION_MASK;
         }
         if (!Double.isFinite(MaximumStep) || MaximumStep <= 0)
         {
@@ -1180,23 +1204,23 @@ public class CustomMovementHandler
         }
         if (Math.abs(ShortestAngle) <= MaximumStep)
         {
-            return TargetOrientation;
+            return TargetOrientation & ORIENTATION_MASK;
         }
 
         double NextOrientation = CurrentOrientationPhase +
                 Math.copySign(MaximumStep, ShortestAngle);
         if (NextOrientation < 0)
         {
-            NextOrientation += 2047;
+            NextOrientation += ORIENTATION_UNITS;
         }
-        else if (NextOrientation > 2047)
+        else if (NextOrientation >= ORIENTATION_UNITS)
         {
-            NextOrientation -= 2047;
+            NextOrientation -= ORIENTATION_UNITS;
         }
         return NextOrientation;
     }
 
-    private int getOrientationBetweenPoints(double point1X, double point1Y, double point2X, double point2Y, int OffsetAngle)
+    static int getOrientationBetweenPoints(double point1X, double point1Y, double point2X, double point2Y, int OffsetAngle)
     {
         // Calculate the difference in X and Y coordinates
         double deltaX = point2X - point1X;
@@ -1205,18 +1229,18 @@ public class CustomMovementHandler
         // Calculate the angle in radians
         double angleInRadians = Math.atan2(deltaY, deltaX);
 
-        // Convert to degrees and normalize to a 0-2047 range
+        // Convert to degrees and normalize to RuneLite's 2048-unit ring.
         double angleInDegrees = Math.toDegrees(angleInRadians);
         angleInDegrees += OffsetAngle;
 
+        angleInDegrees = (360.0 - angleInDegrees) % 360.0;
         if (angleInDegrees < 0)
         {
-            angleInDegrees += 360;
+            angleInDegrees += 360.0;
         }
 
-        angleInDegrees = 360 - angleInDegrees; // Inverted
-
-        return (int) ((angleInDegrees / 360) * 2047);
+        return ((int) ((angleInDegrees / 360.0) *
+                ORIENTATION_UNITS)) & ORIENTATION_MASK;
     }
 
     private boolean IsPlayerOwner()
@@ -1256,7 +1280,7 @@ public class CustomMovementHandler
         if (Model == null || bReplaceSceneObjects)
         {
             RuneLiteObject OldModel = Model;
-            if (bEndpointNativeIdlePoseOverrideActive)
+            if (NativePoseSelectorOverrideAnimation != NO_ANIMATION)
             {
                 SetAllIdlePosesDefault();
             }
@@ -1353,6 +1377,10 @@ public class CustomMovementHandler
         {
             LastInitializedSceneGeneration = SceneGeneration;
             bSceneRebasePending = true;
+            // The controller's last rendered phase remains valid, but time
+            // spent while the old scene was unavailable must not be consumed
+            // as one large animation jump in the replacement scene.
+            LastAnimationGameCycle = -1;
         }
     }
 
@@ -1378,6 +1406,7 @@ public class CustomMovementHandler
         bSceneLoadFramePresentationPending = false;
         ScenePresentationTimeDebtMilliseconds = 0;
         ScenePresentationDebtPaybackRemainder = 0;
+        LastAnimationGameCycle = -1;
         SceneRecoveryBaseVelocity = 0;
         SceneRecoveryTweenDurationOverride = 0;
         bNativeSceneLoadHandoffPresented = false;
@@ -1386,7 +1415,7 @@ public class CustomMovementHandler
         PohArrivalCoordinateGuardSceneGeneration = -1;
         LastValidOwnerPoseAnimation = NO_ANIMATION;
         LastValidOwnerPoseFrame = 0;
-        if (bEndpointNativeIdlePoseOverrideActive)
+        if (NativePoseSelectorOverrideAnimation != NO_ANIMATION)
         {
             SetAllIdlePosesDefault();
         }
@@ -2326,6 +2355,46 @@ public class CustomMovementHandler
                 AnimationInterpolationFilter.test(AnimationId);
     }
 
+    static boolean ShouldOverrideNativeLocomotionPoseSelectors(
+            boolean CustomPlayerPresentationActive,
+            boolean Moving,
+            boolean EndpointIdlePresentationActive,
+            boolean AnimationSmoothingActive,
+            boolean SpecialPresentationActive,
+            int OwnerActionAnimation,
+            int RequestedActionAnimation,
+            int RequestedPoseAnimation)
+    {
+        // The native actor selects a movement pose again every client cycle.
+        // If a directional selector differs from the pose already chosen by
+        // the custom movement path, forcing the requested pose afterward
+        // restarts the native interpolation clock every 20 ms. Pointing those
+        // movement selectors at the same pose lets RuneLite's existing actor
+        // clock and Animation Smoothing advance without a competing write.
+        return CustomPlayerPresentationActive &&
+                Moving &&
+                !EndpointIdlePresentationActive &&
+                AnimationSmoothingActive &&
+                !SpecialPresentationActive &&
+                OwnerActionAnimation == NO_ANIMATION &&
+                RequestedActionAnimation == NO_ANIMATION &&
+                RequestedPoseAnimation != NO_ANIMATION;
+    }
+
+    static int SelectNativeIdlePoseSelectorAnimation(
+            boolean OverrideIdlePoseAnimation,
+            int RequestedPoseAnimation,
+            int NativeIdlePoseAnimation)
+    {
+        // Endpoint presentation genuinely represents idle and needs every
+        // native selector on the same sequence. During locomotion, retaining
+        // the real idle selector preserves the actor's observable movement
+        // semantics without affecting walk/run/turn smoothing.
+        return OverrideIdlePoseAnimation
+                ? RequestedPoseAnimation
+                : NativeIdlePoseAnimation;
+    }
+
     private void StopUsingHeldEndpointIdleModel()
     {
         if (bUsingHeldEndpointIdleModel)
@@ -2372,6 +2441,23 @@ public class CustomMovementHandler
                 CurrentGameCycle <= PreviousGameCycle
                 ? 0
                 : CurrentGameCycle - PreviousGameCycle;
+    }
+
+    static int GetControllerAnimationClockDelta(
+            int CurrentGameCycle,
+            int PreviousGameCycle)
+    {
+        if (PreviousGameCycle < 0 ||
+                CurrentGameCycle <= PreviousGameCycle)
+        {
+            return 0;
+        }
+
+        // A stalled client should not turn one render update into an
+        // unbounded animation catch-up loop. This still covers two seconds
+        // of normal client-cycle progress while bounding recovery work after
+        // a longer gap.
+        return Math.min(100, CurrentGameCycle - PreviousGameCycle);
     }
 
     static boolean ShouldPublishEndpointIdleFrame(
@@ -2689,15 +2775,20 @@ public class CustomMovementHandler
         // Ignore the pose value currently owned by the plugin, while still
         // accepting any different selector values the game publishes during
         // the brief override (for example, an equipment/movement-set change).
-        int PluginOwnedPoseAnimation =
+        int PluginOwnedMovementPoseAnimation =
+                NativePoseSelectorOverrideAnimation != NO_ANIMATION
+                        ? NativePoseSelectorOverrideAnimation
+                        : CurrentPoseAnimation;
+        int PluginOwnedIdlePoseAnimation =
                 bEndpointNativeIdlePoseOverrideActive
-                        ? OldAnimationSet.IdlePoseAnimation
+                        ? NativePoseSelectorOverrideAnimation
                         : CurrentPoseAnimation;
         int PreviousIdlePoseAnimation =
                 OldAnimationSet.IdlePoseAnimation;
         boolean bAnyChanges = false;
         if (Owner.getIdleRotateLeft() != NO_ANIMATION &&
-                Owner.getIdleRotateLeft() != PluginOwnedPoseAnimation &&
+                Owner.getIdleRotateLeft() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.IdleRotateLeft != Owner.getIdleRotateLeft())
         {
             OldAnimationSet.IdleRotateLeft = Owner.getIdleRotateLeft();
@@ -2705,7 +2796,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getIdleRotateRight() != NO_ANIMATION &&
-                Owner.getIdleRotateRight() != PluginOwnedPoseAnimation &&
+                Owner.getIdleRotateRight() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.IdleRotateRight != Owner.getIdleRotateRight())
         {
             OldAnimationSet.IdleRotateRight = Owner.getIdleRotateRight();
@@ -2713,7 +2805,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkAnimation() != NO_ANIMATION &&
-                Owner.getWalkAnimation() != PluginOwnedPoseAnimation &&
+                Owner.getWalkAnimation() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.WalkAnimation != Owner.getWalkAnimation())
         {
             OldAnimationSet.WalkAnimation = Owner.getWalkAnimation();
@@ -2721,7 +2814,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotateLeft() != NO_ANIMATION &&
-                Owner.getWalkRotateLeft() != PluginOwnedPoseAnimation &&
+                Owner.getWalkRotateLeft() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.WalkRotateLeft != Owner.getWalkRotateLeft())
         {
             OldAnimationSet.WalkRotateLeft = Owner.getWalkRotateLeft();
@@ -2729,7 +2823,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotateRight() != NO_ANIMATION &&
-                Owner.getWalkRotateRight() != PluginOwnedPoseAnimation &&
+                Owner.getWalkRotateRight() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.WalkRotateRight != Owner.getWalkRotateRight())
         {
             OldAnimationSet.WalkRotateRight = Owner.getWalkRotateRight();
@@ -2737,7 +2832,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getWalkRotate180() != NO_ANIMATION &&
-                Owner.getWalkRotate180() != PluginOwnedPoseAnimation &&
+                Owner.getWalkRotate180() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.WalkRotate180 != Owner.getWalkRotate180())
         {
             OldAnimationSet.WalkRotate180 = Owner.getWalkRotate180();
@@ -2745,7 +2841,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getIdlePoseAnimation() != NO_ANIMATION &&
-                Owner.getIdlePoseAnimation() != PluginOwnedPoseAnimation &&
+                Owner.getIdlePoseAnimation() !=
+                        PluginOwnedIdlePoseAnimation &&
                 OldAnimationSet.IdlePoseAnimation != Owner.getIdlePoseAnimation())
         {
             OldAnimationSet.IdlePoseAnimation = Owner.getIdlePoseAnimation();
@@ -2753,7 +2850,8 @@ public class CustomMovementHandler
         }
 
         if (Owner.getRunAnimation() != NO_ANIMATION &&
-                Owner.getRunAnimation() != PluginOwnedPoseAnimation &&
+                Owner.getRunAnimation() !=
+                        PluginOwnedMovementPoseAnimation &&
                 OldAnimationSet.RunAnimation != Owner.getRunAnimation())
         {
             OldAnimationSet.RunAnimation = Owner.getRunAnimation();
@@ -4822,11 +4920,11 @@ public class CustomMovementHandler
 
                 if (CurrentCameraObjectOrientation < 0)
                 {
-                    CurrentCameraObjectOrientation += 2047;
+                    CurrentCameraObjectOrientation += ORIENTATION_UNITS;
                 }
-                else if (CurrentCameraObjectOrientation > 2047)
+                else if (CurrentCameraObjectOrientation >= ORIENTATION_UNITS)
                 {
-                    CurrentCameraObjectOrientation -= 2047;
+                    CurrentCameraObjectOrientation -= ORIENTATION_UNITS;
                 }
 
                 cameraModel.setOrientation(CurrentCameraObjectOrientation);
@@ -4860,7 +4958,7 @@ public class CustomMovementHandler
 
     private void SetAllIdlePosesDefault()
     {
-        if (bEndpointNativeIdlePoseOverrideActive)
+        if (NativePoseSelectorOverrideAnimation != NO_ANIMATION)
         {
             // A scene/equipment update can publish a new movement set before
             // the next ordinary handler update. Preserve any non-sentinel
@@ -4907,48 +5005,75 @@ public class CustomMovementHandler
             Owner.setRunAnimation(OldAnimationSet.RunAnimation);
         }
         bEndpointNativeIdlePoseOverrideActive = false;
+        NativePoseSelectorOverrideAnimation = NO_ANIMATION;
     }
 
     private void SetAllMovementPosesToIdleAnimation()
     {
-        int IdlePoseAnimation = OldAnimationSet.IdlePoseAnimation;
-        if (Owner.getIdleRotateLeft() != IdlePoseAnimation)
+        SetAllMovementPoseSelectors(
+                OldAnimationSet.IdlePoseAnimation,
+                true);
+        bEndpointNativeIdlePoseOverrideActive = true;
+    }
+
+    private void SetAllMovementPosesToLocomotionAnimation(
+            int PoseAnimation)
+    {
+        SetAllMovementPoseSelectors(PoseAnimation, false);
+        bEndpointNativeIdlePoseOverrideActive = false;
+    }
+
+    private void SetAllMovementPoseSelectors(
+            int PoseAnimation,
+            boolean OverrideIdlePoseAnimation)
+    {
+        if (Owner.getIdleRotateLeft() != PoseAnimation)
         {
-            Owner.setIdleRotateLeft(IdlePoseAnimation);
+            Owner.setIdleRotateLeft(PoseAnimation);
         }
-        if (Owner.getIdleRotateRight() != IdlePoseAnimation)
+        if (Owner.getIdleRotateRight() != PoseAnimation)
         {
-            Owner.setIdleRotateRight(IdlePoseAnimation);
+            Owner.setIdleRotateRight(PoseAnimation);
         }
-        if (Owner.getWalkAnimation() != IdlePoseAnimation)
+        if (Owner.getWalkAnimation() != PoseAnimation)
         {
-            Owner.setWalkAnimation(IdlePoseAnimation);
+            Owner.setWalkAnimation(PoseAnimation);
         }
-        if (Owner.getWalkRotateLeft() != IdlePoseAnimation)
+        if (Owner.getWalkRotateLeft() != PoseAnimation)
         {
-            Owner.setWalkRotateLeft(IdlePoseAnimation);
+            Owner.setWalkRotateLeft(PoseAnimation);
         }
-        if (Owner.getWalkRotateRight() != IdlePoseAnimation)
+        if (Owner.getWalkRotateRight() != PoseAnimation)
         {
-            Owner.setWalkRotateRight(IdlePoseAnimation);
+            Owner.setWalkRotateRight(PoseAnimation);
         }
-        if (Owner.getWalkRotate180() != IdlePoseAnimation)
+        if (Owner.getWalkRotate180() != PoseAnimation)
         {
-            Owner.setWalkRotate180(IdlePoseAnimation);
+            Owner.setWalkRotate180(PoseAnimation);
         }
+        int IdlePoseAnimation =
+                SelectNativeIdlePoseSelectorAnimation(
+                        OverrideIdlePoseAnimation,
+                        PoseAnimation,
+                        OldAnimationSet.IdlePoseAnimation);
         if (Owner.getIdlePoseAnimation() != IdlePoseAnimation)
         {
             Owner.setIdlePoseAnimation(IdlePoseAnimation);
         }
-        if (Owner.getRunAnimation() != IdlePoseAnimation)
+        if (Owner.getRunAnimation() != PoseAnimation)
         {
-            Owner.setRunAnimation(IdlePoseAnimation);
+            Owner.setRunAnimation(PoseAnimation);
         }
-        bEndpointNativeIdlePoseOverrideActive = true;
+        NativePoseSelectorOverrideAnimation = PoseAnimation;
     }
 
     private void SetAllIdlePosesNoAnimation()
     {
+
+        if (NativePoseSelectorOverrideAnimation != NO_ANIMATION)
+        {
+            UpdateOldIdleAnimations();
+        }
 
         if (Owner.getIdleRotateLeft() != NO_ANIMATION)
         {
@@ -4990,10 +5115,18 @@ public class CustomMovementHandler
             Owner.setRunAnimation(NO_ANIMATION);
         }
         bEndpointNativeIdlePoseOverrideActive = false;
+        NativePoseSelectorOverrideAnimation = NO_ANIMATION;
     }
 
     private void UpdateModelVisibleState()
     {
+        int CurrentAnimationGameCycle = client.getGameCycle();
+        int ElapsedAnimationGameCycles =
+                GetControllerAnimationClockDelta(
+                        CurrentAnimationGameCycle,
+                        LastAnimationGameCycle);
+        LastAnimationGameCycle = CurrentAnimationGameCycle;
+
         // Enter combat mode
         if (!bAttemptToRenderOwner)
         {
@@ -5010,9 +5143,10 @@ public class CustomMovementHandler
 
             if (bShouldUseTrueLocationOrientation || (CurrentTime - LastTimeUniqueAnimationLocationOrientationWasUsed) < 600) // A little bit of time before going to other animation
             {
-                if (Model.getLocation() != Owner.getLocalLocation())
+                LocalPoint ownerLocation = Owner.getLocalLocation();
+                if (!Objects.equals(Model.getLocation(), ownerLocation))
                 {
-                    Model.setLocation(Owner.getLocalLocation(), Owner.getWorldView().getPlane());
+                    Model.setLocation(ownerLocation, Owner.getWorldView().getPlane());
                 }
                 if (Model.getOrientation() != Owner.getOrientation())
                 {
@@ -5029,7 +5163,7 @@ public class CustomMovementHandler
             }
             else
             {
-                if (Model.getLocation() != NewLocalPointToDraw)
+                if (!Objects.equals(Model.getLocation(), NewLocalPointToDraw))
                 {
                     Model.setLocation(NewLocalPointToDraw,
                             Owner.getWorldView().getPlane());
@@ -5112,6 +5246,7 @@ public class CustomMovementHandler
                 if (CustomAnim != null)
                 {
                     bUsedCustomAnimation = true;
+                    boolean bControllerAnimationReplaced = false;
                     int CurrentControllerAnimationId =
                             AnimController.getAnimation() == null
                                     ? NO_ANIMATION
@@ -5138,15 +5273,16 @@ public class CustomMovementHandler
                                     CurrentAnimationRequest.StartingFrame);
                         }
                         bResetCurrentAnimation = false;
+                        bControllerAnimationReplaced = true;
                     }
 
                     SetAllIdlePosesNoAnimation();
                     Owner.setPoseAnimation(NO_ANIMATION);
                     Owner.setPoseAnimationFrame(0);
 
-                    if (CurrentTime - LastAnimationTickTime >= 17) // 17ms per frame->60FPS
+                    if (!bControllerAnimationReplaced &&
+                            ElapsedAnimationGameCycles > 0)
                     {
-                        LastAnimationTickTime = CurrentTime;
                         int CurrentFrame = AnimController.getFrame();
                         if (CurrentFrame >=
                                 CurrentAnimationRequest.EndingFrame)
@@ -5157,7 +5293,8 @@ public class CustomMovementHandler
                         else
                         {
                             AnimController.tick(
-                                    CurrentAnimationRequest.AnimationSpeed);
+                                    ElapsedAnimationGameCycles *
+                                            CurrentAnimationRequest.AnimationSpeed);
                         }
                     }
 
@@ -5174,13 +5311,50 @@ public class CustomMovementHandler
                     }
                 }
             }
+            if (bUsedCustomAnimation &&
+                    NativePoseSelectorOverrideAnimation != NO_ANIMATION &&
+                    !bEndpointNativeIdlePoseOverrideActive)
+            {
+                // A held mesh or controller-driven presentation no longer
+                // consumes the hidden actor's ordinary locomotion model.
+                // Release the selector table before leaving that native path.
+                SetAllIdlePosesDefault();
+            }
             if (!bUsedCustomAnimation)
             {
                 // Normal controller takes back over
+                boolean bCelebrationPresentationActive =
+                        bTargetWasKilled &&
+                                config.AllowNPCKilledCelebrationEmote() &&
+                                LastNPCCombatLevel > 50 &&
+                                bIsDefaultHumanAnimationSet;
+                boolean bUseNativeSmoothedLocomotion =
+                        ShouldOverrideNativeLocomotionPoseSelectors(
+                                !bAttemptToRenderOwner,
+                                bMovingThisAction,
+                                bEndpointIdlePresentationActive,
+                                IsAnimationInterpolationActive(
+                                        CurrentAnimationRequest
+                                                .PoseAnimationToPlay),
+                                IsTeleportPresentationActive() ||
+                                        HasActiveSpotAnimation() ||
+                                        bCelebrationPresentationActive,
+                                Owner.getAnimation(),
+                                CurrentAnimationRequest.AnimationToPlay,
+                                CurrentAnimationRequest
+                                        .PoseAnimationToPlay);
                 bTargetWasKilled = false; // If normal controller is taking it, cancel target killed animation
                 if (bUseNativeSmoothedEndpointIdle)
                 {
                     SetAllMovementPosesToIdleAnimation();
+                }
+                else if (bUseNativeSmoothedLocomotion)
+                {
+                    // Keep the selected locomotion ID on RuneLite's native
+                    // pose clock. Animation Smoothing can now interpolate its
+                    // authored frames without a competing 20 ms selector swap.
+                    SetAllMovementPosesToLocomotionAnimation(
+                            CurrentAnimationRequest.PoseAnimationToPlay);
                 }
                 else
                 {
@@ -5535,6 +5709,7 @@ public class CustomMovementHandler
             // authoritative. Initialize marks a pending rebase; wait until
             // world/local conversion is valid instead of resetting or moving
             // the visible player to a transient local coordinate.
+            LastAnimationGameCycle = -1;
             return;
         }
 
@@ -5557,6 +5732,7 @@ public class CustomMovementHandler
             // Soft suspension while the client is rebuilding a scene: retain
             // the last valid model/interpolation state until conversion from
             // world coordinates is available again.
+            LastAnimationGameCycle = -1;
             return;
         }
 
